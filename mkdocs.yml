@@ -1,0 +1,53 @@
+site_name: Unchained
+site_description: A single-file agentic AI framework - tools, memory, RAG, multi-agent, structured output.
+site_url: https://niravrvaghasiya.github.io/unchained/
+repo_url: https://github.com/NiravRVaghasiya/unchained
+repo_name: NiravRVaghasiya/unchained
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+nav:
+  - Home: index.md
+  - User Manual: USER_MANUAL.md
+  - Architecture: ARCHITECTURE.md
+  - API Reference: api.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            show_source: true
+            show_root_heading: true
+            members_order: source
+            docstring_style: google
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences

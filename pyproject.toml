@@ -1,0 +1,119 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unchained-ai"
+version = "0.3.0"
+description = "A single-file agentic AI framework: tools, memory, RAG, multi-agent orchestration and structured output with just two dependencies."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Unchained Contributors" }]
+keywords = [
+    "ai",
+    "agent",
+    "agents",
+    "llm",
+    "rag",
+    "tool-calling",
+    "openai",
+    "anthropic",
+    "ollama",
+    "multi-agent",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "requests>=2.28",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# Runs on every supported Python (including 3.9).
+test = ["pytest>=7.0", "pytest-cov>=4.0"]
+# Linters/type-checkers; mypy requires 3.10+, so run these on a newer Python.
+lint = ["ruff>=0.6", "mypy>=1.8", "types-requests"]
+# Everything a contributor needs locally.
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.6",
+    "mypy>=1.8",
+    "types-requests",
+    "pre-commit>=3.5",
+    "build>=1.0",
+    "twine>=5.0",
+]
+ui = ["streamlit>=1.30"]
+docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
+
+[project.urls]
+Homepage = "https://github.com/NiravRVaghasiya/unchained"
+Documentation = "https://github.com/NiravRVaghasiya/unchained/tree/main/docs"
+Source = "https://github.com/NiravRVaghasiya/unchained"
+Issues = "https://github.com/NiravRVaghasiya/unchained/issues"
+
+[tool.setuptools]
+py-modules = ["unchained"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort, B: bugbear, C4: comprehensions,
+# UP: pyupgrade, SIM: simplify.
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # function calls in argument defaults (intentional in a few tools)
+    "UP035",  # keep typing.Dict/List imports for 3.9 clarity
+    "UP006",  # keep Dict/List annotations for 3.9 compatibility
+    "UP007",  # keep Optional[X]/Union[X, Y] style
+    "UP045",  # keep Optional[X] rather than X | None
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Examples, benchmarks and tests bootstrap sys.path before importing the
+# framework, so a top-of-file import ordering (E402) is expected there.
+"examples/**" = ["E402"]
+"benchmarks/**" = ["E402"]
+"tests/**" = ["E402"]
+
+[tool.mypy]
+# Runtime supports 3.9+, but mypy itself only type-checks against 3.10+.
+# 3.9 syntax compatibility is enforced separately by ruff (target-version py39).
+python_version = "3.10"
+files = ["unchained.py"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+source = ["unchained"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
