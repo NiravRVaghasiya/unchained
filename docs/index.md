@@ -20,15 +20,19 @@ without any API key or server:
 ```python
 from unchained import Agent, MockLLM, tool
 
+
 @tool
 def add(a: int, b: int) -> int:
     """Add two numbers."""
     return a + b
 
-llm = MockLLM(script=[
-    {"tool_calls": [{"name": "add", "arguments": {"a": 2, "b": 3}, "id": "1"}]},
-    {"content": "2 + 3 = 5."},
-])
+
+llm = MockLLM(
+    script=[
+        {"tool_calls": [{"name": "add", "arguments": {"a": 2, "b": 3}, "id": "1"}]},
+        {"content": "2 + 3 = 5."},
+    ]
+)
 print(Agent(llm, tools=[add]).run("What is 2 + 3?"))
 ```
 

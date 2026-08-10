@@ -65,7 +65,7 @@ Create a file called `hello.py`:
 ```python
 from unchained import LLM, Agent
 
-agent = Agent(LLM(provider="ollama"))     # uses local Ollama by default
+agent = Agent(LLM(provider="ollama"))  # uses local Ollama by default
 print(agent.run("Explain what an AI agent is, in two sentences."))
 ```
 
@@ -94,10 +94,12 @@ reads the function for you; you don't write any schemas.
 ```python
 from unchained import LLM, Agent, tool
 
+
 @tool
 def multiply(a: int, b: int) -> int:
     """Multiply two numbers."""
     return a * b
+
 
 agent = Agent(LLM(provider="ollama"), tools=[multiply])
 print(agent.run("What is 23 times 19?"))
@@ -115,6 +117,7 @@ Tips for good tools:
 
   ```python
   from typing import Literal
+
 
   @tool
   def set_priority(level: Literal["low", "medium", "high"]) -> str:
@@ -154,10 +157,12 @@ attach them. Unchained finds the most relevant pieces automatically.
 from unchained import LLM, Agent, RAG
 
 kb = RAG()
-kb.add_many([
-    "Our support hours are 9am to 5pm, Monday to Friday.",
-    "Refunds are processed within 5 business days.",
-])
+kb.add_many(
+    [
+        "Our support hours are 9am to 5pm, Monday to Friday.",
+        "Refunds are processed within 5 business days.",
+    ]
+)
 
 agent = Agent(LLM(provider="ollama"), rag=kb)
 print(agent.run("When can I reach support?"))
@@ -172,13 +177,15 @@ the shape you want and Unchained validates it for you:
 from pydantic import BaseModel
 from unchained import LLM, Agent
 
+
 class Contact(BaseModel):
     name: str
     email: str
 
+
 agent = Agent(LLM(provider="openai", model="gpt-4o-mini"))
 contact = agent.run("Extract the contact: Jane Doe, jane@acme.com", response_format=Contact)
-print(contact.name)   # "Jane Doe"
+print(contact.name)  # "Jane Doe"
 print(contact.email)  # "jane@acme.com"
 ```
 
@@ -262,7 +269,7 @@ You can also check how many tokens a run used:
 
 ```python
 agent.run("Summarise today's standup notes.")
-print(agent.usage)   # prompt/completion/total token counts
+print(agent.usage)  # prompt/completion/total token counts
 ```
 
 ## Reliability

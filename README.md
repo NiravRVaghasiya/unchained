@@ -56,10 +56,12 @@ Prefer zero install? Copy `unchained.py` straight into your project — that's t
 ```python
 from unchained import LLM, Agent, tool
 
+
 @tool
 def add(a: int, b: int) -> int:
     """Add two numbers together."""
     return a + b
+
 
 agent = Agent(
     LLM(provider="ollama", model="llama3.1"),
@@ -73,7 +75,7 @@ print(agent.run("What is 1234 + 5678?"))
 Switch to a cloud provider by changing a single argument:
 
 ```python
-agent = Agent(LLM(provider="openai",    model="gpt-4o-mini"), tools=[add])
+agent = Agent(LLM(provider="openai", model="gpt-4o-mini"), tools=[add])
 agent = Agent(LLM(provider="anthropic", model="claude-3-5-sonnet-20241022"), tools=[add])
 ```
 
@@ -101,7 +103,7 @@ examples — and your own tests — run with zero setup:
 from unchained import Agent, MockLLM
 
 agent = Agent(MockLLM(reply="Hello from a mock model!"))
-print(agent.run("hi"))          # no key, no server, fully offline
+print(agent.run("hi"))  # no key, no server, fully offline
 ```
 
 See the whole loop (tool calling, streaming, structured output) with no setup:
@@ -134,6 +136,7 @@ string:
 ```python
 from typing import Literal
 
+
 @tool
 def set_thermostat(mode: Literal["heat", "cool", "off"], degrees: int) -> str:
     """Set the thermostat mode and target temperature."""
@@ -149,6 +152,7 @@ event loop:
 async def fetch_price(ticker: str) -> str:
     """Look up a stock price."""
     ...
+
 
 price = await Agent(llm, tools=[fetch_price]).arun("What's AAPL trading at?")
 ```
@@ -186,10 +190,12 @@ on a handful of documents, and it runs entirely in memory.
 from unchained import RAG
 
 rag = RAG()
-rag.add_many([
-    "Unchained is a single-file agent framework.",
-    "It supports OpenAI, Anthropic and Ollama.",
-])
+rag.add_many(
+    [
+        "Unchained is a single-file agent framework.",
+        "It supports OpenAI, Anthropic and Ollama.",
+    ]
+)
 agent = Agent(llm, rag=rag)
 print(agent.run("Which providers does Unchained support?"))
 ```
@@ -198,7 +204,7 @@ Need semantic search? Pass `embed_fn=...` (`list[str] -> list[list[float]]`) to
 use dense embeddings instead — TF-IDF stays the zero-dependency default:
 
 ```python
-rag = RAG(embed_fn=my_embedding_model)   # e.g. OpenAI or sentence-transformers
+rag = RAG(embed_fn=my_embedding_model)  # e.g. OpenAI or sentence-transformers
 ```
 
 ### 📦 Structured output — validated with Pydantic
@@ -206,13 +212,15 @@ rag = RAG(embed_fn=my_embedding_model)   # e.g. OpenAI or sentence-transformers
 ```python
 from pydantic import BaseModel
 
+
 class Recipe(BaseModel):
     title: str
     steps: list[str]
     minutes: int
 
+
 recipe = agent.run("Give me a quick pasta recipe.", response_format=Recipe)
-print(recipe.title, recipe.minutes)   # a real, validated Recipe instance
+print(recipe.title, recipe.minutes)  # a real, validated Recipe instance
 ```
 
 ### 🤝 Multi-agent — route or synthesize
@@ -222,8 +230,8 @@ from unchained import Router
 
 router = Router(llm, agents=[cost_agent, fit_agent, trend_agent], synthesizer=synth)
 
-router.route("How much will this cost?").run(...)   # pick the best single agent
-router.run_all("Compare these options")             # every agent, in parallel
+router.route("How much will this cost?").run(...)  # pick the best single agent
+router.run_all("Compare these options")  # every agent, in parallel
 router.synthesize("Recommend a stack for my team")  # run all, then fuse
 ```
 
@@ -312,7 +320,7 @@ Usage is normalised across providers and accumulated per agent:
 
 ```python
 agent.run("Summarise this.")
-print(agent.usage)   # {'prompt_tokens': ..., 'completion_tokens': ..., 'total_tokens': ...}
+print(agent.usage)  # {'prompt_tokens': ..., 'completion_tokens': ..., 'total_tokens': ...}
 ```
 
 ### Self-healing structured output
