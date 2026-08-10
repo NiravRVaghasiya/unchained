@@ -1,0 +1,1541 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A single-file agentic AI framework - tools, memory, RAG, multi-agent, structured output.">
+      
+      
+      
+        <link rel="canonical" href="https://niravrvaghasiya.github.io/unchained/ARCHITECTURE/">
+      
+      
+        <link rel="prev" href="../USER_MANUAL/">
+      
+      
+        <link rel="next" href="../api/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Architecture - Unchained</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#system-architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Unchained" class="md-header__button md-logo" aria-label="Unchained" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Unchained
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/NiravRVaghasiya/unchained" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    NiravRVaghasiya/unchained
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Unchained" class="md-nav__button md-logo" aria-label="Unchained" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Unchained
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/NiravRVaghasiya/unchained" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    NiravRVaghasiya/unchained
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../USER_MANUAL/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Manual
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-principles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design Principles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#system-architecture-diagram" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System Architecture Diagram
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#component-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Component Details
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Component Details">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-tool-system-tool-class-tool-decorator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Tool System (Tool class + @tool decorator)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-llm-backend-unified-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. LLM Backend (Unified Interface)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-memory-sliding-window-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Memory (Sliding Window + Compression)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-rag-tf-idf-smoothed-idf-cosine-similarity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. RAG (TF-IDF + Smoothed IDF + Cosine Similarity)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#5-agent-core-react-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Agent Core (ReAct Loop)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#6-router-multi-agent-orchestration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Router (Multi-Agent Orchestration)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#data-flow-patterns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Data Flow Patterns
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Data Flow Patterns">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pattern-1-simple-qa" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 1: Simple Q&amp;A
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-2-tool-augmented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 2: Tool-Augmented
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-3-rag-augmented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 3: RAG-Augmented
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-4-multi-agent-synthesis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 4: Multi-Agent Synthesis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#pickmystack-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PickMyStack Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#file-structure-complete" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        File Structure (Complete)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#key-design-decisions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Design Decisions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key Design Decisions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-tf-idf-instead-of-embeddings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why TF-IDF instead of embeddings?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-sliding-window-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why sliding window memory?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-unified-llm-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why unified LLM interface?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-single-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why single file?
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#extension-points" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extension Points
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#performance-characteristics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Characteristics
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-principles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design Principles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#system-architecture-diagram" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        System Architecture Diagram
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#component-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Component Details
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Component Details">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-tool-system-tool-class-tool-decorator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Tool System (Tool class + @tool decorator)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-llm-backend-unified-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. LLM Backend (Unified Interface)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-memory-sliding-window-compression" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Memory (Sliding Window + Compression)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-rag-tf-idf-smoothed-idf-cosine-similarity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. RAG (TF-IDF + Smoothed IDF + Cosine Similarity)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#5-agent-core-react-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Agent Core (ReAct Loop)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#6-router-multi-agent-orchestration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Router (Multi-Agent Orchestration)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#data-flow-patterns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Data Flow Patterns
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Data Flow Patterns">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pattern-1-simple-qa" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 1: Simple Q&amp;A
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-2-tool-augmented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 2: Tool-Augmented
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-3-rag-augmented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 3: RAG-Augmented
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#pattern-4-multi-agent-synthesis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pattern 4: Multi-Agent Synthesis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#pickmystack-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        PickMyStack Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#file-structure-complete" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        File Structure (Complete)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#key-design-decisions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Design Decisions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key Design Decisions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-tf-idf-instead-of-embeddings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why TF-IDF instead of embeddings?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-sliding-window-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why sliding window memory?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-unified-llm-interface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why unified LLM interface?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-single-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why single file?
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#extension-points" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extension Points
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#performance-characteristics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Characteristics
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="system-architecture">System Architecture<a class="headerlink" href="#system-architecture" title="Permanent link">&para;</a></h1>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>Unchained is a <strong>single-file agentic AI framework</strong> that provides everything needed to build intelligent AI agents — tool calling, memory, retrieval-augmented generation, multi-agent orchestration, and structured output.</p>
+<p>For the exact current size, run <code>python benchmarks/compare_frameworks.py</code> (it
+counts live rather than relying on a number in prose, which goes stale as the
+file grows).</p>
+<h2 id="design-principles">Design Principles<a class="headerlink" href="#design-principles" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Single-file core</strong> — Everything in <code>unchained.py</code>, no submodules</li>
+<li><strong>Two dependencies</strong> — <code>requests</code> + <code>pydantic</code> only</li>
+<li><strong>Provider-agnostic</strong> — Same code works with OpenAI, Anthropic, local Ollama, or any OpenAI-compatible endpoint</li>
+<li><strong>No magic</strong> — No metaclasses, no runtime patching, no hidden state</li>
+<li><strong>Composition over inheritance</strong> — Agents compose tools, memory, and RAG</li>
+</ol>
+<hr />
+<h2 id="system-architecture-diagram">System Architecture Diagram<a class="headerlink" href="#system-architecture-diagram" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                              UNCHAINED FRAMEWORK                              │
+│                                (unchained.py)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                         MULTI-AGENT LAYER                           │    │
+│  │  ┌──────────┐                                                       │    │
+│  │  │  Router  │ → Intent classification → Route to best agent         │    │
+│  │  │          │ → run_all(): parallel execution + synthesis           │    │
+│  │  └──────────┘                                                       │    │
+│  └────────────────────────────────┬────────────────────────────────────┘    │
+│                                   │                                         │
+│  ┌────────────────────────────────▼────────────────────────────────────┐    │
+│  │                          AGENT CORE                                 │    │
+│  │                                                                     │    │
+│  │   ┌──────────────────────────────────────────────────────────┐      │    │
+│  │   │                    Agent Loop                             │      │    │
+│  │   │  ┌─────────┐    ┌─────────┐    ┌─────────┐              │      │    │
+│  │   │  │  THINK  │───▶│   ACT   │───▶│ OBSERVE │──┐           │      │    │
+│  │   │  │ (LLM)   │    │ (Tool)  │    │(Result) │  │           │      │    │
+│  │   │  └─────────┘    └─────────┘    └─────────┘  │           │      │    │
+│  │   │       ▲                                      │           │      │    │
+│  │   │       └──────────────────────────────────────┘           │      │    │
+│  │   │                  (repeat until done)                     │      │    │
+│  │   └──────────────────────────────────────────────────────────┘      │    │
+│  │                                                                     │    │
+│  └──┬──────────────┬──────────────┬──────────────┬─────────────────────┘    │
+│     │              │              │              │                           │
+│  ┌──▼───┐  ┌──────▼─────┐  ┌────▼────┐  ┌─────▼──────┐                    │
+│  │ LLM  │  │   Memory   │  │   RAG   │  │   Tools    │                    │
+│  │      │  │            │  │         │  │            │                    │
+│  │OpenAI│  │ Window(20) │  │ TF-IDF  │  │ @tool deco │                    │
+│  │Anthro│  │ + Summary  │  │ + Cosine │  │ Auto-schema│                    │
+│  │Ollama│  │ Compress   │  │ Smoothed │  │ Type infer │                    │
+│  └──────┘  └────────────┘  └─────────┘  └────────────┘                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                     STRUCTURED OUTPUT                               │    │
+│  │  Pydantic schema → JSON mode → validated response                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                          EXTERNAL DEPENDENCIES
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐
+│    requests      │  │    pydantic      │  │  LLM Provider (external)     │
+│  (HTTP client)   │  │ (validation)     │  │  • Ollama (localhost:11434)  │
+│                  │  │                  │  │  • OpenAI API                │
+│                  │  │                  │  │  • Anthropic API             │
+└──────────────────┘  └──────────────────┘  └──────────────────────────────┘
+</code></pre></div>
+<hr />
+<h2 id="component-details">Component Details<a class="headerlink" href="#component-details" title="Permanent link">&para;</a></h2>
+<h3 id="1-tool-system-tool-class-tool-decorator">1. Tool System (<code>Tool</code> class + <code>@tool</code> decorator)<a class="headerlink" href="#1-tool-system-tool-class-tool-decorator" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>@tool decorator
+     │
+     ├── Introspects function signature (inspect module)
+     ├── Extracts type hints → maps to JSON Schema types
+     │     scalars (str/int/float/bool), list, dict, Optional[X]
+     │     Literal[...] / Enum        → JSON Schema &quot;enum&quot;
+     │     nested Pydantic BaseModel  → inlined object schema
+     ├── Extracts docstring → becomes tool description
+     ├── Identifies optional params (has default value)
+     ├── Detects async def            → run() drives it via asyncio.run()
+     │
+     └── Produces OpenAI-compatible function schema:
+         {
+           &quot;type&quot;: &quot;function&quot;,
+           &quot;function&quot;: {
+             &quot;name&quot;: &quot;...&quot;,
+             &quot;description&quot;: &quot;...&quot;,
+             &quot;parameters&quot;: { &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {...} }
+           }
+         }
+</code></pre></div>
+<p>When an agent turn produces more than one tool call, <code>Agent._execute_calls</code>
+runs them concurrently on a <code>ThreadPoolExecutor</code> (most tools are I/O-bound)
+and feeds the results back to the model in the original order.</p>
+<h3 id="2-llm-backend-unified-interface">2. LLM Backend (Unified Interface)<a class="headerlink" href="#2-llm-backend-unified-interface" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>LLM.chat(messages, tools, response_format)
+     │
+     ├── provider == &quot;openai&quot;
+     │   └── POST /v1/chat/completions
+     │       └── Returns: {content, tool_calls[], usage}
+     │
+     ├── provider == &quot;anthropic&quot;
+     │   └── POST /v1/messages
+     │       └── Converts: system msg → system param
+     │       └── Converts: tools → Anthropic tool format
+     │       └── Returns: {content, tool_calls[], usage}
+     │
+     └── provider == &quot;ollama&quot;
+         └── POST /api/chat
+             └── Returns: {content, tool_calls[], usage}
+
+All providers return IDENTICAL response format:
+{
+  &quot;content&quot;: str,        # Text response
+  &quot;tool_calls&quot;: [        # Tools the LLM wants to call
+    {&quot;name&quot;: str, &quot;arguments&quot;: dict}
+  ],
+  &quot;usage&quot;: dict          # Token counts
+}
+
+Cross-cutting LLM behaviour:
+  • base_url per provider can come from an env var (OPENAI_BASE_URL /
+    ANTHROPIC_BASE_URL / OLLAMA_BASE_URL) - this is what lets provider=&quot;openai&quot;
+    target any OpenAI-compatible endpoint with no code change.
+  • Requests go through a persistent requests.Session (one per LLM instance)
+    so repeated calls reuse the TCP/TLS connection.
+  • cache=True stores responses in a bounded LRU (cache_size, default 256)
+    with an optional cache_ttl, rather than an unbounded dict.
+  • achat() offloads chat() to a worker thread (asyncio.to_thread) so it can
+    be awaited from async code - it does not add non-blocking sockets.
+</code></pre></div>
+<h3 id="3-memory-sliding-window-compression">3. Memory (Sliding Window + Compression)<a class="headerlink" href="#3-memory-sliding-window-compression" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>                    max_messages = 20
+┌─────────────────────────────────────────────┐
+│ [msg1] [msg2] ... [msg18] [msg19] [msg20]   │  ← Window full
+└─────────────────────────────────────────────┘
+                      │
+            Overflow triggers _compress()
+                      │
+                      ▼
+┌──────────────┐  ┌───────────────────────────┐
+│   Summary    │  │ [msg11] ... [msg19] [msg20]│  ← Keeps recent half
+│ (compressed) │  │                           │
+│  msg1-msg10  │  │                           │
+└──────────────┘  └───────────────────────────┘
+
+Compression strategies:
+  • With LLM: Summarizes overflow via LLM call
+  • Without LLM: Truncates to first 100 chars per message
+
+Optional max_tokens (rough 4-chars/token estimate, no tokenizer dependency):
+  a message-count window alone can&#39;t promise a token budget - a handful of
+  very long messages can still overflow the context window even under a
+  small max_messages. When set, _compress() keeps shrinking the retained
+  window below max_messages // 2 (down to a minimum of 1 message) until the
+  kept messages fit the token budget too.
+</code></pre></div>
+<h3 id="4-rag-tf-idf-smoothed-idf-cosine-similarity">4. RAG (TF-IDF + Smoothed IDF + Cosine Similarity)<a class="headerlink" href="#4-rag-tf-idf-smoothed-idf-cosine-similarity" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>Documents → Tokenize → TF (term frequency per doc)
+                            │
+                            ▼
+              IDF = log((1 + n) / (1 + df)) + 1   ← Smoothed (sklearn-style)
+                            │
+                            ▼
+              TF-IDF Matrix (sparse, in-memory)
+                            │
+Query ─────────────────────▶│
+                            │
+              Cosine Similarity = dot(q, d) / (|q| * |d|)
+                            │
+                            ▼
+              Ranked results [{text, score, metadata}]
+
+Why smoothed IDF?
+  • Standard log(n/df) → 0 when term appears in all docs
+  • Smoothed version always produces positive scores
+  • Works correctly even with 2-3 documents
+</code></pre></div>
+<h3 id="5-agent-core-react-loop">5. Agent Core (ReAct Loop)<a class="headerlink" href="#5-agent-core-react-loop" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>agent.run(user_input)
+     │
+     ├── [1] RAG augmentation (if rag provided)
+     │        └── Search → prepend context to input
+     │
+     ├── [2] Add to memory
+     │
+     └── [3] Loop (max_iterations):
+              │
+              ├── Build messages (system + summary + history)
+              ├── Call LLM with tool schemas
+              │
+              ├── IF no tool_calls → return content (DONE)
+              │
+              └── IF tool_calls:
+                   ├── Execute all of this turn&#39;s tools (concurrently if &gt;1)
+                   ├── Add each tool call + result to memory, in order
+                   └── Continue loop (LLM sees results next iteration)
+</code></pre></div>
+<p><code>agent.arun(...)</code> offloads the whole method above to a worker thread via
+<code>asyncio.to_thread</code>, so it can be awaited from async code (FastAPI, aiohttp,
+...) without blocking the event loop.</p>
+<h3 id="6-router-multi-agent-orchestration">6. Router (Multi-Agent Orchestration)<a class="headerlink" href="#6-router-multi-agent-orchestration" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>router.route(query)              router.run_all(query)
+     │                                │
+     ├── Build agent descriptions     ├── For each agent:
+     ├── Ask LLM: &quot;which agent?&quot;      │   └── agent.run(query)
+     ├── Fuzzy-match agent name       │
+     └── Delegate to chosen agent     └── Return {name: result}
+
+PickMyStack uses run_all() → Synthesizer pattern:
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ CostAgent│  │ FitAgent │  │TrendAgent│   ← All run in parallel
+  └────┬─────┘  └────┬─────┘  └────┬─────┘
+       │              │              │
+       └──────────────┼──────────────┘
+                      ▼
+              ┌──────────────┐
+              │ Synthesizer  │   ← Combines all results
+              └──────────────┘
+                      │
+                      ▼
+              Final Recommendation
+</code></pre></div>
+<hr />
+<h2 id="data-flow-patterns">Data Flow Patterns<a class="headerlink" href="#data-flow-patterns" title="Permanent link">&para;</a></h2>
+<h3 id="pattern-1-simple-qa">Pattern 1: Simple Q&amp;A<a class="headerlink" href="#pattern-1-simple-qa" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>User → Agent → LLM → Response
+</code></pre></div>
+<h3 id="pattern-2-tool-augmented">Pattern 2: Tool-Augmented<a class="headerlink" href="#pattern-2-tool-augmented" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>User → Agent → LLM → [tool_call] → Tool → LLM → Response
+                ↑                              │
+                └──────────── loop ────────────┘
+</code></pre></div>
+<h3 id="pattern-3-rag-augmented">Pattern 3: RAG-Augmented<a class="headerlink" href="#pattern-3-rag-augmented" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>User → RAG.search() → [context] → Agent → LLM → Response
+</code></pre></div>
+<h3 id="pattern-4-multi-agent-synthesis">Pattern 4: Multi-Agent Synthesis<a class="headerlink" href="#pattern-4-multi-agent-synthesis" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code>User → Router.run_all() → Agent_A → result_a ─┐
+                        → Agent_B → result_b ──┤─→ Synthesizer → Final
+                        → Agent_C → result_c ─┘
+</code></pre></div>
+<hr />
+<h2 id="pickmystack-architecture">PickMyStack Architecture<a class="headerlink" href="#pickmystack-architecture" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>┌────────────────────────────────────────────────────────────────┐
+│                    STREAMLIT FRONTEND                           │
+│  ┌──────────────┐  ┌─────────────┐  ┌───────────────────┐     │
+│  │ Use Case     │  │ Constraints │  │ Progress Display  │     │
+│  │ (text input) │  │ (budget,    │  │ (real-time agent  │     │
+│  │              │  │  team, etc) │  │  status updates)  │     │
+│  └──────┬───────┘  └──────┬──────┘  └───────────────────┘     │
+│         └──────────────────┘                                   │
+│                    │                                           │
+└────────────────────┼───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│                   UNCHAINED BACKEND                              │
+│                                                                │
+│  ┌─────────────────────┐                                       │
+│  │   Knowledge Base    │  ← RAG over framework docs            │
+│  │   (frameworks.md,   │    (models_guide.md, pricing,         │
+│  │    models_guide.md, │     deployment_options.md)             │
+│  │    deploy.md)       │                                       │
+│  └─────────┬───────────┘                                       │
+│            │                                                   │
+│  ┌─────────▼───────────────────────────────────────────┐       │
+│  │              EVALUATION PIPELINE                     │       │
+│  │                                                     │       │
+│  │  ┌────────────┐ ┌───────────┐ ┌─────────────┐      │       │
+│  │  │ CostAgent  │ │ FitAgent  │ │ TrendAgent  │      │       │
+│  │  │ • pricing  │ │ • scoring │ │ • GitHub    │      │       │
+│  │  │ • hosting  │ │ • match % │ │ • community │      │       │
+│  │  │ • TCO      │ │ • fit     │ │ • momentum  │      │       │
+│  │  └─────┬──────┘ └─────┬─────┘ └──────┬──────┘      │       │
+│  │        └───────────────┼──────────────┘             │       │
+│  │                        ▼                            │       │
+│  │               ┌─────────────────┐                   │       │
+│  │               │   Synthesizer   │                   │       │
+│  │               │  (Final rank)   │                   │       │
+│  │               └────────┬────────┘                   │       │
+│  └────────────────────────┼────────────────────────────┘       │
+│                           │                                    │
+└───────────────────────────┼────────────────────────────────────┘
+                            ▼
+                   ┌─────────────────┐
+                   │ TOP 3 STACKS    │
+                   │ with reasoning  │
+                   └─────────────────┘
+</code></pre></div>
+<hr />
+<h2 id="file-structure-complete">File Structure (Complete)<a class="headerlink" href="#file-structure-complete" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>unchained/
+├── unchained.py                  ← THE framework (single file)
+├── pyproject.toml               ← Package config + dependencies
+├── README.md                    ← Star-attracting documentation
+├── LICENSE                      ← MIT License
+├── .gitignore
+├── examples/
+│   ├── researcher.py            ← Web research agent
+│   ├── coder.py                 ← Code execution agent
+│   ├── data_analyst.py          ← CSV analysis agent
+│   ├── quickstart.py            ← Zero-setup tour using MockLLM
+│   ├── sqlite_memory.py         ← Persistent, session-scoped Memory
+│   └── pickmystack/             ← Flagship multi-agent app
+│       ├── app.py               ← CLI entry point
+│       ├── tools/
+│       │   ├── cost_estimator.py    ← Pricing data + estimation
+│       │   ├── benchmark_fetcher.py ← Framework comparison data
+│       │   └── doc_retriever.py     ← RAG search over knowledge
+│       ├── knowledge/
+│       │   ├── frameworks_comparison.md
+│       │   ├── models_guide.md
+│       │   └── deployment_options.md
+│       └── ui/
+│           ├── app_ui.py        ← Streamlit web interface
+│           ├── requirements.txt ← UI dependencies
+│           ├── Dockerfile       ← Container deployment
+│           ├── README_DEPLOY.md ← Deployment guide
+│           └── .streamlit/
+│               └── config.toml  ← Theme configuration
+├── benchmarks/
+│   └── compare_frameworks.py    ← Unchained vs LangChain vs CrewAI
+├── tests/
+│   └── test_unchained.py         ← Unit tests (pytest)
+└── docs/
+    ├── ARCHITECTURE.md          ← This file
+    └── USER_MANUAL.md           ← Non-technical user guide
+</code></pre></div>
+<hr />
+<h2 id="key-design-decisions">Key Design Decisions<a class="headerlink" href="#key-design-decisions" title="Permanent link">&para;</a></h2>
+<h3 id="why-tf-idf-instead-of-embeddings">Why TF-IDF instead of embeddings?<a class="headerlink" href="#why-tf-idf-instead-of-embeddings" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Zero additional dependencies (no sentence-transformers, no API calls)</li>
+<li>Works offline, instant indexing</li>
+<li>Good enough for 100-1000 documents</li>
+<li>Uses smoothed IDF (sklearn-style) for small corpus robustness</li>
+<li>Can be swapped for embeddings later (same interface)</li>
+</ul>
+<h3 id="why-sliding-window-memory">Why sliding window memory?<a class="headerlink" href="#why-sliding-window-memory" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Predictable token usage (no surprise $100 bills)</li>
+<li>Simple to reason about</li>
+<li>Summary compression preserves key context</li>
+<li>No external database needed</li>
+</ul>
+<h3 id="why-unified-llm-interface">Why unified LLM interface?<a class="headerlink" href="#why-unified-llm-interface" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Switch providers with one line change</li>
+<li>Test with free Ollama, deploy with cloud</li>
+<li>Same code works everywhere</li>
+<li>No provider lock-in</li>
+</ul>
+<h3 id="why-single-file">Why single file?<a class="headerlink" href="#why-single-file" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Entire framework readable in one sitting, no jumping between submodules</li>
+<li>Copy <code>unchained.py</code> into any project — no install needed</li>
+<li>Easy to audit, understand, and modify</li>
+<li>Forces discipline: every line must earn its place</li>
+</ul>
+<hr />
+<h2 id="extension-points">Extension Points<a class="headerlink" href="#extension-points" title="Permanent link">&para;</a></h2>
+<p>Unchained is designed to be extended, not forked:</p>
+<table>
+<thead>
+<tr>
+<th>Extension</th>
+<th>How</th>
+<th>Difficulty</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New tools</td>
+<td><code>@tool</code> decorator on any function (sync or async)</td>
+<td>Easy</td>
+</tr>
+<tr>
+<td>New LLM provider</td>
+<td>Add <code>_provider_name()</code> method to <code>LLM</code></td>
+<td>Easy</td>
+</tr>
+<tr>
+<td>OpenAI-compatible provider</td>
+<td>Reuse <code>provider="openai"</code> with a different <code>base_url</code></td>
+<td>Easy</td>
+</tr>
+<tr>
+<td>Better retrieval</td>
+<td>Replace <code>RAG._rebuild_index()</code> + <code>search()</code></td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Persistent memory</td>
+<td>Subclass <code>Memory</code>, add SQLite backend</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>Custom routing</td>
+<td>Subclass <code>Router</code>, override <code>route()</code></td>
+<td>Medium</td>
+</tr>
+<tr>
+<td>True async HTTP</td>
+<td>Subclass <code>LLM</code>, override <code>chat()</code>/<code>_request()</code> with an async client</td>
+<td>Medium</td>
+</tr>
+</tbody>
+</table>
+<p>Streaming and thread-offloaded async (<code>arun</code>/<code>achat</code>) already ship in core -
+see <code>LLM.stream()</code>, <code>Agent.stream()</code>, <code>Agent.arun()</code>, <code>LLM.achat()</code>.</p>
+<hr />
+<h2 id="performance-characteristics">Performance Characteristics<a class="headerlink" href="#performance-characteristics" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Time Complexity</th>
+<th>Space</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tool registration</td>
+<td>O(1)</td>
+<td>O(params)</td>
+</tr>
+<tr>
+<td>RAG indexing</td>
+<td>O(n × d)</td>
+<td>O(n × vocab)</td>
+</tr>
+<tr>
+<td>RAG search</td>
+<td>O(n × vocab)</td>
+<td>O(n)</td>
+</tr>
+<tr>
+<td>Memory add</td>
+<td>O(1) amortized</td>
+<td>O(max_messages)</td>
+</tr>
+<tr>
+<td>Memory compress</td>
+<td>O(overflow)</td>
+<td>O(1)</td>
+</tr>
+<tr>
+<td>Agent.run()</td>
+<td>O(iterations × LLM latency)</td>
+<td>O(messages)</td>
+</tr>
+</tbody>
+</table>
+<p>Where: n = documents, d = avg document length, vocab = unique terms</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "search.suggest"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
