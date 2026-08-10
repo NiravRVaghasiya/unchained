@@ -109,6 +109,21 @@ Tips for good tools:
 - Give the function a clear name and a one-line description (the text in triple quotes).
 - Add type hints (`a: int`) so the model knows what to send.
 - Keep each tool focused on one job.
+- If a parameter only makes sense as one of a fixed set of choices, use
+  `Literal[...]` so the model is told about the constraint instead of
+  guessing at free text:
+
+  ```python
+  from typing import Literal
+
+  @tool
+  def set_priority(level: Literal["low", "medium", "high"]) -> str:
+      """Set the ticket priority."""
+      ...
+  ```
+
+If a tool does network or disk I/O, you can write it as `async def` and the
+agent will still call it correctly through `tool.run(...)`.
 
 ## Remembering the conversation
 
@@ -120,6 +135,14 @@ from unchained import LLM, Agent, Memory
 
 llm = LLM(provider="ollama")
 agent = Agent(llm, memory=Memory(max_messages=20, llm=llm))
+```
+
+If your messages can be long, also cap the token budget - a message-count
+limit alone won't stop a handful of very long messages from overflowing the
+model's context window:
+
+```python
+agent = Agent(llm, memory=Memory(max_messages=20, max_tokens=4000, llm=llm))
 ```
 
 ## Answering from your own documents (RAG)
@@ -195,6 +218,32 @@ the whole thing:
 for piece in agent.stream("Explain how RAG works."):
     print(piece, end="", flush=True)
 ```
+
+## Using Unchained inside an async app
+
+If you're building with FastAPI, aiohttp, or another async framework, `await`
+an agent instead of calling it directly so it doesn't block the event loop:
+
+```python
+result = await agent.arun("Summarise this ticket.")
+```
+
+This runs the (still synchronous) request on a background thread rather than
+opening a non-blocking socket, so it's a convenience for fitting into async
+code, not a full async rewrite of the HTTP layer.
+
+## Using a different provider through the same OpenAI code path
+
+Plenty of providers (Groq, Together, OpenRouter, a local vLLM or LM Studio
+server) speak the same API shape as OpenAI. Point `provider="openai"` at them
+with `base_url` and nothing else changes:
+
+```python
+agent = Agent(LLM(provider="openai", model="llama-3.1-70b", base_url="https://api.groq.com/openai"))
+```
+
+Or set it once via the environment (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
+`OLLAMA_BASE_URL` - see `.env.example`) and leave your code unchanged.
 
 ## Seeing what your agent is doing
 

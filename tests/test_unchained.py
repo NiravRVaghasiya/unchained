@@ -6,10 +6,13 @@ keys or network access are required.
     pytest
 """
 
+import asyncio
+import enum
 import json
 import sys
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import pytest
 import requests
@@ -284,7 +287,7 @@ def test_unknown_provider_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Provider request/response handling (offline via monkeypatched requests.post)
+# Provider request/response handling (offline via a monkeypatched Session.post)
 # ---------------------------------------------------------------------------
 class _FakeResponse:
     def __init__(self, payload=None, status_code=200, headers=None, lines=None):
@@ -307,11 +310,16 @@ class _FakeResponse:
 def _patch_post(
     monkeypatch, payload=None, status_code=200, headers=None, lines=None, responses=None
 ):
-    """Patch unchained.requests.post; capture calls and optionally script responses."""
+    """Patch requests.Session.post; capture calls and optionally script responses.
+
+    LLM makes requests through a persistent ``requests.Session`` (for
+    connection reuse), so the fake is installed on the ``Session`` class
+    rather than on the ``requests.post`` module function.
+    """
     captured = {"calls": 0}
     queue = list(responses) if responses is not None else None
 
-    def fake_post(url, **kwargs):
+    def fake_post(self, url, **kwargs):
         captured["calls"] += 1
         captured["url"] = url
         captured["json"] = kwargs.get("json")
@@ -324,7 +332,7 @@ def _patch_post(
             return item
         return _FakeResponse(payload, status_code, headers, lines)
 
-    monkeypatch.setattr(unchained.requests, "post", fake_post)
+    monkeypatch.setattr(unchained.requests.Session, "post", fake_post)
     # Make retry backoff instant in tests.
     monkeypatch.setattr(unchained.time, "sleep", lambda *_: None)
     return captured
@@ -865,3 +873,392 @@ def test_coder_run_python_times_out(monkeypatch):
 
     monkeypatch.setattr(coder, "EXEC_TIMEOUT_SECONDS", 1)
     assert "timed out" in coder.run_python("while True:\n    pass")
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: richer tool schemas (Literal, Enum, nested BaseModel)
+# ---------------------------------------------------------------------------
+def test_tool_schema_literal_becomes_enum():
+    @tool
+    def set_mode(mode: Literal["heat", "cool", "off"]) -> str:
+        """Set the mode."""
+        return mode
+
+    props = set_mode.schema["function"]["parameters"]["properties"]
+    assert props["mode"] == {"type": "string", "enum": ["heat", "cool", "off"]}
+
+
+def test_tool_schema_literal_mixed_types_omits_single_type():
+    @tool
+    def pick(value: Literal[1, "two", 3]) -> str:
+        """Pick a value."""
+        return str(value)
+
+    props = pick.schema["function"]["parameters"]["properties"]
+    assert props["value"]["enum"] == [1, "two", 3]
+    assert "type" not in props["value"]  # mixed types -> no single JSON type
+
+
+def test_tool_schema_enum_class_becomes_enum():
+    class Color(enum.Enum):
+        RED = "red"
+        BLUE = "blue"
+
+    @tool
+    def paint(color: Color) -> str:
+        """Paint something."""
+        return color.value
+
+    props = paint.schema["function"]["parameters"]["properties"]
+    assert props["color"] == {"type": "string", "enum": ["red", "blue"]}
+
+
+def test_tool_schema_nested_pydantic_model_is_inlined():
+    class Address(BaseModel):
+        city: str
+        zip_code: str
+
+    @tool
+    def ship(address: Address) -> str:
+        """Ship to an address."""
+        return address.city
+
+    props = ship.schema["function"]["parameters"]["properties"]
+    assert props["address"]["type"] == "object"
+    assert "city" in props["address"]["properties"]
+    assert "zip_code" in props["address"]["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: async tools and agents
+# ---------------------------------------------------------------------------
+def test_async_tool_runs_via_tool_run():
+    @tool
+    async def async_add(a: int, b: int) -> int:
+        """Add two numbers asynchronously."""
+        return a + b
+
+    assert async_add.is_async is True
+    assert async_add.run({"a": 2, "b": 3}) == 5
+
+
+def test_async_tool_inside_running_loop_raises_clear_error():
+    @tool
+    async def async_add(a: int, b: int) -> int:
+        """Add two numbers asynchronously."""
+        return a + b
+
+    async def _inner():
+        # Calling the sync .run() from inside a running loop can't use
+        # asyncio.run() - it should fail with a clear, actionable message.
+        with pytest.raises(RuntimeError, match="already running"):
+            async_add.run({"a": 1, "b": 1})
+
+    asyncio.run(_inner())
+
+
+def test_agent_with_async_tool_end_to_end():
+    @tool
+    async def fetch(ticker: str) -> str:
+        """Fetch a price."""
+        return f"{ticker}:100"
+
+    llm = FakeLLM(
+        [
+            {"tool_calls": [{"name": "fetch", "arguments": {"ticker": "ACME"}, "id": "1"}]},
+            {"content": "It's 100."},
+        ]
+    )
+    agent = Agent(llm, tools=[fetch])
+    assert agent.run("price?") == "It's 100."
+    tool_msgs = [m for m in agent.memory.get() if m["role"] == "tool"]
+    assert tool_msgs[0]["content"] == "ACME:100"
+
+
+def test_agent_arun_matches_sync_run():
+    llm = FakeLLM([{"content": "async answer"}])
+    agent = Agent(llm)
+    result = asyncio.run(agent.arun("hi"))
+    assert result == "async answer"
+
+
+def test_llm_achat_offloads_to_thread(monkeypatch):
+    payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
+    _patch_post(monkeypatch, payload)
+    llm = LLM(provider="openai", api_key="k")
+
+    async def _inner():
+        return await llm.achat([{"role": "user", "content": "hi"}])
+
+    out = asyncio.run(_inner())
+    assert out["content"] == "hi"
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: concurrent tool-call execution within a turn
+# ---------------------------------------------------------------------------
+def test_multiple_tool_calls_run_concurrently():
+    barrier = threading.Barrier(2, timeout=5)
+
+    @tool
+    def slow_a() -> str:
+        """Slow tool A."""
+        barrier.wait()  # only returns once both tools have started
+        return "a-done"
+
+    @tool
+    def slow_b() -> str:
+        """Slow tool B."""
+        barrier.wait()
+        return "b-done"
+
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {"name": "slow_a", "arguments": {}, "id": "1"},
+                    {"name": "slow_b", "arguments": {}, "id": "2"},
+                ]
+            },
+            {"content": "both done"},
+        ]
+    )
+    agent = Agent(llm, tools=[slow_a, slow_b])
+    # If calls ran sequentially, the second tool would block forever waiting
+    # on a barrier the first tool (already returned) can never reach again.
+    assert agent.run("go") == "both done"
+    tool_msgs = [m for m in agent.memory.get() if m["role"] == "tool"]
+    # Order in memory still matches the order the model requested them in.
+    assert [m["name"] for m in tool_msgs] == ["slow_a", "slow_b"]
+    assert [m["content"] for m in tool_msgs] == ["a-done", "b-done"]
+
+
+def test_single_tool_call_does_not_use_thread_pool(monkeypatch):
+    @tool
+    def solo() -> str:
+        """Solo tool."""
+        return "solo-done"
+
+    def _fail_if_constructed(*args, **kwargs):
+        raise AssertionError("a single tool call should skip the thread pool entirely")
+
+    monkeypatch.setattr(unchained, "ThreadPoolExecutor", _fail_if_constructed)
+
+    llm = FakeLLM(
+        [
+            {"tool_calls": [{"name": "solo", "arguments": {}, "id": "1"}]},
+            {"content": "done"},
+        ]
+    )
+    agent = Agent(llm, tools=[solo])
+    assert agent.run("go") == "done"
+    tool_msgs = [m for m in agent.memory.get() if m["role"] == "tool"]
+    assert tool_msgs[0]["content"] == "solo-done"
+
+
+def test_concurrent_tool_calls_during_streaming():
+    barrier = threading.Barrier(2, timeout=5)
+
+    @tool
+    def stream_a() -> str:
+        """Stream tool A."""
+        barrier.wait()
+        return "a"
+
+    @tool
+    def stream_b() -> str:
+        """Stream tool B."""
+        barrier.wait()
+        return "b"
+
+    class ToolThenStreamLLM:
+        def __init__(self):
+            self.chat_calls = 0
+
+        def chat(self, messages, tools=None, response_format=None):
+            self.chat_calls += 1
+            if self.chat_calls == 1:
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "stream_a", "arguments": {}, "id": "1"},
+                        {"name": "stream_b", "arguments": {}, "id": "2"},
+                    ],
+                    "usage": {},
+                }
+            return {"content": "", "tool_calls": [], "usage": {}}
+
+        def stream(self, messages):
+            yield "done"
+
+    agent = Agent(ToolThenStreamLLM(), tools=[stream_a, stream_b])
+    assert "".join(agent.stream("go")) == "done"
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: token-aware Memory
+# ---------------------------------------------------------------------------
+def test_memory_max_tokens_shrinks_window_further():
+    # Two huge messages alone (~1000 tokens each) already blow a 500-token
+    # budget, even though max_messages=20 wouldn't trigger compression yet.
+    memory = Memory(max_messages=20, max_tokens=500)
+    memory.add("user", "x" * 4000)  # ~1000 estimated tokens
+    memory.add("user", "y" * 4000)  # ~1000 estimated tokens more
+    kept = memory.get()
+    assert len(kept) <= 1  # shrunk below the message-count cap to fit budget
+    assert memory.summary  # the rest was compressed into the summary
+
+
+def test_memory_max_tokens_keeps_at_least_one_message():
+    memory = Memory(max_messages=20, max_tokens=1)  # impossible budget
+    memory.add("user", "hello world")
+    assert len(memory.get()) == 1  # never compresses away the last message
+
+
+def test_memory_without_max_tokens_ignores_token_budget():
+    # Default behaviour (max_tokens=None) is unaffected: only max_messages counts.
+    memory = Memory(max_messages=4)
+    memory.add("user", "x" * 10_000)  # would blow any reasonable token budget
+    assert len(memory.get()) == 1
+    assert memory.summary == ""  # no compression triggered yet (1 <= 4)
+
+
+def test_estimate_tokens_helper():
+    assert unchained._estimate_tokens("abcd") == 1  # 4 chars / 4 = 1 token
+    assert unchained._estimate_tokens("a" * 40) == 10
+    assert unchained._estimate_tokens("") == 1  # minimum of 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: HTTP session reuse
+# ---------------------------------------------------------------------------
+def test_llm_reuses_a_single_session_across_requests(monkeypatch):
+    payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
+    _patch_post(monkeypatch, payload)
+    llm = LLM(provider="openai", api_key="k")
+    assert isinstance(llm.session, requests.Session)
+    session_before = llm.session
+    llm.chat([{"role": "user", "content": "one"}])
+    llm.chat([{"role": "user", "content": "two"}])
+    # Same Session instance backs both calls - connections can be pooled.
+    assert llm.session is session_before
+
+
+def test_llm_close_closes_the_session():
+    llm = LLM(provider="openai", api_key="k")
+    closed = {"value": False}
+    original_close = llm.session.close
+
+    def fake_close():
+        closed["value"] = True
+        original_close()
+
+    llm.session.close = fake_close
+    llm.close()
+    assert closed["value"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: bounded + TTL response cache
+# ---------------------------------------------------------------------------
+def test_cache_evicts_oldest_entry_past_cache_size(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_post(self, url, **kwargs):
+        calls["n"] += 1
+        content = f"response-{calls['n']}"
+        return _FakeResponse(
+            {"choices": [{"message": {"content": content, "tool_calls": []}}], "usage": {}}
+        )
+
+    monkeypatch.setattr(unchained.requests.Session, "post", fake_post)
+    llm = LLM(provider="openai", api_key="k", cache=True, cache_size=2)
+
+    llm.chat([{"role": "user", "content": "one"}])
+    llm.chat([{"role": "user", "content": "two"}])
+    assert len(llm.cache) == 2
+
+    llm.chat([{"role": "user", "content": "three"}])  # evicts "one"
+    assert len(llm.cache) == 2
+    assert calls["n"] == 3
+
+    # "one" was evicted, so asking again re-fetches (call count increases).
+    llm.chat([{"role": "user", "content": "one"}])
+    assert calls["n"] == 4
+
+    # "three" is still cached (was not evicted).
+    llm.chat([{"role": "user", "content": "three"}])
+    assert calls["n"] == 4
+
+
+def test_cache_ttl_expires_old_entries(monkeypatch):
+    payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
+    captured = _patch_post(monkeypatch, payload)
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(unchained.time, "time", lambda: clock["now"])
+
+    llm = LLM(provider="openai", api_key="k", cache=True, cache_ttl=60)
+    messages = [{"role": "user", "content": "hi"}]
+    llm.chat(messages)
+    assert captured["calls"] == 1
+
+    clock["now"] += 30  # still within TTL
+    llm.chat(messages)
+    assert captured["calls"] == 1
+
+    clock["now"] += 40  # now 70s later - past the 60s TTL
+    llm.chat(messages)
+    assert captured["calls"] == 2
+
+
+def test_cache_without_ttl_never_expires(monkeypatch):
+    payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
+    captured = _patch_post(monkeypatch, payload)
+    llm = LLM(provider="openai", api_key="k", cache=True)  # cache_ttl=None
+    messages = [{"role": "user", "content": "hi"}]
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: per-provider base_url environment variables
+# ---------------------------------------------------------------------------
+def test_openai_base_url_env_var_is_honoured(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.groq.com/openai")
+    llm = LLM(provider="openai", api_key="k")
+    assert llm.base_url == "https://api.groq.com/openai"
+
+
+def test_ollama_base_url_env_var_is_honoured(monkeypatch):
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://remote-ollama:11434")
+    llm = LLM(provider="ollama")
+    assert llm.base_url == "http://remote-ollama:11434"
+
+
+def test_explicit_base_url_wins_over_env_var(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://from-env.example.com")
+    llm = LLM(provider="openai", api_key="k", base_url="https://explicit.example.com")
+    assert llm.base_url == "https://explicit.example.com"
+
+
+def test_no_env_var_falls_back_to_provider_default(monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    llm = LLM(provider="openai", api_key="k")
+    assert llm.base_url == "https://api.openai.com"
+
+
+def test_pydantic_schema_helper_handles_v1_and_non_pydantic():
+    class FakeV1Model:
+        """Duck-types a pydantic v1 model (schema() but no model_json_schema())."""
+
+        @staticmethod
+        def schema():
+            return {"v1": True}
+
+    class NotAModel:
+        pass
+
+    assert unchained._pydantic_schema(FakeV1Model) == {"v1": True}
+    assert unchained._pydantic_schema(NotAModel) == {}

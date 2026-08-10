@@ -34,11 +34,26 @@ HOSTING = {
 
 
 def _closest_model(name: str) -> str:
-    name = (name or "").lower().replace(" ", "").replace("_", "-")
+    """Match a free-text model name to the closest known pricing key.
+
+    Tries an exact match first, then falls back to the *longest* known key
+    that is a substring match either way. Longest-match matters: without it,
+    a plain first-match scan would resolve "gpt-4o-mini" to "gpt-4o" (since
+    "gpt4o" is a substring of "gpt4omini" and "gpt-4o" happens to be defined
+    first in MODEL_PRICING), silently pricing it ~16x too high.
+    """
+    normalized = (name or "").lower().replace(" ", "").replace("_", "").replace("-", "")
+    if not normalized:
+        return "gpt-4o-mini"
     for key in MODEL_PRICING:
-        compact = key.replace("-", "")
-        if compact in name.replace("-", "") or name.replace("-", "") in compact:
+        if key.replace("-", "") == normalized:
             return key
+    contains_input = [k for k in MODEL_PRICING if k.replace("-", "") in normalized]
+    if contains_input:
+        return max(contains_input, key=len)
+    input_contains = [k for k in MODEL_PRICING if normalized in k.replace("-", "")]
+    if input_contains:
+        return max(input_contains, key=len)
     return "gpt-4o-mini"
 
 

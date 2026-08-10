@@ -2,13 +2,17 @@
 
 ## Overview
 
-Unchained is a **single-file agentic AI framework** (417 lines) that provides everything needed to build intelligent AI agents — tool calling, memory, retrieval-augmented generation, multi-agent orchestration, and structured output.
+Unchained is a **single-file agentic AI framework** that provides everything needed to build intelligent AI agents — tool calling, memory, retrieval-augmented generation, multi-agent orchestration, and structured output.
+
+For the exact current size, run `python benchmarks/compare_frameworks.py` (it
+counts live rather than relying on a number in prose, which goes stale as the
+file grows).
 
 ## Design Principles
 
-1. **Single-file core** — Everything in `unchained.py` (< 500 lines)
+1. **Single-file core** — Everything in `unchained.py`, no submodules
 2. **Two dependencies** — `requests` + `pydantic` only
-3. **Provider-agnostic** — Same code works with OpenAI, Anthropic, or local Ollama
+3. **Provider-agnostic** — Same code works with OpenAI, Anthropic, local Ollama, or any OpenAI-compatible endpoint
 4. **No magic** — No metaclasses, no runtime patching, no hidden state
 5. **Composition over inheritance** — Agents compose tools, memory, and RAG
 
@@ -19,7 +23,7 @@ Unchained is a **single-file agentic AI framework** (417 lines) that provides ev
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              UNCHAINED FRAMEWORK                              │
-│                           (unchained.py — 417 lines)                          │
+│                                (unchained.py)                                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
@@ -81,8 +85,12 @@ Unchained is a **single-file agentic AI framework** (417 lines) that provides ev
      │
      ├── Introspects function signature (inspect module)
      ├── Extracts type hints → maps to JSON Schema types
+     │     scalars (str/int/float/bool), list, dict, Optional[X]
+     │     Literal[...] / Enum        → JSON Schema "enum"
+     │     nested Pydantic BaseModel  → inlined object schema
      ├── Extracts docstring → becomes tool description
      ├── Identifies optional params (has default value)
+     ├── Detects async def            → run() drives it via asyncio.run()
      │
      └── Produces OpenAI-compatible function schema:
          {
@@ -94,6 +102,10 @@ Unchained is a **single-file agentic AI framework** (417 lines) that provides ev
            }
          }
 ```
+
+When an agent turn produces more than one tool call, `Agent._execute_calls`
+runs them concurrently on a `ThreadPoolExecutor` (most tools are I/O-bound)
+and feeds the results back to the model in the original order.
 
 ### 2. LLM Backend (Unified Interface)
 
@@ -122,6 +134,17 @@ All providers return IDENTICAL response format:
   ],
   "usage": dict          # Token counts
 }
+
+Cross-cutting LLM behaviour:
+  • base_url per provider can come from an env var (OPENAI_BASE_URL /
+    ANTHROPIC_BASE_URL / OLLAMA_BASE_URL) - this is what lets provider="openai"
+    target any OpenAI-compatible endpoint with no code change.
+  • Requests go through a persistent requests.Session (one per LLM instance)
+    so repeated calls reuse the TCP/TLS connection.
+  • cache=True stores responses in a bounded LRU (cache_size, default 256)
+    with an optional cache_ttl, rather than an unbounded dict.
+  • achat() offloads chat() to a worker thread (asyncio.to_thread) so it can
+    be awaited from async code - it does not add non-blocking sockets.
 ```
 
 ### 3. Memory (Sliding Window + Compression)
@@ -144,6 +167,13 @@ All providers return IDENTICAL response format:
 Compression strategies:
   • With LLM: Summarizes overflow via LLM call
   • Without LLM: Truncates to first 100 chars per message
+
+Optional max_tokens (rough 4-chars/token estimate, no tokenizer dependency):
+  a message-count window alone can't promise a token budget - a handful of
+  very long messages can still overflow the context window even under a
+  small max_messages. When set, _compress() keeps shrinking the retained
+  window below max_messages // 2 (down to a minimum of 1 message) until the
+  kept messages fit the token budget too.
 ```
 
 ### 4. RAG (TF-IDF + Smoothed IDF + Cosine Similarity)
@@ -188,10 +218,14 @@ agent.run(user_input)
               ├── IF no tool_calls → return content (DONE)
               │
               └── IF tool_calls:
-                   ├── Execute each tool
-                   ├── Add tool call + result to memory
+                   ├── Execute all of this turn's tools (concurrently if >1)
+                   ├── Add each tool call + result to memory, in order
                    └── Continue loop (LLM sees results next iteration)
 ```
+
+`agent.arun(...)` offloads the whole method above to a worker thread via
+`asyncio.to_thread`, so it can be awaited from async code (FastAPI, aiohttp,
+...) without blocking the event loop.
 
 ### 6. Router (Multi-Agent Orchestration)
 
@@ -303,15 +337,17 @@ User → Router.run_all() → Agent_A → result_a ─┐
 
 ```
 unchained/
-├── unchained.py                  ← THE framework (417 lines)
+├── unchained.py                  ← THE framework (single file)
 ├── pyproject.toml               ← Package config + dependencies
 ├── README.md                    ← Star-attracting documentation
 ├── LICENSE                      ← MIT License
 ├── .gitignore
 ├── examples/
-│   ├── researcher.py            ← Web research agent (30 lines)
-│   ├── coder.py                 ← Code execution agent (25 lines)
-│   ├── data_analyst.py          ← CSV analysis agent (20 lines)
+│   ├── researcher.py            ← Web research agent
+│   ├── coder.py                 ← Code execution agent
+│   ├── data_analyst.py          ← CSV analysis agent
+│   ├── quickstart.py            ← Zero-setup tour using MockLLM
+│   ├── sqlite_memory.py         ← Persistent, session-scoped Memory
 │   └── pickmystack/             ← Flagship multi-agent app
 │       ├── app.py               ← CLI entry point
 │       ├── tools/
@@ -362,7 +398,7 @@ unchained/
 - No provider lock-in
 
 ### Why single file?
-- Entire framework readable in 15 minutes
+- Entire framework readable in one sitting, no jumping between submodules
 - Copy `unchained.py` into any project — no install needed
 - Easy to audit, understand, and modify
 - Forces discipline: every line must earn its place
@@ -375,13 +411,16 @@ Unchained is designed to be extended, not forked:
 
 | Extension | How | Difficulty |
 |---|---|---|
-| New tools | `@tool` decorator on any function | Easy |
+| New tools | `@tool` decorator on any function (sync or async) | Easy |
 | New LLM provider | Add `_provider_name()` method to `LLM` | Easy |
+| OpenAI-compatible provider | Reuse `provider="openai"` with a different `base_url` | Easy |
 | Better retrieval | Replace `RAG._rebuild_index()` + `search()` | Medium |
 | Persistent memory | Subclass `Memory`, add SQLite backend | Medium |
 | Custom routing | Subclass `Router`, override `route()` | Medium |
-| Streaming | Modify `LLM.chat()` to yield chunks | Medium |
-| Async execution | Wrap with `asyncio` | Medium |
+| True async HTTP | Subclass `LLM`, override `chat()`/`_request()` with an async client | Medium |
+
+Streaming and thread-offloaded async (`arun`/`achat`) already ship in core -
+see `LLM.stream()`, `Agent.stream()`, `Agent.arun()`, `LLM.achat()`.
 
 ---
 

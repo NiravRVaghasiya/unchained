@@ -16,6 +16,8 @@ or local Ollama. No metaclasses, no runtime patching, no hidden state.
 
 from __future__ import annotations
 
+import asyncio
+import enum
 import inspect
 import json
 import logging
@@ -24,7 +26,7 @@ import os
 import random
 import re
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import (
@@ -33,6 +35,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Type,
     Union,
@@ -45,14 +48,17 @@ import requests
 
 try:
     from pydantic import BaseModel, ValidationError
+
+    _HAS_PYDANTIC = True
 except ImportError:  # pragma: no cover
     BaseModel = object  # type: ignore[assignment,misc]
     ValidationError = Exception  # type: ignore[assignment,misc]
+    _HAS_PYDANTIC = False
 
 logger = logging.getLogger("unchained")
 logger.addHandler(logging.NullHandler())
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "tool",
     "Tool",
@@ -89,17 +95,35 @@ _PY_TO_JSON = {
 }
 
 
+def _pydantic_schema(model: Type[Any]) -> Dict[str, Any]:
+    """Return a JSON schema for a Pydantic model, across v1 and v2."""
+    if hasattr(model, "model_json_schema"):
+        return model.model_json_schema()  # pydantic v2
+    if hasattr(model, "schema"):
+        return model.schema()  # pydantic v1
+    return {}
+
+
 class Tool:
     """Wrap a function as an LLM-callable tool with an auto-generated schema.
 
     Type hints become JSON-Schema types, the docstring becomes the description,
-    and parameters without a default are marked required.
+    and parameters without a default are marked required. Beyond the basic
+    scalars, ``Literal[...]`` and ``Enum`` subclasses become a JSON Schema
+    ``enum``, and a nested Pydantic ``BaseModel`` parameter is inlined as an
+    ``object`` with its own properties.
+
+    ``run()`` also accepts ``async def`` functions: the coroutine is executed
+    to completion via ``asyncio.run`` (see the "Async" note on ``run`` for the
+    one caveat - it cannot be called from inside a running event loop; use
+    ``await tool.func(...)`` directly in that case, or ``Agent.arun``).
     """
 
     def __init__(self, func: Callable[..., Any]):
         self.func = func
         self.name = func.__name__
         self.description = (inspect.getdoc(func) or "").strip()
+        self.is_async = inspect.iscoroutinefunction(func)
         self.schema = self._build_schema(func)
 
     def _build_schema(self, func: Callable[..., Any]) -> Dict[str, Any]:
@@ -126,6 +150,8 @@ class Tool:
 
     def _type_to_schema(self, hint: Any) -> Dict[str, Any]:
         origin = get_origin(hint)
+        if origin is Literal:
+            return self._enum_schema(get_args(hint))
         if origin in (list, List):
             args = get_args(hint)
             item = self._type_to_schema(args[0]) if args else {"type": "string"}
@@ -136,11 +162,45 @@ class Tool:
             real = [a for a in get_args(hint) if a is not type(None)]
             if real:
                 return self._type_to_schema(real[0])
+        if isinstance(hint, type) and issubclass(hint, enum.Enum):
+            return self._enum_schema([member.value for member in hint])
+        if _HAS_PYDANTIC and isinstance(hint, type) and issubclass(hint, BaseModel):
+            return _pydantic_schema(hint)
         return {"type": _PY_TO_JSON.get(hint, "string")}
 
+    @staticmethod
+    def _enum_schema(values: Any) -> Dict[str, Any]:
+        """Build a JSON Schema ``enum``, plus a ``type`` if every value shares one.
+
+        Shared by ``Literal[...]`` and ``Enum`` handling in ``_type_to_schema``.
+        """
+        values = list(values)
+        kinds = {_PY_TO_JSON.get(type(v), "string") for v in values}
+        base = {"type": kinds.pop()} if len(kinds) == 1 else {}
+        return {**base, "enum": values}
+
     def run(self, arguments: Dict[str, Any]) -> Any:
-        """Call the wrapped function with a dict of keyword arguments."""
-        return self.func(**(arguments or {}))
+        """Call the wrapped function with a dict of keyword arguments.
+
+        Async note: if the wrapped function is ``async def``, its coroutine is
+        driven to completion with ``asyncio.run``. That only works when no
+        event loop is already running in the current thread - inside async
+        code, ``await`` the tool's underlying function directly instead
+        (``await my_tool.func(**args)``), or drive the agent with
+        ``Agent.arun``, which offloads the whole turn to a worker thread.
+        """
+        result = self.func(**(arguments or {}))
+        if inspect.iscoroutine(result):
+            try:
+                return asyncio.run(result)
+            except RuntimeError as exc:
+                result.close()
+                raise RuntimeError(
+                    f"Tool '{self.name}' is async and can't be run with asyncio.run() "
+                    "because an event loop is already running on this thread. Await "
+                    "it directly, or call the agent via 'await Agent.arun(...)'."
+                ) from exc
+        return result
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.func(*args, **kwargs)
@@ -161,6 +221,14 @@ _PROVIDER_DEFAULTS = {
     "ollama": ("llama3.1", "http://localhost:11434"),
 }
 _PROVIDER_ENV_KEY = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+# Overriding these lets provider="openai" target any OpenAI-compatible
+# endpoint (Groq, Together, OpenRouter, vLLM, LM Studio, ...) with no code
+# change, and lets Ollama point at a non-default host without an argument.
+_PROVIDER_ENV_URL = {
+    "openai": "OPENAI_BASE_URL",
+    "anthropic": "ANTHROPIC_BASE_URL",
+    "ollama": "OLLAMA_BASE_URL",
+}
 
 
 class LLM:
@@ -183,6 +251,8 @@ class LLM:
         max_retries: int = 2,
         backoff: float = 0.5,
         cache: bool = False,
+        cache_size: int = 256,
+        cache_ttl: Optional[float] = None,
     ):
         self.provider = provider.lower().strip()
         if self.provider not in _PROVIDER_DEFAULTS:
@@ -191,12 +261,21 @@ class LLM:
             )
         default_model, default_url = _PROVIDER_DEFAULTS[self.provider]
         self.model = model or default_model
-        self.base_url = (base_url or default_url).rstrip("/")
+        env_url = os.getenv(_PROVIDER_ENV_URL.get(self.provider, ""))
+        self.base_url = (base_url or env_url or default_url).rstrip("/")
         self.temperature, self.max_tokens, self.timeout = temperature, max_tokens, timeout
         self.max_retries, self.backoff = max_retries, backoff
-        self.cache: Optional[Dict[str, Dict[str, Any]]] = {} if cache else None
+        self.cache_size, self.cache_ttl = cache_size, cache_ttl
+        # An LRU cache (OrderedDict, oldest first) capped at cache_size entries;
+        # each value optionally expires after cache_ttl seconds.
+        self.cache: Optional[OrderedDict[str, tuple[float, Dict[str, Any]]]] = (
+            OrderedDict() if cache else None
+        )
         env_key = _PROVIDER_ENV_KEY.get(self.provider)
         self.api_key = api_key or (os.getenv(env_key) if env_key else None)
+        # Reused across requests on this instance: cheaper than a fresh
+        # requests.post() each time thanks to TCP/TLS connection pooling.
+        self.session = requests.Session()
 
     def chat(
         self,
@@ -207,16 +286,58 @@ class LLM:
         """Send a chat request and return the normalised response dict.
 
         With ``cache=True`` identical requests are served from an in-memory
-        cache instead of hitting the provider again.
+        LRU cache (bounded by ``cache_size``, optionally expiring after
+        ``cache_ttl`` seconds) instead of hitting the provider again.
         """
         if self.cache is not None:
             key = self._cache_key(messages, tools, response_format)
-            if key in self.cache:
-                return self.cache[key]
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
             result = self._dispatch(messages, tools, response_format)
-            self.cache[key] = result
+            self._cache_put(key, result)
             return result
         return self._dispatch(messages, tools, response_format)
+
+    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        assert self.cache is not None
+        entry = self.cache.get(key)
+        if entry is None:
+            return None
+        timestamp, result = entry
+        if self.cache_ttl is not None and (time.time() - timestamp) > self.cache_ttl:
+            del self.cache[key]
+            return None
+        self.cache.move_to_end(key)  # refresh LRU order on hit
+        return result
+
+    def _cache_put(self, key: str, result: Dict[str, Any]) -> None:
+        assert self.cache is not None
+        self.cache[key] = (time.time(), result)
+        self.cache.move_to_end(key)
+        while len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)  # evict the oldest entry
+
+    async def achat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Tool]] = None,
+        response_format: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Async wrapper around :meth:`chat`.
+
+        Unchained's HTTP layer is built on the synchronous ``requests``
+        library by design (fewer dependencies, one code path to read). This
+        offloads the blocking call to a worker thread with
+        ``asyncio.to_thread`` so it can be awaited from async code without
+        blocking the event loop - it does not make the request itself
+        non-blocking or concurrent at the socket level.
+        """
+        return await asyncio.to_thread(self.chat, messages, tools, response_format)
+
+    def close(self) -> None:
+        """Close the underlying HTTP session. Optional; safe to skip."""
+        self.session.close()
 
     def _dispatch(
         self,
@@ -534,12 +655,17 @@ class LLM:
         return self._request(path, **kwargs).json()
 
     def _request(self, path: str, **kwargs: Any) -> requests.Response:
-        """POST with retries on connection errors and 429/5xx responses."""
+        """POST with retries on connection errors and 429/5xx responses.
+
+        Uses a persistent ``requests.Session`` so repeated calls on the same
+        ``LLM`` instance reuse the underlying TCP/TLS connection instead of
+        renegotiating one per request.
+        """
         url = f"{self.base_url}{path}"
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                resp = requests.post(url, timeout=self.timeout, **kwargs)
+                resp = self.session.post(url, timeout=self.timeout, **kwargs)
                 if resp.status_code in _RETRYABLE_STATUS:
                     raise _RetryableStatus(resp)
                 resp.raise_for_status()
@@ -659,21 +785,44 @@ class MockLLM(LLM):
 
 
 # --- 3. Memory (sliding window + compression) ------------------------------
+# A dependency-free rule of thumb (no tokenizer needed): English text averages
+# roughly 4 characters per token. It's approximate, but good enough to decide
+# when a window is at risk of overflowing a model's context window.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(content: Any) -> int:
+    return max(1, len(str(content)) // _CHARS_PER_TOKEN)
+
+
 class Memory:
     """Fixed sliding-window conversation memory.
 
     On overflow the oldest half is compressed into a running ``summary`` - via
     the LLM if one is supplied, otherwise by truncating each message to 100 chars.
+
+    ``max_messages`` bounds the window by message count. Optionally also pass
+    ``max_tokens`` to additionally shrink the retained window (using a rough
+    4-chars-per-token estimate, no tokenizer dependency) whenever the kept
+    messages alone would exceed it - message count alone can't promise a
+    token budget, since a handful of long messages can still blow the context
+    window even under a small ``max_messages``.
     """
 
-    def __init__(self, max_messages: int = 20, llm: Optional[LLM] = None):
+    def __init__(
+        self,
+        max_messages: int = 20,
+        llm: Optional[LLM] = None,
+        max_tokens: Optional[int] = None,
+    ):
         self.max_messages, self.llm = max_messages, llm
+        self.max_tokens = max_tokens
         self.messages: List[Dict[str, Any]] = []
         self.summary = ""
 
     def add(self, role: str, content: Any, **extra: Any) -> None:
         self.messages.append({"role": role, "content": content, **extra})
-        if len(self.messages) > self.max_messages:
+        if len(self.messages) > self.max_messages or self._over_token_budget():
             self._compress()
 
     def get(self) -> List[Dict[str, Any]]:
@@ -683,9 +832,25 @@ class Memory:
         self.messages.clear()
         self.summary = ""
 
+    def _over_token_budget(self) -> bool:
+        if self.max_tokens is None:
+            return False
+        return self._window_tokens(self.messages) > self.max_tokens
+
+    @staticmethod
+    def _window_tokens(messages: List[Dict[str, Any]]) -> int:
+        return sum(_estimate_tokens(m.get("content", "")) for m in messages)
+
     def _compress(self) -> None:
         keep = max(1, self.max_messages // 2)
-        overflow, self.messages = self.messages[:-keep], self.messages[-keep:]
+        overflow, kept = self.messages[:-keep], self.messages[-keep:]
+        # A message-count window can still bust a token budget (e.g. 20 huge
+        # messages), so keep shrinking from the front until it fits - but
+        # always leave at least the single most recent message.
+        if self.max_tokens is not None:
+            while len(kept) > 1 and self._window_tokens(kept) > self.max_tokens:
+                overflow.append(kept.pop(0))
+        self.messages = kept
         if not overflow:
             return
         rendered = "\n".join(f"{m.get('role')}: {m.get('content', '')}" for m in overflow)
@@ -909,15 +1074,7 @@ class Agent:
                 self.memory.add("assistant", answer)
                 break
             self.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-            for call in result["tool_calls"]:
-                observation = self._execute(call)
-                self._emit("on_tool_call", call["name"], call.get("arguments", {}), observation)
-                self.memory.add(
-                    "tool",
-                    observation,
-                    tool_call_id=call.get("id") or call["name"],
-                    name=call["name"],
-                )
+            self._execute_calls(result["tool_calls"])
         if answer is None:  # exhausted iterations - force a final answer
             answer = self._chat(
                 self._build_messages(response_format), response_format=response_format
@@ -949,15 +1106,7 @@ class Agent:
                 if not result["tool_calls"]:
                     break
                 self.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-                for call in result["tool_calls"]:
-                    observation = self._execute(call)
-                    self._emit("on_tool_call", call["name"], call.get("arguments", {}), observation)
-                    self.memory.add(
-                        "tool",
-                        observation,
-                        tool_call_id=call.get("id") or call["name"],
-                        name=call["name"],
-                    )
+                self._execute_calls(result["tool_calls"])
         chunks: List[str] = []
         for chunk in self.llm.stream(self._build_messages(None)):
             chunks.append(chunk)
@@ -965,6 +1114,18 @@ class Agent:
         answer = "".join(chunks)
         self.memory.add("assistant", answer)
         self._emit("on_finish", answer)
+
+    async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
+        """Async wrapper around :meth:`run`.
+
+        ``unchained`` has no separate async HTTP stack; this offloads the
+        whole (blocking) turn to a worker thread via ``asyncio.to_thread`` so
+        it can be awaited alongside other coroutines without blocking the
+        event loop. Handy for using an agent inside an async web framework
+        (FastAPI, aiohttp, ...) without switching the whole codebase to a
+        dedicated async HTTP client.
+        """
+        return await asyncio.to_thread(self.run, user_input, response_format)
 
     # -- instrumentation helpers --
     def _chat(
@@ -1013,6 +1174,29 @@ class Agent:
             )
         return [{"role": "system", "content": system}] + self.memory.get()
 
+    def _execute_calls(self, calls: List[Dict[str, Any]]) -> None:
+        """Run one turn's tool calls, add each result to memory in order.
+
+        A single call runs inline. Multiple independent calls (the model
+        asked for several tools in the same turn) run concurrently on a
+        thread pool - most tools are I/O-bound (HTTP, disk, subprocess), so
+        this cuts wall-clock latency for that turn without changing the
+        observed order of results.
+        """
+        if len(calls) == 1:
+            observations = [self._execute(calls[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+                observations = list(pool.map(self._execute, calls))
+        for call, observation in zip(calls, observations):
+            self._emit("on_tool_call", call["name"], call.get("arguments", {}), observation)
+            self.memory.add(
+                "tool",
+                observation,
+                tool_call_id=call.get("id") or call["name"],
+                name=call["name"],
+            )
+
     def _execute(self, call: Dict[str, Any]) -> str:
         tool_obj = self.tools.get(call["name"])
         if tool_obj is None:
@@ -1024,11 +1208,7 @@ class Agent:
 
     @staticmethod
     def _json_schema(schema: Type[BaseModel]) -> Dict[str, Any]:
-        if hasattr(schema, "model_json_schema"):
-            return schema.model_json_schema()  # pydantic v2
-        if hasattr(schema, "schema"):
-            return schema.schema()  # pydantic v1
-        return {}
+        return _pydantic_schema(schema)
 
     def _parse_structured(self, content: str, schema: Type[BaseModel]):
         """Validate content against the schema, repairing via the LLM on failure."""

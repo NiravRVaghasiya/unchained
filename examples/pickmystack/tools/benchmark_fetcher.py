@@ -8,14 +8,35 @@ multi-agent and RAG are supported out of the box.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+_ROOT = Path(__file__).resolve().parents[3]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from unchained import tool
+
+
+def _count_unchained_loc() -> int:
+    """Count Unchained's own non-blank, non-comment source lines, live.
+
+    Measured rather than hardcoded so this comparison can't silently go
+    stale as the framework grows (see benchmarks/compare_frameworks.py for
+    the same approach against the other frameworks).
+    """
+    try:
+        lines = 0
+        for raw in (_ROOT / "unchained.py").read_text(encoding="utf-8").splitlines():
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("#"):
+                lines += 1
+        return lines
+    except OSError:  # pragma: no cover - unchained.py always ships alongside this file
+        return 0
+
 
 # ease/momentum are 1-5 (higher is better/hotter).
 FRAMEWORKS = {
     "unchained": {
-        "lines_of_code": 619,
+        "lines_of_code": _count_unchained_loc(),
         "dependencies": 2,
         "ease": 5,
         "multi_agent": True,

@@ -5,11 +5,16 @@ it to judge how well a framework fits a given team, use case, and constraint.
 
 ## Unchained
 
-- Single-file core (~620 lines), two dependencies (requests + pydantic).
+- Single-file core, two dependencies (requests + pydantic). Run
+  `python benchmarks/compare_frameworks.py` for the current line count.
 - Best for: small teams, prototypes, learning, embedding an agent inside an existing app.
-- Strengths: tiny footprint, no lock-in, provider-agnostic (OpenAI/Anthropic/Ollama), easy to audit.
-- Weaknesses: no built-in streaming or async, retrieval is TF-IDF rather than vector embeddings.
-- Learning curve: very low. A developer can read the whole framework in 15 minutes.
+- Strengths: tiny footprint, no lock-in, provider-agnostic (OpenAI/Anthropic/Ollama and
+  any OpenAI-compatible endpoint), easy to audit. Supports streaming and has
+  thread-offloaded async helpers (`achat`/`arun`) for use inside async apps.
+- Weaknesses: no dedicated async HTTP client (async helpers offload to a thread pool
+  rather than using non-blocking sockets), retrieval is TF-IDF rather than vector
+  embeddings by default (pluggable via `embed_fn`).
+- Learning curve: very low. The core framework is small enough to read in one sitting.
 - License: MIT.
 
 ## LangChain

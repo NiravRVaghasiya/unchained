@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unchained-ai"
-version = "0.3.0"
+version = "0.4.0"
 description = "A single-file agentic AI framework: tools, memory, RAG, multi-agent orchestration and structured output with just two dependencies."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -65,6 +65,17 @@ Issues = "https://github.com/NiravRVaghasiya/unchained/issues"
 
 [tool.setuptools]
 py-modules = ["unchained"]
+# NOTE: no py.typed marker is shipped. PEP 561 does not define a mechanism
+# for module-only (py-modules) distributions to ship one inside the built
+# wheel - only package (directory) distributions can. Verified by building
+# and inspecting the wheel: setuptools' package-data / include-package-data
+# do not attach a data file to a bare py-modules entry, and mypy reports
+# "missing library stubs or py.typed marker" against the installed wheel
+# even with such a marker file present in the source tree. Making this
+# fully work for `pip install unchained-ai` would require converting
+# unchained.py into a package directory, which conflicts with the
+# single-file design. The core is still fully inline-typed and mypy-clean
+# when developed from source (which is also how CI type-checks it).
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
