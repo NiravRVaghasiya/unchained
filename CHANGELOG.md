@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Tool execution semantics.** A model can request several tools in one turn
+  and they all ran concurrently, with no way to say that a tool must not
+  overlap with itself. `@tool(concurrency="exclusive")` marks one that runs
+  alone: nothing else from that turn runs while it does.
+  - `concurrency="parallel"` is the default and is exactly the previous
+    behaviour - a turn of only parallel tools is still a single concurrent
+    batch. An unknown mode raises at decoration time.
+  - Mixed turns are defined: calls keep the order the model asked for,
+    consecutive parallel ones are grouped, and an exclusive call is a group
+    of one.
+  - `side_effects=True` still does **not** serialise anything - it describes
+    a tool to a policy and to the audit log. A tool whose concurrent calls
+    would race needs `concurrency="exclusive"` as well. Making
+    `side_effects` imply exclusivity would silently change scheduling for
+    tools already marked with it.
+  - The framework does not infer dependencies between different tools, and
+    the docs say so: a tool-call list expresses no ordering, and none can be
+    recovered from it. Exclusivity holds within a turn - two concurrent
+    sessions can still overlap, so process-wide exclusion needs a lock
+    inside the tool.
 - **Structured `AgentEvent` observability.** A flat, immutable event stream
   for logging, metrics and debugging - no OpenTelemetry, no new dependency,
   no tracing framework:

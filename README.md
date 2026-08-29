@@ -195,6 +195,43 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+Concurrency is fine until a tool races with itself. Mark those `exclusive`:
+
+```python
+@tool(concurrency="exclusive", side_effects=True)
+def append_ledger(entry: str) -> str:
+    """Two of these at once would interleave, so it runs alone."""
+```
+
+An exclusive call **runs on its own** — nothing else from that turn runs while
+it does. Calls keep the order the model asked for, with consecutive parallel
+ones grouped:
+
+```
+model asks for:  [read, read, append_ledger, read, append_ledger]
+runs as:         {read, read} → append_ledger → read → append_ledger
+```
+
+A turn of only parallel tools is a single group, which is exactly what every
+tool did before this existed — so nothing changes unless you opt in.
+
+> **`side_effects=True` does not serialize anything.** It describes a tool to
+> your `ToolPolicy` and to the audit log. If two concurrent calls would race,
+> you must also set `concurrency="exclusive"`.
+
+**The framework cannot infer dependencies, and does not pretend to.** A model
+emits a *list* of calls it wants; nothing in the protocol says the second
+depends on the first, and no amount of inspection can recover an ordering the
+model never expressed. `exclusive` is the one thing you can declare: *this
+tool must not overlap*. If two different tools must run in a particular order,
+that is a relationship only you know — express it in the tools themselves (one
+tool that does both steps), not by hoping the scheduler guesses.
+
+The guarantee is also **per turn**. Two exclusive calls in the same turn never
+overlap; the same tool called from two concurrent sessions still can, because
+those are separate runs. For process-wide exclusion, take a lock inside the
+tool.
+
 ### ⏱️ Tool timeouts — bounding the wait, not the work
 
 An LLM call has a timeout; a Python tool can block forever. Give a tool a

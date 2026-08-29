@@ -4846,3 +4846,260 @@ def test_logging_callback_handles_events():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 15: tool execution semantics
+#
+# Default is unchanged - everything in a turn runs together. A tool marked
+# concurrency="exclusive" runs alone. The race-sensitive tests below use a
+# read-modify-write that genuinely loses updates when run concurrently, so
+# they fail if exclusivity stops working rather than merely looking slower.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def overlap_tools():
+    """Tools that record how many of them ran at the same time."""
+    live = {"now": 0, "peak": 0}
+    order = []
+    guard = threading.Lock()
+
+    def track(tag):
+        with guard:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+            order.append(tag)
+        time.sleep(0.03)
+        with guard:
+            live["now"] -= 1
+
+    @tool
+    def par(tag: str = "p") -> str:
+        """Parallel by default."""
+        track(f"par:{tag}")
+        return f"par-{tag}"
+
+    @tool(concurrency="exclusive")
+    def excl(tag: str = "e") -> str:
+        """Runs alone."""
+        track(f"excl:{tag}")
+        return f"excl-{tag}"
+
+    @tool(side_effects=True)
+    def marked(tag: str = "m") -> str:
+        """Side-effecting but not exclusive."""
+        track(f"marked:{tag}")
+        return f"marked-{tag}"
+
+    return {"par": par, "excl": excl, "marked": marked, "live": live, "order": order}
+
+
+def _dispatch(agent, names):
+    calls = [
+        {"name": name, "arguments": {"tag": str(i)}, "id": f"c{i}"} for i, name in enumerate(names)
+    ]
+    session = agent.session()
+    agent._execute_calls(session, calls)
+    return [m["content"] for m in session.memory.get() if m["role"] == "tool"]
+
+
+# --- the default is unchanged ---------------------------------------------
+def test_parallel_tools_still_run_concurrently(overlap_tools):
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]], max_tool_workers=8)
+    _dispatch(agent, ["par"] * 6)
+    assert overlap_tools["live"]["peak"] > 1, "the default must stay concurrent"
+
+
+def test_tools_default_to_parallel(overlap_tools):
+    assert overlap_tools["par"].concurrency == "parallel"
+
+    @tool
+    def bare() -> str:
+        """Bare."""
+        return "x"
+
+    assert bare.concurrency == "parallel"
+
+
+def test_a_turn_of_only_parallel_calls_is_one_group(overlap_tools):
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]])
+    calls = [{"name": "par", "arguments": {}, "id": f"c{i}"} for i in range(5)]
+    groups = agent._schedule(calls)
+    assert len(groups) == 1 and len(groups[0]) == 5
+
+
+# --- exclusive tools -------------------------------------------------------
+def test_exclusive_tools_never_overlap(overlap_tools):
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["excl"]], max_tool_workers=8)
+    _dispatch(agent, ["excl"] * 5)
+    assert overlap_tools["live"]["peak"] == 1
+
+
+def test_an_exclusive_call_runs_alone_among_parallel_ones(overlap_tools):
+    # Defined behaviour for a mixed turn: the exclusive call is a group of
+    # one, so nothing else from the turn runs while it does.
+    agent = Agent(
+        FakeLLM([]), tools=[overlap_tools["par"], overlap_tools["excl"]], max_tool_workers=8
+    )
+    _dispatch(agent, ["par", "par", "excl", "par", "par"])
+    order = overlap_tools["order"]
+    exclusive_at = order.index("excl:2")
+    # Nothing started between the exclusive call starting and finishing:
+    # it is the only entry between the two parallel batches.
+    assert order[:2] == ["par:0", "par:1"] or sorted(order[:2]) == ["par:0", "par:1"]
+    assert order[exclusive_at] == "excl:2"
+    assert sorted(order[exclusive_at + 1 :]) == ["par:3", "par:4"]
+
+
+def test_results_stay_in_the_order_the_model_asked_for(overlap_tools):
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"], overlap_tools["excl"]])
+    results = _dispatch(agent, ["par", "excl", "par", "excl"])
+    assert results == ["par-0", "excl-1", "par-2", "excl-3"]
+
+
+def test_scheduling_groups_consecutive_parallel_calls(overlap_tools):
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"], overlap_tools["excl"]])
+    calls = [
+        {"name": name, "arguments": {}, "id": f"c{i}"}
+        for i, name in enumerate(["par", "par", "excl", "par", "excl", "excl", "par"])
+    ]
+    groups = [[c["name"] for c in group] for group in agent._schedule(calls)]
+    assert groups == [
+        ["par", "par"],
+        ["excl"],
+        ["par"],
+        ["excl"],
+        ["excl"],
+        ["par"],
+    ]
+
+
+def test_an_unknown_tool_is_scheduled_as_parallel(overlap_tools):
+    # It is refused in _execute long before anything runs, so it cannot race.
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]])
+    calls = [
+        {"name": "ghost", "arguments": {}, "id": "g"},
+        {"name": "par", "arguments": {}, "id": "p"},
+    ]
+    assert len(agent._schedule(calls)) == 1
+
+
+# --- race-sensitive behaviour ---------------------------------------------
+def _withdrawal_agent(mode):
+    balance = {"value": 100}
+
+    @tool(concurrency=mode)
+    def withdraw(amount: int = 10) -> str:
+        """Read-modify-write: two at once lose an update."""
+        current = balance["value"]
+        time.sleep(0.01)  # widen the interleaving window
+        balance["value"] = current - amount
+        return str(balance["value"])
+
+    return Agent(FakeLLM([]), tools=[withdraw], max_tool_workers=8), balance
+
+
+def test_an_exclusive_tool_does_not_lose_updates():
+    agent, balance = _withdrawal_agent("exclusive")
+    calls = [{"name": "withdraw", "arguments": {"amount": 10}, "id": f"w{i}"} for i in range(8)]
+    agent._execute_calls(agent.default_session, calls)
+    assert balance["value"] == 20  # 100 - 8*10, every update applied
+
+
+def test_the_same_tool_run_in_parallel_does_lose_updates():
+    # Proves the previous test measures something real: without exclusivity
+    # this read-modify-write interleaves and drops nearly every update.
+    agent, balance = _withdrawal_agent("parallel")
+    calls = [{"name": "withdraw", "arguments": {"amount": 10}, "id": f"w{i}"} for i in range(8)]
+    agent._execute_calls(agent.default_session, calls)
+    assert balance["value"] > 20  # updates were lost
+
+
+# --- side_effects is descriptive, not a schedule ---------------------------
+def test_side_effects_alone_does_not_serialise(overlap_tools):
+    # A real footgun: side_effects describes the tool to a policy and the
+    # audit log. It says nothing about whether concurrent calls are safe.
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["marked"]], max_tool_workers=8)
+    _dispatch(agent, ["marked"] * 4)
+    assert overlap_tools["marked"].concurrency == "parallel"
+    assert overlap_tools["live"]["peak"] > 1
+
+
+def test_a_tool_can_be_both_side_effecting_and_exclusive():
+    @tool(side_effects=True, concurrency="exclusive")
+    def append_ledger(entry: str = "x") -> str:
+        """Both."""
+        return "ok"
+
+    assert append_ledger.side_effects is True
+    assert append_ledger.concurrency == "exclusive"
+
+
+# --- configuration errors --------------------------------------------------
+def test_an_unknown_concurrency_mode_is_rejected_at_decoration():
+    with pytest.raises(ValueError) as excinfo:
+
+        @tool(concurrency="serial")
+        def bad() -> str:
+            """Bad."""
+            return "x"
+
+    assert "serial" in str(excinfo.value)
+    assert "parallel" in str(excinfo.value)
+
+
+def test_concurrency_survives_a_direct_tool_construction():
+    def plain() -> str:
+        """Plain."""
+        return "x"
+
+    assert Tool(plain, concurrency="exclusive").concurrency == "exclusive"
+    with pytest.raises(ValueError):
+        Tool(plain, concurrency="nonsense")
+
+
+# --- the limits of the guarantee ------------------------------------------
+def test_exclusivity_is_per_turn_not_process_wide():
+    # Documented limit: two runs, each with its own turn, can overlap. The
+    # scheduler orders one turn's calls, not the whole process.
+    live = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    @tool(concurrency="exclusive")
+    def slow() -> str:
+        """Exclusive within a turn."""
+        with guard:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        time.sleep(0.05)
+        with guard:
+            live["now"] -= 1
+        return "ok"
+
+    agent = Agent(FakeLLM([]), tools=[slow])
+    start = threading.Barrier(4)
+
+    def one_turn():
+        start.wait()
+        session = agent.session()
+        agent._execute_calls(session, [{"name": "slow", "arguments": {}, "id": "c"}])
+
+    threads = [threading.Thread(target=one_turn) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Separate turns are not serialised against each other - by design.
+    assert live["peak"] > 1
+
+
+def test_the_scheduler_does_not_infer_dependencies(overlap_tools):
+    # Two parallel tools stay in one group however they are ordered. Nothing
+    # in a tool-call list says the second depends on the first, and the
+    # framework does not pretend to know.
+    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]])
+    calls = [
+        {"name": "par", "arguments": {}, "id": "first"},
+        {"name": "par", "arguments": {}, "id": "second"},
+    ]
+    assert len(agent._schedule(calls)) == 1

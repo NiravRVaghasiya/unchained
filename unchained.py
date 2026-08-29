@@ -259,6 +259,12 @@ class _RetryableStatus(Exception):
 
 
 # --- 1. Tool system --------------------------------------------------------
+# How a tool may be scheduled when the model asks for several at once.
+#   "parallel"  - may run alongside anything else. The default, and what
+#                 every tool did before this existed.
+#   "exclusive" - runs on its own: nothing else from that turn runs while it
+#                 does. For tools whose concurrent calls would race.
+_CONCURRENCY_MODES = ("parallel", "exclusive")
 _PY_TO_JSON = {
     str: "string",
     int: "integer",
@@ -333,6 +339,12 @@ class Tool:
     * ``max_output_size`` - characters of result the agent will pass on to
       the model. Overrides ``Agent(max_tool_output_size=...)``. Also enforced
       by the agent, for the same reason.
+    * ``concurrency``  - ``"parallel"`` (default) or ``"exclusive"``. An
+      exclusive tool runs on its own: nothing else from that turn runs
+      while it does. Mark a tool exclusive when two of its calls, running at
+      once, would race. Note that ``side_effects=True`` does **not** imply
+      this - it describes the tool to a policy and to the audit log, and says
+      nothing about whether concurrent calls are safe.
 
     None of this is sent to the model. Metadata describes the tool to your
     policy; it is not a hint the model can read, argue with, or override.
@@ -359,7 +371,13 @@ class Tool:
         allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
         timeout: Optional[float] = None,
         max_output_size: Optional[int] = None,
+        concurrency: str = "parallel",
     ):
+        if concurrency not in _CONCURRENCY_MODES:
+            raise ValueError(
+                f"Unknown concurrency {concurrency!r} for tool {func.__name__!r}. "
+                f"Choose from {list(_CONCURRENCY_MODES)}."
+            )
         self.func = func
         self.name = func.__name__
         self.description = (inspect.getdoc(func) or "").strip()
@@ -372,6 +390,7 @@ class Tool:
         self.allowed = allowed
         self.timeout = timeout
         self.max_output_size = max_output_size
+        self.concurrency = concurrency
         self.accepts_kwargs = any(
             param.kind is inspect.Parameter.VAR_KEYWORD
             for param in inspect.signature(func).parameters.values()
@@ -649,6 +668,7 @@ def tool(
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = ...,
     timeout: Optional[float] = ...,
     max_output_size: Optional[int] = ...,
+    concurrency: str = ...,
 ) -> Callable[[Callable[..., Any]], Tool]: ...
 
 
@@ -661,6 +681,7 @@ def tool(
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
     timeout: Optional[float] = None,
     max_output_size: Optional[int] = None,
+    concurrency: str = "parallel",
 ) -> Any:
     """Decorator: turn any function into a Tool with an auto-generated schema.
 
@@ -678,6 +699,10 @@ def tool(
         @tool(timeout=10, max_output_size=8_000)
         def fetch_data(url: str) -> str:
             "Waited on for 10s, and trimmed to 8k characters."
+
+        @tool(concurrency="exclusive", side_effects=True)
+        def append_ledger(entry: str) -> str:
+            "Two of these at once would interleave, so it runs alone."
     """
 
     def wrap(target: Callable[..., Any]) -> Tool:
@@ -689,6 +714,7 @@ def tool(
             allowed=allowed,
             timeout=timeout,
             max_output_size=max_output_size,
+            concurrency=concurrency,
         )
 
     return wrap(func) if func is not None else wrap
@@ -2677,11 +2703,15 @@ class Agent:
     ) -> None:
         """Run one turn's tool calls, add each result to memory in order.
 
-        A single call runs inline. Multiple independent calls (the model
-        asked for several tools in the same turn) run concurrently on a
-        thread pool - most tools are I/O-bound (HTTP, disk, subprocess), so
-        this cuts wall-clock latency for that turn without changing the
-        observed order of results.
+        A single call runs inline. Multiple parallel calls (the model asked
+        for several tools in the same turn) run concurrently on a thread pool
+        - most tools are I/O-bound (HTTP, disk, subprocess), so this cuts
+        wall-clock latency for that turn without changing the observed order
+        of results.
+
+        A tool marked ``concurrency="exclusive"`` runs on its own: the turn is
+        split into consecutive groups, in the order the model asked for them,
+        and an exclusive call is a group of one. See :meth:`_schedule`.
 
         The pool is capped at ``max_tool_workers``. How many calls arrive in
         a turn is decided by the model, not by the application, so sizing the
@@ -2693,11 +2723,16 @@ class Agent:
         if len(calls) == 1:
             observations = [self._execute(session, calls[0], state)]
         else:
-            workers = min(len(calls), self.max_tool_workers)
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                observations = list(
-                    pool.map(partial(self._execute, session), calls, [state] * len(calls))
-                )
+            observations = []
+            for group in self._schedule(calls):
+                if len(group) == 1:
+                    observations.append(self._execute(session, group[0], state))
+                    continue
+                workers = min(len(group), self.max_tool_workers)
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    observations.extend(
+                        pool.map(partial(self._execute, session), group, [state] * len(group))
+                    )
         for call, observation in zip(calls, observations):
             self._emit(
                 session, "on_tool_call", call["name"], call.get("arguments", {}), observation
@@ -2708,6 +2743,47 @@ class Agent:
                 tool_call_id=call.get("id") or call["name"],
                 name=call["name"],
             )
+
+    def _schedule(self, calls: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Split a turn's calls into groups that may run together.
+
+        Calls stay in the order the model asked for them. Consecutive
+        parallel ones form a group and run concurrently; an exclusive one is
+        a group of its own, so nothing else from the turn runs while it does.
+        A turn of only parallel tools is a single group - exactly the
+        behaviour every tool had before this existed.
+
+        That order is preserved because reordering would be surprising, not
+        because it means anything. **The model is not expressing a
+        dependency.** It emits a list of calls it wants; nothing in the
+        protocol says the second depends on the first, and the framework
+        cannot infer that it does. If two tools must run in a particular
+        order, or must not overlap with a *specific* other tool, that is a
+        relationship only you know - express it in the tools themselves (one
+        tool that does both steps, or a lock inside them), not by hoping the
+        scheduler guesses.
+
+        The guarantee is also per turn. Two exclusive calls in the same turn
+        never overlap; the same tool called from two concurrent sessions
+        still can, because those are different runs. For process-wide
+        exclusion, take a lock inside the tool.
+        """
+        groups: List[List[Dict[str, Any]]] = []
+        batch: List[Dict[str, Any]] = []
+        for call in calls:
+            tool_obj = self.tools.get(call.get("name", ""))
+            # An unknown name is scheduled as parallel: it is refused in
+            # _execute long before anything runs, so it cannot race.
+            if tool_obj is not None and tool_obj.concurrency == "exclusive":
+                if batch:
+                    groups.append(batch)
+                    batch = []
+                groups.append([call])
+            else:
+                batch.append(call)
+        if batch:
+            groups.append(batch)
+        return groups
 
     def _execute(
         self, session: Session, call: Dict[str, Any], state: Optional[RunState] = None

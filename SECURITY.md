@@ -166,6 +166,14 @@ Known non-boundaries, by design:
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).
+- **Concurrent tool calls are not serialised unless you say so.** A model can
+  request several tools in one turn and they run concurrently by default. A
+  tool whose concurrent calls would race — a read-modify-write, an append, a
+  non-reentrant client — must be marked `@tool(concurrency="exclusive")`.
+  `side_effects=True` does **not** do this: it describes the tool to a policy
+  and the audit log, and says nothing about thread safety. Exclusivity holds
+  within one turn; two concurrent sessions can still overlap, so
+  process-wide exclusion needs a lock inside the tool.
 - **Tool timeouts bound the agent's wait, not the tool's work.** Python cannot
   cancel a running thread. `@tool(timeout=...)` and `Agent(tool_timeout=...)`
   stop the agent hanging, but the abandoned call keeps running, keeps its
