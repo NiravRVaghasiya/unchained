@@ -26,7 +26,7 @@ if str(_ROOT) not in sys.path:
 from pydantic import BaseModel, ValidationError
 
 import unchained
-from unchained import LLM, RAG, Agent, Memory, MockLLM, Router, Tool, tool
+from unchained import LLM, RAG, Agent, Budget, Memory, MockLLM, Router, Tool, tool
 
 
 # ---------------------------------------------------------------------------
@@ -4075,3 +4075,361 @@ def test_budget_is_carried_by_the_decorator_and_defaults_to_none():
 def test_tool_run_does_not_apply_the_budget(output_tools):
     # Like the policy and the timeout, this is an agent-level control.
     assert len(output_tools["sized"].run({"n": 5_000})) == 5_000
+
+
+# ---------------------------------------------------------------------------
+# Tier 13: run budgets
+#
+# Budgets are per run. Each test drives a model that always asks for another
+# tool, so the loop would never end on its own - what stops it is the budget.
+# ---------------------------------------------------------------------------
+def _looping_llm(usage=None, tool_name="ping", calls_per_turn=1):
+    """A model that always requests tool calls, so the loop never self-ends."""
+
+    def handler(messages, tools):
+        return {
+            "content": "",
+            "tool_calls": [
+                {"name": tool_name, "arguments": {}, "id": f"c{i}"} for i in range(calls_per_turn)
+            ],
+            "usage": usage or {},
+        }
+
+    return MockLLM(handler=handler)
+
+
+@pytest.fixture
+def budget_tools():
+    ran = []
+
+    @tool
+    def ping() -> str:
+        """Cheap."""
+        ran.append("ping")
+        return "pong"
+
+    @tool
+    def bulky() -> str:
+        """Returns a lot."""
+        ran.append("bulky")
+        return "z" * 5_000
+
+    @tool
+    def slow() -> str:
+        """Takes a moment."""
+        ran.append("slow")
+        time.sleep(0.12)
+        return "ok"
+
+    return {"ping": ping, "bulky": bulky, "slow": slow, "ran": ran}
+
+
+_USAGE = {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50}
+
+
+# --- max_iterations keeps its existing contract ---------------------------
+def test_max_iterations_still_finalises_rather_than_raising(budget_tools):
+    # The one budget that does not raise: running out of turns ends with a
+    # forced final answer, exactly as it did before budgets existed.
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], max_iterations=3)
+    session = agent.session()
+    session.run("go")  # must not raise
+    assert session.last_run.iterations == 3
+    assert session.last_run.exceeded is None
+
+
+def test_budget_max_iterations_overrides_the_agent_setting(budget_tools):
+    agent = Agent(
+        _looping_llm(),
+        tools=[budget_tools["ping"]],
+        max_iterations=9,
+        budget=Budget(max_iterations=2),
+    )
+    session = agent.session()
+    session.run("go")
+    assert session.last_run.iterations == 2
+
+
+def test_an_empty_budget_limits_nothing_new(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], max_iterations=2, budget=Budget())
+    session = agent.session()
+    session.run("go")  # falls back to the agent's max_iterations
+    assert session.last_run.iterations == 2
+
+
+# --- max_tool_calls --------------------------------------------------------
+def test_max_tool_calls_stops_the_run(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=2))
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        agent.session().run("go")
+    assert budget_tools["ran"] == ["ping", "ping"]  # no third call ran
+
+
+def test_a_tool_call_cannot_bypass_the_budget_under_concurrency(budget_tools):
+    # A turn's calls run concurrently. Reservation is atomic, so exactly the
+    # allowed number run - a check-then-increment would let several through.
+    agent = Agent(
+        _looping_llm(calls_per_turn=8),
+        tools=[budget_tools["ping"]],
+        budget=Budget(max_tool_calls=3),
+        max_tool_workers=8,
+    )
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        agent.session().run("go")
+    assert len(budget_tools["ran"]) == 3
+
+
+def test_an_unknown_tool_still_counts_against_the_budget(budget_tools):
+    # The budget is claimed on the single path every model-requested call
+    # takes, before the tool is even located.
+    agent = Agent(
+        _looping_llm(tool_name="ghost"),
+        tools=[budget_tools["ping"]],
+        budget=Budget(max_tool_calls=2),
+    )
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        agent.session().run("go")
+
+
+def test_a_policy_denied_tool_still_counts_against_the_budget(budget_tools):
+    class DenyAll(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            raise unchained.ToolAuthorizationError("no")
+
+    agent = Agent(
+        _looping_llm(),
+        tools=[budget_tools["ping"]],
+        policy=DenyAll(),
+        budget=Budget(max_tool_calls=2),
+    )
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        agent.session().run("go")
+    assert budget_tools["ran"] == []
+
+
+# --- max_total_tokens ------------------------------------------------------
+def test_max_total_tokens_stops_the_run(budget_tools):
+    agent = Agent(
+        _looping_llm(_USAGE), tools=[budget_tools["ping"]], budget=Budget(max_total_tokens=120)
+    )
+    session = agent.session()
+    with pytest.raises(unchained.TokenBudgetExceeded):
+        session.run("go")
+    assert session.last_run.usage["total_tokens"] >= 120
+    assert session.last_run.exceeded == "max_total_tokens"
+
+
+def test_a_token_budget_may_be_passed_by_the_call_that_crosses_it(budget_tools):
+    # Documented: a call's cost is not known until it returns, so the total
+    # can land past the cap. The run stops immediately afterwards.
+    agent = Agent(
+        _looping_llm(_USAGE), tools=[budget_tools["ping"]], budget=Budget(max_total_tokens=60)
+    )
+    session = agent.session()
+    with pytest.raises(unchained.TokenBudgetExceeded):
+        session.run("go")
+    assert session.last_run.usage["total_tokens"] == 100  # two calls of 50
+
+
+# --- max_tool_output -------------------------------------------------------
+def test_max_tool_output_is_cumulative_across_the_run(budget_tools):
+    # Distinct from Tool.max_output_size, which caps a single result: this
+    # caps the sum, so many well-behaved tools cannot add up to an overflow.
+    agent = Agent(
+        _looping_llm(tool_name="bulky"),
+        tools=[budget_tools["bulky"]],
+        budget=Budget(max_tool_output=8_000),
+    )
+    session = agent.session()
+    with pytest.raises(unchained.ToolOutputBudgetExceeded):
+        session.run("go")
+    assert session.last_run.tool_output_chars == 10_000  # two 5,000-char results
+    assert len(budget_tools["ran"]) == 2
+
+
+def test_per_tool_truncation_and_the_run_budget_compose(budget_tools):
+    # Each result is truncated to 1,000, and the run stops once the total
+    # passes 2,500 - so three results, not two.
+    budget_tools["bulky"].max_output_size = 1_000
+    agent = Agent(
+        _looping_llm(tool_name="bulky"),
+        tools=[budget_tools["bulky"]],
+        budget=Budget(max_tool_output=2_500),
+    )
+    session = agent.session()
+    with pytest.raises(unchained.ToolOutputBudgetExceeded):
+        session.run("go")
+    assert session.last_run.tool_calls == 3
+
+
+# --- timeout ---------------------------------------------------------------
+def test_timeout_stops_the_run(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["slow"]], budget=Budget(timeout=0.25))
+    agent.tools = {"slow": budget_tools["slow"]}
+    llm = _looping_llm(tool_name="slow")
+    agent.llm = llm
+    session = agent.session()
+    started = time.perf_counter()
+    with pytest.raises(unchained.TimeBudgetExceeded):
+        session.run("go")
+    assert time.perf_counter() - started < 3
+    assert session.last_run.exceeded == "timeout"
+
+
+# --- max_cost --------------------------------------------------------------
+def test_max_cost_requires_pricing():
+    # A cap that cannot be computed cannot be enforced, and pretending
+    # otherwise is worse than having no cap.
+    with pytest.raises(ValueError) as excinfo:
+        Budget(max_cost=1.0)
+    assert "pricing" in str(excinfo.value)
+
+
+def test_max_cost_stops_the_run_when_priced(budget_tools):
+    agent = Agent(
+        _looping_llm(_USAGE),
+        tools=[budget_tools["ping"]],
+        budget=Budget(max_cost=0.20, pricing={"mock": (1000.0, 2000.0)}),
+    )
+    session = agent.session()
+    with pytest.raises(unchained.CostBudgetExceeded):
+        session.run("go")
+    assert session.last_run.estimated_cost >= 0.20
+    assert session.last_run.cost_is_complete is True
+
+
+def test_an_unpriced_model_is_not_costed_as_zero(budget_tools):
+    # Silently pricing an unknown model at zero would let a cost cap pass
+    # forever while spending real money.
+    agent = Agent(
+        _looping_llm(_USAGE),
+        tools=[budget_tools["ping"]],
+        budget=Budget(max_cost=999.0, pricing={"some-other-model": (1.0, 1.0)}),
+    )
+    with pytest.raises(unchained.CostBudgetExceeded) as excinfo:
+        agent.session().run("go")
+    assert "no pricing for model" in str(excinfo.value)
+
+
+def test_cost_is_reported_as_incomplete_when_pricing_is_absent(budget_tools):
+    # No cap set, so nothing is enforced - but the estimate must not be
+    # mistaken for a full one.
+    agent = Agent(_looping_llm(_USAGE), tools=[budget_tools["ping"]], max_iterations=2)
+    session = agent.session()
+    session.run("go")
+    assert session.last_run.cost_is_complete is False
+    assert session.last_run.estimated_cost == 0.0
+
+
+def test_cost_is_estimated_from_provider_token_counts(budget_tools):
+    agent = Agent(
+        _looping_llm(_USAGE),
+        tools=[budget_tools["ping"]],
+        max_iterations=1,
+        budget=Budget(max_cost=1_000.0, pricing={"mock": (2.0, 4.0)}),
+    )
+    session = agent.session()
+    session.run("go")
+    # Two calls (loop + forced final): each 40 in / 10 out.
+    expected = 2 * ((40 / 1_000_000) * 2.0 + (10 / 1_000_000) * 4.0)
+    assert abs(session.last_run.estimated_cost - expected) < 1e-12
+
+
+# --- the exception hierarchy ----------------------------------------------
+@pytest.mark.parametrize(
+    "name",
+    [
+        "TokenBudgetExceeded",
+        "ToolCallBudgetExceeded",
+        "ToolOutputBudgetExceeded",
+        "TimeBudgetExceeded",
+        "CostBudgetExceeded",
+    ],
+)
+def test_every_budget_error_derives_from_the_base(name):
+    error = getattr(unchained, name)
+    assert issubclass(error, unchained.BudgetExceededError)
+    assert issubclass(error, RuntimeError)
+    assert name in unchained.__all__
+
+
+def test_catching_the_base_catches_them_all(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=1))
+    with pytest.raises(unchained.BudgetExceededError):
+        agent.session().run("go")
+
+
+def test_budget_errors_carry_structured_detail(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=1))
+    with pytest.raises(unchained.BudgetExceededError) as excinfo:
+        agent.session().run("go")
+    assert excinfo.value.limit_name == "max_tool_calls"
+    assert excinfo.value.limit == 1
+    assert excinfo.value.used == 1
+
+
+# --- exposure --------------------------------------------------------------
+def test_run_state_is_exposed_and_serialisable(budget_tools):
+    agent = Agent(_looping_llm(_USAGE), tools=[budget_tools["ping"]], max_iterations=2)
+    session = agent.session()
+    assert session.last_run is None  # nothing has run yet
+    session.run("go")
+
+    snapshot = session.last_run.snapshot()
+    json.dumps(snapshot)  # safe for logs
+    assert snapshot["iterations"] == 2
+    assert snapshot["tool_calls"] == 2
+    assert snapshot["usage"]["total_tokens"] == 150
+    assert snapshot["exceeded"] is None
+    assert snapshot["cost_is_complete"] is False
+
+
+def test_run_state_survives_the_budget_that_stopped_it(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=2))
+    session = agent.session()
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        session.run("go")
+    assert session.last_run.snapshot()["exceeded"] == "max_tool_calls"
+    assert session.last_run.tool_calls == 2
+
+
+def test_budgets_are_per_run_not_per_session(budget_tools):
+    # A ten-turn conversation gets the budget ten times; session.usage is
+    # what accumulates over a lifetime.
+    agent = Agent(
+        MockLLM(reply="done"), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=2)
+    )
+    session = agent.session()
+    session.run("one")
+    first = session.last_run
+    session.run("two")
+    assert session.last_run is not first  # a fresh budget each run
+    assert session.last_run.tool_calls == 0
+
+
+def test_session_budget_overrides_the_agent_budget(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=99))
+    tight = agent.session(budget=Budget(max_tool_calls=1))
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        tight.run("go")
+    assert len(budget_tools["ran"]) == 1
+
+
+def test_budgets_apply_to_stream_as_well(budget_tools):
+    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=2))
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        list(agent.session().stream("go"))
+    assert len(budget_tools["ran"]) == 2
+
+
+def test_a_run_with_no_budget_records_state_anyway(budget_tools):
+    agent = Agent(MockLLM(reply="done"), tools=[budget_tools["ping"]])
+    session = agent.session()
+    session.run("go")
+    assert session.last_run.iterations == 1
+    assert session.last_run.exceeded is None
+
+
+def test_budget_and_run_state_are_exported():
+    assert "Budget" in unchained.__all__
+    assert "RunState" in unchained.__all__

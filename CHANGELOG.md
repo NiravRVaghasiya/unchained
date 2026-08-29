@@ -7,6 +7,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Run budgets.** `Budget` bounds what a single run may consume, so a
+  runaway agent stops deterministically instead of looping until something
+  else gives out:
+
+  ```python
+  Agent(
+      llm,
+      tools=[...],
+      budget=Budget(
+          max_tool_calls=20,
+          max_total_tokens=50_000,
+          max_tool_output=200_000,
+          timeout=60,
+      ),
+  )
+  ```
+
+  - `BudgetExceededError` with `TokenBudgetExceeded`,
+    `ToolCallBudgetExceeded`, `ToolOutputBudgetExceeded`,
+    `TimeBudgetExceeded` and `CostBudgetExceeded`. Each carries
+    `.limit_name`, `.limit` and `.used`.
+  - `max_iterations` keeps its existing contract: exhausting it forces a
+    final answer rather than raising, and it defaults to the agent's own
+    `max_iterations`, so existing agents are unchanged. It is the only
+    budget that does not raise, and there is deliberately no iteration
+    exception for one that never fires.
+  - Budgets are **per run**. `session.usage` still accumulates over the
+    session's lifetime. `agent.session(budget=...)` overrides per caller.
+  - No tool call escapes: the budget is claimed on the single path every
+    model-requested call takes, before the tool is located or authorized, so
+    unknown and policy-denied calls count too.
+  - `session.last_run` exposes a `RunState` with iterations, tool calls,
+    output characters, usage, elapsed time, estimated cost and which limit
+    stopped the run; `.snapshot()` returns it as a JSON-safe dict.
+  - `max_tool_output` is the run total, distinct from `Tool.max_output_size`,
+    which caps a single result.
+  - **Cost is an estimate and needs your rates.** Unchained ships no price
+    table - published prices change and a stale table would under-report.
+    `Budget(max_cost=...)` without `pricing` raises at construction, and a
+    model absent from `pricing` raises rather than being costed as zero.
+  - Budgets are checked before spending, so a call already under way can
+    carry the total slightly past a limit; the run stops immediately after.
 - **Tool output limits.** A tool could return megabytes straight into the
   transcript - overflowing the context window, costing money on every
   subsequent turn, and growing memory. `@tool(max_output_size=8_000)` bounds

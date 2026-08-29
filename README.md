@@ -239,6 +239,95 @@ thread, and Unchained does not pretend otherwise:
 Concurrent calls each get their own budget, so one hanging tool does not delay
 its siblings or the turn.
 
+### 💰 Run budgets — making a run's cost predictable
+
+Individual limits stop individual things. A budget bounds a whole run:
+
+```python
+from unchained import Agent, Budget, BudgetExceededError
+
+agent = Agent(
+    llm,
+    tools=[...],
+    budget=Budget(
+        max_tool_calls=20,
+        max_total_tokens=50_000,
+        max_tool_output=200_000,
+        timeout=60,
+    ),
+)
+
+try:
+    answer = session.run("research this thoroughly")
+except BudgetExceededError as exc:
+    print(exc.limit_name, exc.limit, exc.used)
+```
+
+| Budget | Bounds | On exhaustion |
+|---|---|---|
+| `max_iterations` | think/act cycles | **forces a final answer** (no raise) |
+| `max_tool_calls` | tool calls in the run | `ToolCallBudgetExceeded` |
+| `max_total_tokens` | prompt + completion tokens | `TokenBudgetExceeded` |
+| `max_tool_output` | total characters of tool output | `ToolOutputBudgetExceeded` |
+| `timeout` | wall-clock seconds | `TimeBudgetExceeded` |
+| `max_cost` | estimated spend | `CostBudgetExceeded` |
+
+All subclass `BudgetExceededError`, and each carries `.limit_name`, `.limit`
+and `.used`.
+
+**`max_iterations` is the exception that does not raise.** Running out of
+turns ends with one final call and an answer, exactly as it did before
+budgets existed — ending a turn with nothing is worse than one more call. It
+defaults to the agent's own `max_iterations`, so existing agents are
+unchanged.
+
+**Budgets are per run**, not per session: a ten-turn conversation gets the
+budget ten times. Lifetime token accounting is `session.usage`, which keeps
+accumulating. A session can carry its own budget, so one agent can serve
+callers on different allowances:
+
+```python
+agent.session(budget=Budget(max_tool_calls=5))  # overrides the agent's
+```
+
+**No tool call escapes the budget.** It is claimed on the single path every
+model-requested call takes — before the tool is located or authorized — so
+unknown and policy-denied calls count too.
+
+#### Reading what a run spent
+
+`session.last_run` holds the accounting, and stays there afterwards —
+including when a budget stopped the run:
+
+```python
+session.last_run.snapshot()
+# {'iterations': 3, 'tool_calls': 7, 'tool_output_chars': 4120,
+#  'usage': {...}, 'elapsed': 2.41, 'estimated_cost': 0.0032,
+#  'cost_is_complete': True, 'exceeded': None}
+```
+
+#### Cost, honestly
+
+Unchained ships **no price table**. Published prices change, and a table
+baked into this file would quietly go stale — a cost cap computed from stale
+numbers is worse than no cap. You supply the rates, per 1M tokens:
+
+```python
+Budget(max_cost=0.50, pricing={"gpt-4o-mini": (0.15, 0.60)})
+```
+
+- `Budget(max_cost=...)` **without** `pricing` raises at construction.
+- A model missing from `pricing` while `max_cost` is set raises
+  `CostBudgetExceeded` rather than costing it as zero — a cap that cannot be
+  computed cannot be enforced.
+- With no cap, an unpriced call just sets `cost_is_complete = False`.
+- The figure is `estimated_cost`, derived from the provider's own token
+  counts. It is an estimate, never an invoice.
+
+Budgets are checked before spending, but a call's cost is not known until it
+returns — so the last call can carry the total slightly past a limit, and the
+run stops immediately after. This is runtime governance, not billing.
+
 ### 📏 Tool output limits — bounding what reaches the context
 
 A tool can return megabytes. That overflows the context window, costs money

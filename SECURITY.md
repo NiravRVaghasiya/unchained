@@ -169,6 +169,19 @@ Known non-boundaries, by design:
 - **A tool timeout does not abort network I/O.** HTTP tools must still set
   their own timeout (`requests.get(url, timeout=20)`); otherwise the request
   outlives the timeout and holds a connection.
+- **Run budgets bound cost and runaway loops, not behaviour.** `Budget`
+  limits what one run may consume — iterations, tool calls, tokens, tool
+  output, wall clock, estimated spend — and stops the run deterministically
+  when a limit is reached. Every model-requested tool call is claimed against
+  it on the single path such calls take, before the tool is located or
+  authorized, so unknown and denied calls count too. It is resource
+  governance: it does not decide *whether* a tool may run (that is
+  `ToolPolicy`) and it cannot interrupt a call already in flight.
+- **Cost is an estimate, never an invoice.** It is computed from the
+  provider's reported token counts and rates you supply. Unchained ships no
+  price table, because a stale one would silently under-report. A model with
+  no pricing entry raises rather than being costed as zero when `max_cost` is
+  set, and sets `cost_is_complete = False` when it is not.
 - **Tool output limits are a context and cost boundary, not a sandbox.**
   `@tool(max_output_size=...)` and `Agent(max_tool_output_size=...)` bound
   what a tool *sends onward* into the transcript. They do not stop a tool

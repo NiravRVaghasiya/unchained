@@ -98,6 +98,14 @@ __all__ = [
     "ToolArgumentValidationError",
     "ToolTimeoutError",
     "ToolOutputTruncated",
+    "Budget",
+    "RunState",
+    "BudgetExceededError",
+    "TokenBudgetExceeded",
+    "ToolCallBudgetExceeded",
+    "ToolOutputBudgetExceeded",
+    "TimeBudgetExceeded",
+    "CostBudgetExceeded",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
@@ -139,6 +147,51 @@ class ToolApprovalRequired(RuntimeError):
 
 class ToolArgumentValidationError(RuntimeError):
     """Raised when model-supplied arguments do not fit the tool's signature."""
+
+
+class BudgetExceededError(RuntimeError):
+    """Base class for every budget that can stop a run.
+
+    Carries ``limit_name`` (which budget), ``limit`` and ``used``, so a
+    handler can report the overrun without parsing the message. Catch this to
+    catch them all, or a subclass to single one out.
+
+    There is deliberately no iteration subclass: running out of iterations is
+    the one budget that ends the turn gracefully rather than by raising - see
+    :class:`Budget`.
+    """
+
+    def __init__(self, limit_name: str, limit: Any, used: Any, detail: str = ""):
+        self.limit_name = limit_name
+        self.limit = limit
+        self.used = used
+        message = f"budget '{limit_name}' exhausted: used {used} of {limit}"
+        super().__init__(f"{message} - {detail}" if detail else message)
+
+
+class TokenBudgetExceeded(BudgetExceededError):
+    """Raised when a run reaches ``Budget.max_total_tokens``."""
+
+
+class ToolCallBudgetExceeded(BudgetExceededError):
+    """Raised when a run reaches ``Budget.max_tool_calls``."""
+
+
+class ToolOutputBudgetExceeded(BudgetExceededError):
+    """Raised when a run's total tool output passes ``Budget.max_tool_output``."""
+
+
+class TimeBudgetExceeded(BudgetExceededError):
+    """Raised when a run passes ``Budget.timeout`` seconds of wall clock."""
+
+
+class CostBudgetExceeded(BudgetExceededError):
+    """Raised when a run reaches ``Budget.max_cost``, or cannot be priced.
+
+    Also raised when ``max_cost`` is set and a call uses a model absent from
+    ``Budget.pricing``: a cap that cannot be computed cannot be honoured, and
+    continuing would mean pretending to enforce it.
+    """
 
 
 class ToolOutputTruncated:
@@ -1704,7 +1757,235 @@ class PermissionPolicy(ToolPolicy):
         )
 
 
-# --- 7. Agent core (ReAct loop) --------------------------------------------
+# --- 7. Budgets (runtime governance) ---------------------------------------
+class Budget:
+    """What a single run of an agent may consume. Every limit is optional.
+
+    A budget is **per run** - one ``agent.run()`` or ``session.run()`` call -
+    not per session lifetime. A ten-turn conversation gets the budget ten
+    times. Lifetime token accounting is ``session.usage``, which keeps
+    accumulating regardless.
+
+    * ``max_iterations``   - think/act cycles. Defaults to the agent's own
+      ``max_iterations``. **This one does not raise:** when the loop is
+      exhausted the agent makes one final call and answers, exactly as it
+      always has. Ending a turn with no answer at all is worse than one more
+      call, and that behaviour predates budgets.
+    * ``max_tool_calls``   - tool calls in the run, counted across every
+      iteration and every concurrent call in a turn.
+    * ``max_total_tokens`` - prompt + completion tokens, as reported by the
+      provider.
+    * ``max_tool_output``  - total characters of tool output for the run.
+      Distinct from ``Tool.max_output_size``, which caps a *single* result;
+      this caps the sum, so a hundred well-behaved tools cannot add up to a
+      context overflow.
+    * ``timeout``          - wall-clock seconds for the whole run.
+    * ``max_cost``         - estimated spend, in whatever unit ``pricing``
+      uses. Requires ``pricing``.
+
+    ``pricing`` maps a model name to ``(input_rate, output_rate)`` per
+    1,000,000 tokens::
+
+        Budget(max_cost=0.50, pricing={"gpt-4o-mini": (0.15, 0.60)})
+
+    Rates are yours to supply. Unchained ships no price table, because
+    published prices change and a table baked into this file would quietly go
+    stale - and a cost cap computed from stale numbers is worse than none.
+    Cost is therefore always an **estimate** from the provider's own token
+    counts, never an invoice.
+
+    Budgets that are reached stop the run by raising a
+    :class:`BudgetExceededError`. They are checked before spending, but a
+    single call's cost is not known until it returns, so the final call can
+    carry the total slightly past the limit; the run stops immediately
+    afterwards. This is runtime governance, not billing.
+    """
+
+    def __init__(
+        self,
+        max_iterations: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
+        max_total_tokens: Optional[int] = None,
+        max_tool_output: Optional[int] = None,
+        timeout: Optional[float] = None,
+        max_cost: Optional[float] = None,
+        pricing: Optional[Dict[str, Any]] = None,
+    ):
+        if max_cost is not None and not pricing:
+            raise ValueError(
+                "Budget(max_cost=...) needs pricing to compute against, e.g. "
+                'pricing={"gpt-4o-mini": (0.15, 0.60)} per 1M tokens. Without it '
+                "the cap could not be enforced, and pretending otherwise would be "
+                "worse than having no cap."
+            )
+        self.max_iterations = max_iterations
+        self.max_tool_calls = max_tool_calls
+        self.max_total_tokens = max_total_tokens
+        self.max_tool_output = max_tool_output
+        self.timeout = timeout
+        self.max_cost = max_cost
+        self.pricing = dict(pricing or {})
+
+    def __repr__(self) -> str:  # pragma: no cover
+        set_limits = {
+            name: value
+            for name, value in vars(self).items()
+            if name != "pricing" and value is not None
+        }
+        return f"<Budget {set_limits or 'unlimited'}>"
+
+
+class RunState:
+    """Live accounting for one run, and the record of it afterwards.
+
+    Readable during a run from ``session.last_run`` and left in place when the
+    run ends - including when a budget stopped it, where ``exceeded`` names
+    the limit that did. :meth:`snapshot` returns the same information as a
+    plain dict for logging.
+
+    Counters are updated from the worker threads that run a turn's tool calls,
+    so they are taken under a lock. That is bookkeeping, not shared
+    conversation state: the accounting for a run belongs to that run.
+    """
+
+    def __init__(self, budget: Budget):
+        self.budget = budget
+        self.started = time.monotonic()
+        self.iterations = 0
+        self.tool_calls = 0
+        self.tool_output_chars = 0
+        self.usage: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self.estimated_cost = 0.0
+        # False once any call could not be priced, so a reported cost is
+        # never mistaken for a complete one.
+        self.cost_is_complete = True
+        self.exceeded: Optional[str] = None
+        self._lock = threading.Lock()
+
+    @property
+    def elapsed(self) -> float:
+        """Wall-clock seconds since the run started."""
+        return time.monotonic() - self.started
+
+    def snapshot(self) -> Dict[str, Any]:
+        """A plain, JSON-serialisable record of the run so far."""
+        return {
+            "iterations": self.iterations,
+            "tool_calls": self.tool_calls,
+            "tool_output_chars": self.tool_output_chars,
+            "usage": dict(self.usage),
+            "elapsed": round(self.elapsed, 3),
+            "estimated_cost": round(self.estimated_cost, 6),
+            "cost_is_complete": self.cost_is_complete,
+            "exceeded": self.exceeded,
+        }
+
+    # -- checks ----------------------------------------------------------
+    def _stop(self, error: BudgetExceededError) -> BudgetExceededError:
+        self.exceeded = error.limit_name
+        logger.warning("run stopped: %s", error)
+        return error
+
+    def check_before_call(self) -> None:
+        """Raise if the run may not spend anything more.
+
+        Called before every LLM call and before every tool call, so nothing
+        that costs time, tokens or money starts once a budget is reached.
+        """
+        budget = self.budget
+        if budget.timeout is not None and self.elapsed >= budget.timeout:
+            raise self._stop(
+                TimeBudgetExceeded(
+                    "timeout", budget.timeout, round(self.elapsed, 3), "wall-clock seconds"
+                )
+            )
+        if (
+            budget.max_total_tokens is not None
+            and self.usage["total_tokens"] >= budget.max_total_tokens
+        ):
+            raise self._stop(
+                TokenBudgetExceeded(
+                    "max_total_tokens", budget.max_total_tokens, self.usage["total_tokens"]
+                )
+            )
+        if budget.max_cost is not None and self.estimated_cost >= budget.max_cost:
+            raise self._stop(
+                CostBudgetExceeded(
+                    "max_cost",
+                    budget.max_cost,
+                    round(self.estimated_cost, 6),
+                    "estimated from provider token counts",
+                )
+            )
+
+    def reserve_tool_call(self, name: str) -> None:
+        """Claim one tool call against the budget, or raise.
+
+        Reserved under the lock rather than checked then incremented: a turn's
+        tool calls run concurrently, and a check-then-act would let several
+        pass a limit only one of them could have.
+        """
+        limit = self.budget.max_tool_calls
+        with self._lock:
+            if limit is not None and self.tool_calls >= limit:
+                raise self._stop(
+                    ToolCallBudgetExceeded(
+                        "max_tool_calls", limit, self.tool_calls, f"tool {name!r}"
+                    )
+                )
+            self.tool_calls += 1
+
+    def record_tool_output(self, size: int) -> None:
+        """Add a tool result's size to the run, raising if the total passes the cap.
+
+        The size is only known once the tool has returned, so the total can
+        pass the cap by that one result; the run stops before anything else
+        is spent. ``Tool.max_output_size`` is what bounds an individual one.
+        """
+        limit = self.budget.max_tool_output
+        with self._lock:
+            self.tool_output_chars += size
+            total = self.tool_output_chars
+        if limit is not None and total > limit:
+            raise self._stop(
+                ToolOutputBudgetExceeded("max_tool_output", limit, total, "characters")
+            )
+
+    def record_llm_call(self, usage: Optional[Dict[str, Any]], model: str) -> None:
+        """Fold one LLM response's usage, and its estimated cost, into the run."""
+        with self._lock:
+            for key in self.usage:
+                self.usage[key] += int((usage or {}).get(key, 0) or 0)
+            self.estimated_cost += self._price(usage or {}, model)
+
+    def _price(self, usage: Dict[str, Any], model: str) -> float:
+        """Estimate one call's cost, or refuse to guess."""
+        rates = self.budget.pricing.get(model)
+        if rates is None:
+            self.cost_is_complete = False
+            if self.budget.max_cost is not None:
+                raise self._stop(
+                    CostBudgetExceeded(
+                        "max_cost",
+                        self.budget.max_cost,
+                        round(self.estimated_cost, 6),
+                        f"no pricing for model {model!r}; add it to Budget(pricing=...) "
+                        "or drop max_cost, because a cap that cannot be computed "
+                        "cannot be enforced",
+                    )
+                )
+            return 0.0
+        input_rate, output_rate = rates
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        completion = int(usage.get("completion_tokens", 0) or 0)
+        return (prompt / 1_000_000) * input_rate + (completion / 1_000_000) * output_rate
+
+
+# --- 8. Agent core (ReAct loop) --------------------------------------------
 class Agent:
     """A ReAct agent: think (LLM) -> act (tool) -> observe -> repeat.
 
@@ -1759,6 +2040,7 @@ class Agent:
         memory_factory: Optional[Callable[[], Memory]] = None,
         tool_timeout: Optional[float] = None,
         max_tool_output_size: Optional[int] = None,
+        budget: Optional[Budget] = None,
     ):
         """``memory`` and ``memory_factory`` differ, and the difference matters.
 
@@ -1806,6 +2088,9 @@ class Agent:
         # Characters of tool output to pass on, for tools that do not set
         # their own. None means unbounded, which is the old behaviour.
         self.max_tool_output_size = max_tool_output_size
+        # What one run may consume. An empty Budget limits nothing except the
+        # iteration count, which max_iterations has always bounded.
+        self.budget = budget or Budget()
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
         # dialog must not be re-entered from several workers at once. This
         # stays on the Agent on purpose: it guards the application's single
@@ -1824,6 +2109,7 @@ class Agent:
         callbacks: Optional[List[Callback]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        budget: Optional[Budget] = None,
     ) -> Session:
         """Start a new, independent conversation with this agent.
 
@@ -1849,6 +2135,7 @@ class Agent:
             callbacks=callbacks,
             metadata=metadata,
             session_id=session_id,
+            budget=budget,
         )
 
     @property
@@ -1937,10 +2224,13 @@ class Agent:
         response_format: Optional[Type[BaseModel]] = None,
     ) -> Any:
         """The ReAct loop, against one session's state. See :meth:`Session.run`."""
+        state = self._begin_run(session)
         session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         answer: Optional[str] = None
-        for i in range(self.max_iterations):
+        for i in range(self._iteration_limit(state)):
+            state.iterations = i + 1
+            state.check_before_call()
             self._emit(session, "on_iteration", i)
             # JSON mode is only requested when no tools are in play; combining
             # tool-calling with JSON mode is unreliable across providers.
@@ -1956,7 +2246,7 @@ class Agent:
                 session.memory.add("assistant", answer)
                 break
             session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-            self._execute_calls(session, result["tool_calls"])
+            self._execute_calls(session, result["tool_calls"], state)
         if answer is None:  # exhausted iterations - force a final answer
             answer = self._chat(
                 session,
@@ -1983,16 +2273,19 @@ class Agent:
         Any tool calls are resolved first (non-streaming); the final assistant
         reply is then streamed. With no tools, the reply is streamed directly.
         """
+        state = self._begin_run(session)
         session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         if tool_list:
-            for i in range(self.max_iterations):
+            for i in range(self._iteration_limit(state)):
+                state.iterations = i + 1
+                state.check_before_call()
                 self._emit(session, "on_iteration", i)
                 result = self._chat(session, self._build_messages(session, None), tools=tool_list)
                 if not result["tool_calls"]:
                     break
                 session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-                self._execute_calls(session, result["tool_calls"])
+                self._execute_calls(session, result["tool_calls"], state)
         chunks: List[str] = []
         for chunk in self.llm.stream(self._build_messages(session, None)):
             chunks.append(chunk)
@@ -2000,6 +2293,25 @@ class Agent:
         answer = "".join(chunks)
         session.memory.add("assistant", answer)
         self._emit(session, "on_finish", answer)
+
+    # -- budgets --
+    def _begin_run(self, session: Session) -> RunState:
+        """Open the accounting for one run and publish it on the session.
+
+        A session's own ``budget`` wins over the agent's, so one agent can
+        serve callers on different allowances. The state stays on
+        ``session.last_run`` after the run ends - including when a budget
+        stopped it - so the caller can read what was spent.
+        """
+        budget = session.budget if session.budget is not None else self.budget
+        state = RunState(budget)
+        session.last_run = state
+        return state
+
+    def _iteration_limit(self, state: RunState) -> int:
+        """Iterations allowed: the budget's, else the agent's ``max_iterations``."""
+        limit = state.budget.max_iterations
+        return self.max_iterations if limit is None else limit
 
     # -- instrumentation helpers --
     def _chat(
@@ -2011,6 +2323,12 @@ class Agent:
     ) -> Dict[str, Any]:
         result = self.llm.chat(messages, tools=tools, response_format=response_format)
         self._track_usage(session, result.get("usage"))
+        if session.last_run is not None:
+            # getattr: the LLM interface is the chat() contract, not a class.
+            # A custom backend need not carry a `model` name, and an unnamed
+            # one simply has no pricing entry - which the budget reports as
+            # incomplete rather than as zero.
+            session.last_run.record_llm_call(result.get("usage"), getattr(self.llm, "model", ""))
         self._emit(session, "on_llm_call", messages, result)
         return result
 
@@ -2059,7 +2377,12 @@ class Agent:
             )
         return [{"role": "system", "content": system}] + session.memory.get()
 
-    def _execute_calls(self, session: Session, calls: List[Dict[str, Any]]) -> None:
+    def _execute_calls(
+        self,
+        session: Session,
+        calls: List[Dict[str, Any]],
+        state: Optional[RunState] = None,
+    ) -> None:
         """Run one turn's tool calls, add each result to memory in order.
 
         A single call runs inline. Multiple independent calls (the model
@@ -2076,11 +2399,13 @@ class Agent:
         run; only their concurrency is bounded, and results keep their order.
         """
         if len(calls) == 1:
-            observations = [self._execute(session, calls[0])]
+            observations = [self._execute(session, calls[0], state)]
         else:
             workers = min(len(calls), self.max_tool_workers)
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                observations = list(pool.map(partial(self._execute, session), calls))
+                observations = list(
+                    pool.map(partial(self._execute, session), calls, [state] * len(calls))
+                )
         for call, observation in zip(calls, observations):
             self._emit(
                 session, "on_tool_call", call["name"], call.get("arguments", {}), observation
@@ -2092,7 +2417,9 @@ class Agent:
                 name=call["name"],
             )
 
-    def _execute(self, session: Session, call: Dict[str, Any]) -> str:
+    def _execute(
+        self, session: Session, call: Dict[str, Any], state: Optional[RunState] = None
+    ) -> str:
         """Authorize, then run, one model-requested tool call.
 
         This is the only path from model output to a tool function, and it is
@@ -2105,9 +2432,19 @@ class Agent:
         A refusal at any step becomes an observation string, so the model
         learns it was refused and the loop continues; a denied tool is never
         a way to crash the run. Application code calling ``tool.run(...)``
+        Application code calling ``tool.run(...)``
         directly is trusted and deliberately not policed - this boundary is
         for model intent.
+
+        The run's budget is claimed here, before the tool is located or
+        authorized, because this is the only path a model-requested call
+        takes - so there is no tool call that does not count against it. A
+        budget that is out raises rather than returning an observation: the
+        run must stop, not be told about it and carry on spending.
         """
+        if state is not None:
+            state.check_before_call()
+            state.reserve_tool_call(call.get("name", ""))
         name = call.get("name", "")
         arguments = call.get("arguments", {})
         tool_obj = self.tools.get(name)
@@ -2153,7 +2490,10 @@ class Agent:
         except Exception as exc:  # a tool must never crash the loop
             # Bounded too: an exception message can be as large as a result.
             output = f"Error executing '{name}': {exc}"
-        return self._bound_output(tool_obj, output)
+        observation = self._bound_output(tool_obj, output)
+        if state is not None:
+            state.record_tool_output(len(observation))
+        return observation
 
     def _output_limit_for(self, tool_obj: Tool) -> Optional[int]:
         """Characters of output to keep: the tool's own setting, else the agent's."""
@@ -2393,7 +2733,7 @@ class Agent:
         return value if found and isinstance(value, dict) else {}
 
 
-# --- 8. Session (one conversation's state) ---------------------------------
+# --- 9. Session (one conversation's state) ---------------------------------
 class Session:
     """One conversation with an :class:`Agent`: its memory, usage and metadata.
 
@@ -2430,6 +2770,7 @@ class Session:
         callbacks: Optional[List[Callback]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        budget: Optional[Budget] = None,
     ):
         self.agent = agent
         self.memory = memory if memory is not None else Memory()
@@ -2437,6 +2778,13 @@ class Session:
         self.callbacks = list(callbacks or [])
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.id = session_id or uuid.uuid4().hex[:12]
+        # Overrides the agent's budget for this conversation only; None means
+        # "use the agent's". Set per session so one agent can serve callers on
+        # different allowances.
+        self.budget = budget
+        # Accounting for the most recent run, left in place afterwards - see
+        # RunState. None until this session has run once.
+        self.last_run: Optional[RunState] = None
         self.usage: Dict[str, int] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -2476,7 +2824,7 @@ class Session:
         return f"<Session {self.id} of {self.agent.name}: {len(self.memory.get())} messages>"
 
 
-# --- 9. Router (multi-agent orchestration) ---------------------------------
+# --- 10. Router (multi-agent orchestration) --------------------------------
 class Router:
     """Coordinate several agents: route to one, run all, or run all and fuse.
 
