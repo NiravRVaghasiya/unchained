@@ -485,7 +485,36 @@ memory indefinitely:
 
 ```python
 llm = LLM(provider="openai", cache=True, cache_size=256, cache_ttl=300)  # 5-minute TTL
+llm.clear_cache()  # invalidate everything
 ```
+
+**Tool-call responses are not cached.** A plain answer is a fact worth
+remembering; a response asking to call `refund(order_id="A-1")` is a *decision
+to act*. Caching that would replay the decision on the next identical prompt —
+the same refund, the same email — without the model being asked again, and
+without a request going out to reveal it. The world the decision was made in
+has moved on; the cached answer has not.
+
+So `cache=True` means `"final_only"`: plain answers are stored, tool-call
+responses are returned to the caller but never kept.
+
+```python
+LLM(provider="openai", cache=True)  # "final_only" — the default
+LLM(provider="openai", cache="none")  # off
+LLM(provider="openai", cache="all")  # also cache tool-call decisions
+```
+
+Use `"all"` only when every tool in play is read-only. Even then the cache
+only decides *what the model is taken to have said* — it never executes
+anything. Every tool call still passes the [tool policy](#-tool-authorization--a-policy-layer-not-a-prompt)
+and any approval hook before it runs, cached or fresh.
+
+The cache key covers everything that can change the answer: provider, base
+URL, model, temperature, `max_tokens`, the messages, the **full tool schemas**,
+and the response-format schema. Tools are keyed by schema rather than name
+because two tools can share a name and differ completely — a `search` over
+public docs and a `search` over internal records — and response formats are
+keyed by schema because unrelated models are so often both called `Item`.
 
 ### Connection reuse
 

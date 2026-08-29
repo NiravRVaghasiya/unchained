@@ -76,6 +76,20 @@ hold even when the model is confused, jailbroken, or adversarial.
   per user; `agent.run()` is one persistent conversation, so do not use it to
   serve several. Session `metadata` reaches `ToolPolicy` as
   `context["metadata"]`, which is how a policy authorizes per user.
+- **The response cache does not store tool-call decisions.** With
+  `LLM(cache=True)` (policy `"final_only"`) a response asking for tool calls
+  is returned to the caller but never cached, so an identical later prompt
+  cannot replay a decision to act without the model being consulted — a
+  replay that would otherwise be invisible, since no request leaves the
+  process. `cache="all"` opts out; use it only when every tool in play is
+  read-only. The cache never executes anything under any policy: it decides
+  what the model is taken to have said, and every tool call still passes the
+  policy and approval hook.
+- **The cache key covers everything that changes an answer**, including full
+  tool schemas rather than tool names. Keying on names alone let two
+  different tools that happen to share one — a `search` over public documents
+  and a `search` over internal records — serve each other's cached responses.
+  Response formats are keyed by schema for the same reason.
 - **Authorization decisions are audited.** Each decision is emitted to
   `Callback.on_tool_audit` before the tool runs, so the record survives a tool
   that hangs or crashes, and refusals are written to the module logger even
@@ -116,6 +130,11 @@ Known non-boundaries, by design:
   narrows the agent's tool list, it does not replace it: an unlabelled tool
   passes. Declare permissions on every tool you intend to gate — the audit log
   records the permissions of each call, which makes the gaps visible.
+- **A cache hit means no request is made, and no audit trail from the
+  provider.** Cached responses are still emitted to callbacks, but if you
+  reconcile agent behaviour against provider-side logs, cached turns will not
+  appear there. Use `cache="none"` where that matters, and `clear_cache()`
+  when the underlying facts change.
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).

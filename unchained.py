@@ -17,6 +17,7 @@ or local Ollama. No metaclasses, no runtime patching, no hidden state.
 from __future__ import annotations
 
 import asyncio
+import copy
 import enum
 import inspect
 import json
@@ -98,6 +99,15 @@ __all__ = [
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# What an LLM may keep in its response cache.
+#   "none"       - cache nothing.
+#   "final_only" - cache plain answers; never store a response that asks for
+#                  tool calls. The default, because a cached tool call is a
+#                  stored decision to act, replayed without the model being
+#                  asked again.
+#   "all"        - cache tool-call responses too. For read-only tool sets.
+_CACHE_POLICIES = ("none", "final_only", "all")
 
 
 class RoutingError(RuntimeError):
@@ -562,7 +572,7 @@ class LLM:
         timeout: int = 120,
         max_retries: int = 2,
         backoff: float = 0.5,
-        cache: bool = False,
+        cache: Union[bool, str] = False,
         cache_size: int = 256,
         cache_ttl: Optional[float] = None,
     ):
@@ -578,10 +588,18 @@ class LLM:
         self.temperature, self.max_tokens, self.timeout = temperature, max_tokens, timeout
         self.max_retries, self.backoff = max_retries, backoff
         self.cache_size, self.cache_ttl = cache_size, cache_ttl
+        # ``cache`` accepts a bool for convenience or a policy name outright:
+        # True means "final_only", the safe default (see _CACHE_POLICIES).
+        policy = "final_only" if cache is True else "none" if cache is False else str(cache)
+        self.cache_policy = policy.lower().strip()
+        if self.cache_policy not in _CACHE_POLICIES:
+            raise ValueError(
+                f"Unknown cache policy {cache!r}. Choose from {list(_CACHE_POLICIES)}."
+            )
         # An LRU cache (OrderedDict, oldest first) capped at cache_size entries;
         # each value optionally expires after cache_ttl seconds.
         self.cache: Optional[OrderedDict[str, tuple[float, Dict[str, Any]]]] = (
-            OrderedDict() if cache else None
+            OrderedDict() if self.cache_policy != "none" else None
         )
         env_key = _PROVIDER_ENV_KEY.get(self.provider)
         self.api_key = api_key or (os.getenv(env_key) if env_key else None)
@@ -597,9 +615,13 @@ class LLM:
     ) -> Dict[str, Any]:
         """Send a chat request and return the normalised response dict.
 
-        With ``cache=True`` identical requests are served from an in-memory
+        With caching enabled, identical requests are served from an in-memory
         LRU cache (bounded by ``cache_size``, optionally expiring after
         ``cache_ttl`` seconds) instead of hitting the provider again.
+
+        What counts as cacheable is set by ``cache_policy``. Under the default
+        ``"final_only"`` a response asking for tool calls is returned to the
+        caller but never stored: see :meth:`_should_store`.
         """
         if self.cache is not None:
             key = self._cache_key(messages, tools, response_format)
@@ -607,9 +629,36 @@ class LLM:
             if cached is not None:
                 return cached
             result = self._dispatch(messages, tools, response_format)
-            self._cache_put(key, result)
+            if self._should_store(result):
+                self._cache_put(key, result)
             return result
         return self._dispatch(messages, tools, response_format)
+
+    def _should_store(self, result: Dict[str, Any]) -> bool:
+        """Decide whether a fresh response may enter the cache.
+
+        A response carrying ``tool_calls`` is a decision to *act*. Storing it
+        means a later identical prompt replays that decision without the model
+        being consulted - the same refund issued twice, the same message sent
+        again - and the replay is invisible, because no request goes out. The
+        world the decision was made in has also moved on, while the cached
+        answer has not.
+
+        So ``"final_only"`` (the default) stores plain answers and drops
+        tool-call responses. ``"all"`` stores them; use it only when every
+        tool in play is read-only. The cache never *executes* anything either
+        way: it decides what the model is taken to have said, and every tool
+        call still passes :class:`ToolPolicy` and any approval hook before it
+        runs.
+        """
+        if self.cache_policy == "all":
+            return True
+        return not result.get("tool_calls")
+
+    def clear_cache(self) -> None:
+        """Drop every cached response. Safe to call when caching is off."""
+        if self.cache is not None:
+            self.cache.clear()
 
     def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
         assert self.cache is not None
@@ -621,14 +670,33 @@ class LLM:
             del self.cache[key]
             return None
         self.cache.move_to_end(key)  # refresh LRU order on hit
-        return result
+        return self._copy_result(result)
 
     def _cache_put(self, key: str, result: Dict[str, Any]) -> None:
         assert self.cache is not None
-        self.cache[key] = (time.time(), result)
+        self.cache[key] = (time.time(), self._copy_result(result))
         self.cache.move_to_end(key)
         while len(self.cache) > self.cache_size:
             self.cache.popitem(last=False)  # evict the oldest entry
+
+    @staticmethod
+    def _copy_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a response in and out of the cache.
+
+        Callers put responses into conversation memory and read them later;
+        without this, every hit would hand back the *same* dict, and one
+        caller mutating it would silently rewrite what the cache serves
+        everyone else.
+        """
+        # Deep, not shallow: tool-call arguments are nested dicts, and a
+        # per-call shallow copy would still share them.
+        return copy.deepcopy(
+            {
+                "content": result.get("content", ""),
+                "tool_calls": result.get("tool_calls") or [],
+                "usage": result.get("usage") or {},
+            }
+        )
 
     async def achat(
         self,
@@ -667,13 +735,41 @@ class LLM:
         tools: Optional[List[Tool]],
         response_format: Optional[Any],
     ) -> str:
+        """Identify a request by everything that can change its answer.
+
+        Everything the provider is sent, or that selects which provider is
+        sent to: endpoint, model, generation parameters, the conversation, the
+        **full** tool schemas, and the requested output schema.
+
+        Tools are keyed by schema rather than by name. Two tools can share a
+        name and differ completely - a ``search`` over public documents and a
+        ``search`` over internal records - and keying on the name alone would
+        serve one tool's answer for the other. Schemas are sorted so that
+        offering the same tools in a different order still hits.
+
+        Response formats are keyed by their JSON schema for the same reason:
+        two unrelated models are often both called ``Item``.
+
+        Over-keying only costs a cache miss. Under-keying returns the wrong
+        answer, so anything uncertain belongs in here.
+        """
         return json.dumps(
             {
+                "provider": self.provider,
+                "base_url": self.base_url,
                 "model": self.model,
                 "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
                 "messages": messages,
-                "tools": sorted(t.name for t in tools) if tools else None,
-                "format": getattr(response_format, "__name__", None),
+                "tools": sorted(json.dumps(t.schema, sort_keys=True) for t in tools)
+                if tools
+                else None,
+                "response_format": None
+                if response_format is None
+                else {
+                    "name": getattr(response_format, "__name__", None),
+                    "schema": _pydantic_schema(response_format),
+                },
             },
             sort_keys=True,
             default=str,

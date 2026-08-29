@@ -6,7 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Tool-call responses are no longer cached by default.** A cached response
+  carrying `tool_calls` is a stored decision to act: an identical later prompt
+  replayed it without the model being consulted, and without a request going
+  out to make the replay visible — the same refund issued twice from one
+  model decision. `LLM(cache=True)` now means the `"final_only"` policy:
+  plain answers are cached, tool-call responses are returned to the caller but
+  never stored.
+- **The cache key no longer collides across different tools sharing a name.**
+  Tools were keyed by name alone, so a `search` over public documents and a
+  `search` over internal records — or the same tool before and after its
+  description or parameters changed — served each other's cached responses.
+  Tools are now keyed by their full schema, sorted so that offering the same
+  tools in a different order still hits.
+- **Response formats are keyed by schema, not by class name.** Two unrelated
+  Pydantic models both called `Item` previously collided.
+- **`max_tokens`, `base_url` and `provider` are now part of the cache key.**
+  `max_tokens` is sent to Anthropic and truncates the reply, so two `LLM`s
+  differing only in it returned each other's answers.
+- **Cached responses are handed out as private copies.** Every hit previously
+  returned the same dict, and `Agent` puts responses into conversation memory
+  — so one conversation mutating a response silently rewrote what the cache
+  served the next.
+
 ### Added
+- `LLM(cache=...)` accepts a policy name as well as a bool: `"none"`,
+  `"final_only"` (the default, and what `cache=True` means) or `"all"` for
+  read-only tool sets that want tool-call responses cached too. An unknown
+  name raises. The active policy is readable as `llm.cache_policy`.
+- `LLM.clear_cache()` to invalidate every entry.
 - **Runtime argument validation before every tool execution.** Type
   annotations previously only generated the JSON schema shown to the model;
   what actually arrived reached the function after structural checks only. A

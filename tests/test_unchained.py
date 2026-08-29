@@ -2954,3 +2954,347 @@ def test_schema_generation_is_unchanged_by_validation(every_type):
         "color",
         "person",
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 9: cache correctness and side-effect safety
+#
+# Two separate concerns:
+#   * the KEY must identify everything that can change the answer, or the
+#     cache returns the right answer to the wrong question;
+#   * the POLICY decides what may be stored, because a cached tool call is a
+#     stored decision to act, replayed without asking the model again.
+# ---------------------------------------------------------------------------
+def _final(content="plain answer"):
+    return {"choices": [{"message": {"content": content, "tool_calls": []}}], "usage": {}}
+
+
+def _with_tool_call(name="refund", arguments='{"order_id": "A-1"}'):
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "function": {"name": name, "arguments": arguments}}
+                    ],
+                }
+            }
+        ],
+        "usage": {},
+    }
+
+
+# --- what may be stored ----------------------------------------------------
+def test_identical_final_responses_are_cached(monkeypatch):
+    captured = _patch_post(monkeypatch, _final("the answer"))
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    messages = [{"role": "user", "content": "same question"}]
+
+    assert llm.chat(messages)["content"] == "the answer"
+    assert llm.chat(messages)["content"] == "the answer"
+    assert captured["calls"] == 1  # the second was served from cache
+    assert len(llm.cache) == 1
+
+
+def test_tool_call_responses_are_not_cached_by_default(monkeypatch):
+    # A cached tool call is a stored decision to act. Replaying it would
+    # re-issue the same refund without the model ever being asked again.
+    captured = _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    messages = [{"role": "user", "content": "refund order A-1"}]
+
+    first = llm.chat(messages)
+    second = llm.chat(messages)
+
+    assert first["tool_calls"][0]["name"] == "refund"  # still returned to the caller
+    assert second["tool_calls"][0]["name"] == "refund"
+    assert captured["calls"] == 2, "the tool-call response must not have been cached"
+    assert len(llm.cache) == 0
+
+
+def test_default_cache_policy_is_final_only():
+    assert LLM(provider="openai", api_key="k", cache=True).cache_policy == "final_only"
+    assert LLM(provider="openai", api_key="k").cache_policy == "none"
+    assert LLM(provider="openai", api_key="k").cache is None
+
+
+def test_cache_policy_all_stores_tool_calls_for_advanced_users(monkeypatch):
+    captured = _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    messages = [{"role": "user", "content": "refund order A-1"}]
+
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 1  # opted in: the decision was replayed
+    assert len(llm.cache) == 1
+
+
+def test_cache_policy_none_stores_nothing(monkeypatch):
+    captured = _patch_post(monkeypatch, _final())
+    llm = LLM(provider="openai", api_key="k", cache="none")
+    messages = [{"role": "user", "content": "q"}]
+
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 2
+    assert llm.cache is None
+
+
+def test_final_only_still_caches_finals_when_tools_are_offered(monkeypatch):
+    # Offering tools does not make the answer uncacheable; only a response
+    # that actually asks for a tool call is withheld.
+    @tool
+    def helper(x: int) -> str:
+        """Helper."""
+        return "ok"
+
+    captured = _patch_post(monkeypatch, _final("no tools needed"))
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    messages = [{"role": "user", "content": "q"}]
+
+    llm.chat(messages, tools=[helper])
+    llm.chat(messages, tools=[helper])
+    assert captured["calls"] == 1
+
+
+def test_unknown_cache_policy_is_rejected():
+    with pytest.raises(ValueError):
+        LLM(provider="openai", api_key="k", cache="sometimes")
+    with pytest.raises(ValueError):
+        LLM(provider="openai", api_key="k", cache="FINAL")  # not a policy name
+
+
+def test_cache_policy_accepts_explicit_names():
+    assert LLM(provider="openai", api_key="k", cache="final_only").cache_policy == "final_only"
+    assert LLM(provider="openai", api_key="k", cache="ALL ").cache_policy == "all"
+
+
+# --- a cached tool call is never self-executing ----------------------------
+def test_a_cached_tool_call_is_still_authorized_before_it_runs(monkeypatch):
+    # Even under the opt-in "all" policy, the cache decides only what the
+    # model is taken to have said. Whether the call may run is still the
+    # policy's decision, on every turn.
+    ran = []
+
+    @tool(permissions={"billing:write"}, side_effects=True)
+    def refund(order_id: str) -> str:
+        """Issue a refund."""
+        ran.append(order_id)
+        return "refunded"
+
+    _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    messages = [{"role": "user", "content": "refund order A-1"}]
+    llm.chat(messages, tools=[refund])  # prime the cache with the decision
+
+    agent = Agent(llm, tools=[refund], policy=unchained.PermissionPolicy(granted=set()))
+    observation = agent._execute(
+        agent.default_session, {"name": "refund", "arguments": {"order_id": "A-1"}, "id": "c1"}
+    )
+    assert "billing:write" in observation
+    assert ran == []  # the cached decision did not become an execution
+
+
+def test_a_cached_tool_call_still_requires_approval(monkeypatch):
+    ran = []
+
+    @tool(requires_approval=True)
+    def refund(order_id: str) -> str:
+        """Issue a refund."""
+        ran.append(order_id)
+        return "refunded"
+
+    _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    llm.chat([{"role": "user", "content": "refund"}], tools=[refund])
+
+    agent = Agent(llm, tools=[refund])  # no approve= configured -> fails closed
+    observation = agent._execute(
+        agent.default_session, {"name": "refund", "arguments": {"order_id": "A-1"}, "id": "c1"}
+    )
+    assert "requires approval" in observation
+    assert ran == []
+
+
+# --- the cache key ---------------------------------------------------------
+def _key(llm, messages=None, tools=None, response_format=None):
+    return llm._cache_key(messages or [{"role": "user", "content": "hi"}], tools, response_format)
+
+
+def test_tools_sharing_a_name_but_not_a_schema_do_not_collide():
+    # The dangerous case: a public `search` and an internal `search`.
+    @tool
+    def public():
+        """Search public documents."""
+        return "a"
+
+    @tool
+    def internal():
+        """Search internal records, including private ones."""
+        return "b"
+
+    public.name = internal.name = "search"
+    public.schema["function"]["name"] = internal.schema["function"]["name"] = "search"
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    assert _key(llm, tools=[public]) != _key(llm, tools=[internal])
+
+
+def test_changing_a_tools_parameters_changes_the_key():
+    @tool
+    def lookup(query: str) -> str:
+        """Look something up."""
+        return "a"
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    before = _key(llm, tools=[lookup])
+    lookup.schema["function"]["parameters"]["properties"]["admin"] = {"type": "boolean"}
+    assert _key(llm, tools=[lookup]) != before
+
+
+def test_changing_a_tools_description_changes_the_key():
+    @tool
+    def lookup(query: str) -> str:
+        """Look something up."""
+        return "a"
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    before = _key(llm, tools=[lookup])
+    lookup.schema["function"]["description"] = "Look something up, including private records."
+    assert _key(llm, tools=[lookup]) != before
+
+
+def test_offering_the_same_tools_in_a_different_order_still_hits():
+    @tool
+    def alpha(x: int) -> str:
+        """Alpha."""
+        return "a"
+
+    @tool
+    def beta(y: int) -> str:
+        """Beta."""
+        return "b"
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    assert _key(llm, tools=[alpha, beta]) == _key(llm, tools=[beta, alpha])
+
+
+def test_different_response_formats_sharing_a_name_do_not_collide():
+    first: dict = {}
+    exec("from pydantic import BaseModel\nclass Item(BaseModel):\n    name: str", first)
+    second: dict = {}
+    exec("from pydantic import BaseModel\nclass Item(BaseModel):\n    sku: int", second)
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    assert first["Item"].__name__ == second["Item"].__name__ == "Item"
+    assert _key(llm, response_format=first["Item"]) != _key(llm, response_format=second["Item"])
+
+
+def test_response_format_presence_changes_the_key():
+    class Item(BaseModel):
+        name: str
+
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    assert _key(llm) != _key(llm, response_format=Item)
+
+
+@pytest.mark.parametrize(
+    "field,other",
+    [
+        ("model", {"model": "gpt-4o"}),
+        ("temperature", {"temperature": 0.1}),
+        ("max_tokens", {"max_tokens": 64}),
+        ("base_url", {"base_url": "https://api.groq.com"}),
+    ],
+)
+def test_generation_parameters_are_part_of_the_key(field, other):
+    base = LLM(provider="openai", api_key="k", cache=True)
+    changed = LLM(provider="openai", api_key="k", cache=True, **other)
+    assert _key(base) != _key(changed), f"{field} is missing from the cache key"
+
+
+def test_provider_is_part_of_the_key():
+    a = LLM(provider="openai", api_key="k", cache=True, model="m", base_url="http://x")
+    b = LLM(provider="anthropic", api_key="k", cache=True, model="m", base_url="http://x")
+    assert _key(a) != _key(b)
+
+
+def test_different_messages_do_not_collide():
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    assert _key(llm, [{"role": "user", "content": "a"}]) != _key(
+        llm, [{"role": "user", "content": "b"}]
+    )
+
+
+# --- invalidation ----------------------------------------------------------
+def test_clear_cache_invalidates_every_entry(monkeypatch):
+    captured = _patch_post(monkeypatch, _final())
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    messages = [{"role": "user", "content": "q"}]
+
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 1
+
+    llm.clear_cache()
+    assert len(llm.cache) == 0
+    llm.chat(messages)
+    assert captured["calls"] == 2  # refetched after invalidation
+
+
+def test_clear_cache_is_safe_when_caching_is_disabled():
+    llm = LLM(provider="openai", api_key="k")
+    llm.clear_cache()  # must not raise
+    assert llm.cache is None
+
+
+# --- entries are private copies -------------------------------------------
+def test_a_caller_mutating_a_response_cannot_corrupt_the_cache(monkeypatch):
+    _patch_post(monkeypatch, _final("original"))
+    llm = LLM(provider="openai", api_key="k", cache=True)
+    messages = [{"role": "user", "content": "q"}]
+
+    first = llm.chat(messages)
+    first["content"] = "tampered"
+    first["usage"]["prompt_tokens"] = 999
+
+    second = llm.chat(messages)
+    assert second["content"] == "original"
+    assert second["usage"]["prompt_tokens"] == 0  # not the tampered 999
+    assert second is not first
+
+
+def test_cached_tool_calls_are_copied_not_aliased(monkeypatch):
+    # Agent puts tool_calls into conversation memory; a shared list would let
+    # one conversation rewrite what the cache serves the next.
+    _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    messages = [{"role": "user", "content": "refund"}]
+
+    first = llm.chat(messages)
+    first["tool_calls"][0]["arguments"]["order_id"] = "TAMPERED"
+
+    second = llm.chat(messages)
+    assert second["tool_calls"][0]["arguments"]["order_id"] == "A-1"
+    assert second["tool_calls"] is not first["tool_calls"]
+
+
+# --- backwards compatibility ----------------------------------------------
+def test_cache_true_still_enables_caching_as_before(monkeypatch):
+    captured = _patch_post(monkeypatch, _final())
+    llm = LLM(provider="openai", api_key="k", cache=True, cache_size=8, cache_ttl=60)
+    messages = [{"role": "user", "content": "q"}]
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 1
+    assert llm.cache_size == 8 and llm.cache_ttl == 60
+
+
+def test_cache_false_still_disables_caching(monkeypatch):
+    captured = _patch_post(monkeypatch, _final())
+    llm = LLM(provider="openai", api_key="k", cache=False)
+    messages = [{"role": "user", "content": "q"}]
+    llm.chat(messages)
+    llm.chat(messages)
+    assert captured["calls"] == 2
