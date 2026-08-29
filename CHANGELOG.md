@@ -7,6 +7,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Structured `AgentEvent` observability.** A flat, immutable event stream
+  for logging, metrics and debugging - no OpenTelemetry, no new dependency,
+  no tracing framework:
+
+  ```python
+  stop = agent.subscribe(lambda event: log.info("%s", event))
+  ```
+
+  - Events: `AgentStarted`, `AgentIteration`, `LLMStarted`, `LLMFinished`,
+    `ToolStarted`, `ToolFinished`, `ToolFailed`, `AgentFinished`,
+    `AgentFailed`. Each carries `run_id`, `session_id`, `agent`,
+    `timestamp`, and where they apply `duration`, `model`, `tool`,
+    `tool_call_id`, `usage` and `metadata`. `as_dict()` is JSON-safe.
+  - `run_id` is unique per run, so concurrent runs never interleave
+    ambiguously. `RunState.snapshot()` reports the same id.
+  - `ToolFailed` may arrive without a preceding `ToolStarted` - a call
+    refused before it ran never started - and `metadata["reason"]`
+    distinguishes `unknown_tool`, `invalid_arguments`, `denied`,
+    `approval_denied`, `timeout` and `raised`.
+  - **Payloads are excluded by default**: prompts, tool arguments, tool
+    results and answers are omitted in favour of counts and sizes, because
+    an event stream usually ends up in a log aggregator.
+    `Agent(event_payloads=True)` opts in.
+  - `Agent.subscribe(fn)` returns an unsubscribe. `Callback.on_event` is the
+    class-based form; existing `Callback` subclasses are unaffected, since
+    the base `on_event` is a no-op and every older hook still fires.
+  - Handler errors stay logged and swallowed; `Agent(strict_callbacks=True)`
+    re-raises them, which is what you want in tests.
 - **Run budgets.** `Budget` bounds what a single run may consume, so a
   runaway agent stops deterministically instead of looping until something
   else gives out:

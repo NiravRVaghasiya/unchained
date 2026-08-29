@@ -33,6 +33,7 @@ import warnings
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import (
     Any,
@@ -90,6 +91,7 @@ __all__ = [
     "Router",
     "Callback",
     "LoggingCallback",
+    "AgentEvent",
     "ToolPolicy",
     "PermissionPolicy",
     "RoutingError",
@@ -1597,7 +1599,82 @@ class RAG:
         return len(self.docs)
 
 
-# --- 5. Observability (callbacks) ------------------------------------------
+# --- 5. Observability (callbacks and events) -------------------------------
+@dataclass(frozen=True)
+class AgentEvent:
+    """One thing that happened during a run.
+
+    A flat, immutable record - enough for a log line, a metric, or a trace
+    you assemble yourself, without becoming a tracing framework. Correlate
+    with ``run_id`` (unique per run, so concurrent runs never interleave) and
+    ``session_id`` (stable across a conversation).
+
+    ``event_type`` is one of:
+
+    ===================  =========================================
+    ``AgentStarted``     a run began
+    ``AgentIteration``   a think/act cycle began
+    ``LLMStarted``       a provider request went out
+    ``LLMFinished``      it came back (carries ``usage``, ``duration``)
+    ``ToolStarted``      an authorized tool call began
+    ``ToolFinished``     it returned (carries ``duration``)
+    ``ToolFailed``       it did not return a result - refused, invalid,
+                         denied, timed out or raised
+    ``AgentFinished``    the run produced an answer
+    ``AgentFailed``      the run raised
+    ===================  =========================================
+
+    ``ToolFailed`` can arrive without a preceding ``ToolStarted``: a call
+    refused before it ran never started. Its ``metadata["reason"]`` says
+    which stage refused it.
+
+    **Payloads are excluded by default.** Prompts, tool arguments, tool
+    results and the final answer are the things most likely to hold personal
+    data or credentials, and an event stream usually ends up in a log
+    aggregator. Events carry shapes and sizes instead - message counts,
+    character counts. Pass ``Agent(event_payloads=True)`` to include the
+    content itself, deliberately.
+
+    Frozen, so a handler cannot rewrite an event other handlers will see.
+    ``metadata`` is copied in on construction; it is a plain dict, so it is
+    not deeply frozen.
+    """
+
+    event_type: str
+    run_id: str
+    session_id: str
+    agent: str
+    timestamp: float = 0.0
+    duration: Optional[float] = None
+    model: Optional[str] = None
+    tool: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    usage: Optional[Dict[str, int]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Copy the caller's mapping. frozen=True blocks attribute assignment,
+        # not mutation of a dict the event was built from - without this an
+        # event could still be rewritten through it after the fact.
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    def as_dict(self) -> Dict[str, Any]:
+        """A plain dict, for structured logging."""
+        return asdict(self)
+
+    def __str__(self) -> str:
+        parts = [f"{self.event_type} run={self.run_id}"]
+        for name in ("tool", "model"):
+            value = getattr(self, name)
+            if value:
+                parts.append(f"{name}={value}")
+        if self.duration is not None:
+            parts.append(f"{self.duration * 1000:.0f}ms")
+        if self.usage:
+            parts.append(f"tokens={self.usage.get('total_tokens', 0)}")
+        return " ".join(parts)
+
+
 class Callback:
     """Hook into the agent loop. Subclass and override the methods you need.
 
@@ -1627,8 +1704,27 @@ class Callback:
         sink if your tools take secrets.
         """
 
+    def on_event(self, event: AgentEvent) -> None:
+        """Called with every :class:`AgentEvent`.
+
+        The structured stream: one handler covering starts, finishes,
+        failures, timings and token usage, rather than a method per hook. The
+        older, narrower callbacks above still fire alongside it, so existing
+        subclasses keep working unchanged.
+        """
+
     def on_finish(self, answer: Any) -> None:
         """Called once with the final answer."""
+
+
+class _EventListener(Callback):
+    """Adapts a plain function into a Callback. See :meth:`Agent.subscribe`."""
+
+    def __init__(self, handler: Callable[[AgentEvent], None]):
+        self._handler = handler
+
+    def on_event(self, event: AgentEvent) -> None:
+        self._handler(event)
 
 
 class LoggingCallback(Callback):
@@ -1659,6 +1755,9 @@ class LoggingCallback(Callback):
             event.get("arguments"),
             f" - {event['reason']}" if event.get("reason") else "",
         )
+
+    def on_event(self, event: AgentEvent) -> None:
+        self.log.info("%s", event)
 
     def on_finish(self, answer: Any) -> None:
         self.log.info("finished (%d chars)", len(str(answer)))
@@ -1850,6 +1949,9 @@ class RunState:
 
     def __init__(self, budget: Budget):
         self.budget = budget
+        # Distinct per run, so concurrent runs - of one agent or many - never
+        # share an id and their events can be told apart.
+        self.id = uuid.uuid4().hex[:12]
         self.started = time.monotonic()
         self.iterations = 0
         self.tool_calls = 0
@@ -1874,6 +1976,7 @@ class RunState:
     def snapshot(self) -> Dict[str, Any]:
         """A plain, JSON-serialisable record of the run so far."""
         return {
+            "run_id": self.id,
             "iterations": self.iterations,
             "tool_calls": self.tool_calls,
             "tool_output_chars": self.tool_output_chars,
@@ -2041,6 +2144,8 @@ class Agent:
         tool_timeout: Optional[float] = None,
         max_tool_output_size: Optional[int] = None,
         budget: Optional[Budget] = None,
+        event_payloads: bool = False,
+        strict_callbacks: bool = False,
     ):
         """``memory`` and ``memory_factory`` differ, and the difference matters.
 
@@ -2091,6 +2196,15 @@ class Agent:
         # What one run may consume. An empty Budget limits nothing except the
         # iteration count, which max_iterations has always bounded.
         self.budget = budget or Budget()
+        # Whether AgentEvents carry prompts, tool arguments, tool results and
+        # the final answer. Off by default: an event stream usually ends up
+        # in a log aggregator, and those fields are where the personal data
+        # and credentials are. See AgentEvent.
+        self.event_payloads = event_payloads
+        # Instrumentation must not break a run, so callback errors are logged
+        # and swallowed. Set this to surface them instead - useful in tests,
+        # where a silently broken sink looks like a working one.
+        self.strict_callbacks = strict_callbacks
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
         # dialog must not be re-entered from several workers at once. This
         # stays on the Agent on purpose: it guards the application's single
@@ -2225,6 +2339,51 @@ class Agent:
     ) -> Any:
         """The ReAct loop, against one session's state. See :meth:`Session.run`."""
         state = self._begin_run(session)
+        self._emit_event(
+            session,
+            "AgentStarted",
+            state,
+            model=getattr(self.llm, "model", None),
+            metadata={
+                "input_chars": len(user_input),
+                "tools": len(self.tools),
+                **self._payload(input=user_input),
+            },
+        )
+        try:
+            answer = self._run_loop(session, state, user_input, response_format)
+        except Exception as exc:
+            self._emit_event(
+                session,
+                "AgentFailed",
+                state,
+                duration=state.elapsed,
+                usage=dict(state.usage),
+                metadata={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+        self._emit_event(
+            session,
+            "AgentFinished",
+            state,
+            duration=state.elapsed,
+            usage=dict(state.usage),
+            metadata={
+                "iterations": state.iterations,
+                "tool_calls": state.tool_calls,
+                **self._payload(answer=str(answer)),
+            },
+        )
+        return answer
+
+    def _run_loop(
+        self,
+        session: Session,
+        state: RunState,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+    ) -> Any:
+        """The loop itself. See :meth:`_run`, which reports around it."""
         session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         answer: Optional[str] = None
@@ -2232,6 +2391,7 @@ class Agent:
             state.iterations = i + 1
             state.check_before_call()
             self._emit(session, "on_iteration", i)
+            self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
             # JSON mode is only requested when no tools are in play; combining
             # tool-calling with JSON mode is unreliable across providers.
             fmt = response_format if not tool_list else None
@@ -2274,6 +2434,17 @@ class Agent:
         reply is then streamed. With no tools, the reply is streamed directly.
         """
         state = self._begin_run(session)
+        self._emit_event(
+            session,
+            "AgentStarted",
+            state,
+            model=getattr(self.llm, "model", None),
+            metadata={
+                "streaming": True,
+                "input_chars": len(user_input),
+                **self._payload(input=user_input),
+            },
+        )
         session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         if tool_list:
@@ -2281,18 +2452,108 @@ class Agent:
                 state.iterations = i + 1
                 state.check_before_call()
                 self._emit(session, "on_iteration", i)
+                self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
                 result = self._chat(session, self._build_messages(session, None), tools=tool_list)
                 if not result["tool_calls"]:
                     break
                 session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
                 self._execute_calls(session, result["tool_calls"], state)
         chunks: List[str] = []
-        for chunk in self.llm.stream(self._build_messages(session, None)):
-            chunks.append(chunk)
-            yield chunk
+        try:
+            for chunk in self.llm.stream(self._build_messages(session, None)):
+                chunks.append(chunk)
+                yield chunk
+        except Exception as exc:
+            self._emit_event(
+                session,
+                "AgentFailed",
+                state,
+                duration=state.elapsed,
+                usage=dict(state.usage),
+                metadata={"streaming": True, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
         answer = "".join(chunks)
         session.memory.add("assistant", answer)
         self._emit(session, "on_finish", answer)
+        self._emit_event(
+            session,
+            "AgentFinished",
+            state,
+            duration=state.elapsed,
+            usage=dict(state.usage),
+            metadata={
+                "streaming": True,
+                "iterations": state.iterations,
+                "chunks": len(chunks),
+                **self._payload(answer=answer),
+            },
+        )
+
+    # -- observability --
+    def subscribe(self, handler: Callable[[AgentEvent], None]) -> Callable[[], None]:
+        """Receive every :class:`AgentEvent` from this agent. Returns an unsubscribe.
+
+        The one-liner form of attaching a :class:`Callback` with an
+        ``on_event`` method::
+
+            stop = agent.subscribe(lambda e: log.info("%s", e))
+            ...
+            stop()
+
+        Agent-level subscribers see every session. For one conversation only,
+        pass a Callback to ``agent.session(callbacks=[...])``.
+        """
+        listener = _EventListener(handler)
+        self.callbacks.append(listener)
+
+        def unsubscribe() -> None:
+            if listener in self.callbacks:
+                self.callbacks.remove(listener)
+
+        return unsubscribe
+
+    def _emit_event(
+        self,
+        session: Session,
+        event_type: str,
+        state: Optional[RunState] = None,
+        duration: Optional[float] = None,
+        model: Optional[str] = None,
+        tool: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        usage: Optional[Dict[str, int]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Build and dispatch one AgentEvent, if anyone is listening.
+
+        The early return matters: with no callbacks attached - the common
+        case - instrumentation costs one attribute check per event rather
+        than building a record nobody reads.
+        """
+        if not self.callbacks and not session.callbacks:
+            return
+        self._emit(
+            session,
+            "on_event",
+            AgentEvent(
+                event_type=event_type,
+                run_id=state.id if state is not None else "",
+                session_id=session.id,
+                agent=self.name,
+                timestamp=time.time(),
+                duration=duration,
+                model=model,
+                tool=tool,
+                tool_call_id=tool_call_id,
+                usage=usage,
+                metadata=metadata or {},  # AgentEvent copies it
+            ),
+        )
+
+    def _payload(self, **fields: Any) -> Dict[str, Any]:
+        """Content for an event's metadata, included only when opted in."""
+        return dict(fields) if self.event_payloads else {}
 
     # -- budgets --
     def _begin_run(self, session: Session) -> RunState:
@@ -2321,14 +2582,41 @@ class Agent:
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        state = session.last_run
+        model = getattr(self.llm, "model", None)
+        self._emit_event(
+            session,
+            "LLMStarted",
+            state,
+            model=model,
+            metadata={
+                "messages": len(messages),
+                "tools": len(tools or []),
+                **self._payload(messages=messages),
+            },
+        )
+        started = time.monotonic()
         result = self.llm.chat(messages, tools=tools, response_format=response_format)
+        self._emit_event(
+            session,
+            "LLMFinished",
+            state,
+            duration=time.monotonic() - started,
+            model=model,
+            usage=dict(result.get("usage") or {}),
+            metadata={
+                "content_chars": len(result.get("content") or ""),
+                "tool_calls": len(result.get("tool_calls") or []),
+                **self._payload(content=result.get("content")),
+            },
+        )
         self._track_usage(session, result.get("usage"))
-        if session.last_run is not None:
+        if state is not None:
             # getattr: the LLM interface is the chat() contract, not a class.
             # A custom backend need not carry a `model` name, and an unnamed
             # one simply has no pricing entry - which the budget reports as
             # incomplete rather than as zero.
-            session.last_run.record_llm_call(result.get("usage"), getattr(self.llm, "model", ""))
+            state.record_llm_call(result.get("usage"), model or "")
         self._emit(session, "on_llm_call", messages, result)
         return result
 
@@ -2350,7 +2638,11 @@ class Agent:
         for cb in (*self.callbacks, *session.callbacks):
             try:
                 getattr(cb, event)(*args)
-            except Exception:  # instrumentation must never break the run
+            except Exception:
+                if self.strict_callbacks:
+                    raise
+                # Instrumentation must not break a run: a broken metrics sink
+                # should not cost an answer the model already produced.
                 logger.exception("callback %s failed", event)
 
     def _augment_with_rag(self, user_input: str) -> str:
@@ -2451,6 +2743,7 @@ class Agent:
         if tool_obj is None:
             # A hallucinated or out-of-scope name never reaches a function.
             self._audit(session, name, arguments, "unknown_tool", "not in this agent's tool set")
+            self._tool_failed(session, state, call, "unknown_tool", "not in this agent's tool set")
             return f"Error: unknown tool '{name}'."
         # The policy sees who is asking, not just what for: session metadata
         # is how a policy authorizes per user rather than per agent.
@@ -2470,27 +2763,62 @@ class Agent:
                 decision = "approved"
         except ToolArgumentValidationError as exc:
             self._audit(session, name, arguments, "invalid_arguments", str(exc), tool_obj)
+            self._tool_failed(session, state, call, "invalid_arguments", str(exc))
             return f"Error: {exc}"
         except ToolApprovalRequired as exc:
             self._audit(session, name, arguments, "approval_denied", str(exc), tool_obj)
+            self._tool_failed(session, state, call, "approval_denied", str(exc))
             return f"Error: {exc}"
         except ToolAuthorizationError as exc:
             self._audit(session, name, arguments, "denied", str(exc), tool_obj)
+            self._tool_failed(session, state, call, "denied", str(exc))
             return f"Error: {exc}"
         except Exception as exc:  # a policy that breaks must not fail open
             logger.exception("policy raised while authorizing '%s'", name)
             self._audit(session, name, arguments, "denied", f"policy error: {exc}", tool_obj)
+            self._tool_failed(session, state, call, "denied", f"policy error: {exc}")
             return f"Error: tool '{name}' was not authorized (policy error)."
         self._audit(session, name, arguments, decision, "", tool_obj)
+        self._emit_event(
+            session,
+            "ToolStarted",
+            state,
+            tool=name,
+            tool_call_id=call.get("id"),
+            metadata={
+                "side_effects": tool_obj.side_effects,
+                **self._payload(arguments=arguments),
+            },
+        )
+        started = time.monotonic()
+        failure = ""
         try:
             output = str(self._invoke(tool_obj, arguments))
         except ToolTimeoutError as exc:
             logger.warning("%s", exc)
+            self._tool_failed(session, state, call, "timeout", str(exc), time.monotonic() - started)
             return f"Error: {exc}"
         except Exception as exc:  # a tool must never crash the loop
             # Bounded too: an exception message can be as large as a result.
+            failure = f"{type(exc).__name__}: {exc}"
             output = f"Error executing '{name}': {exc}"
         observation = self._bound_output(tool_obj, output)
+        elapsed = time.monotonic() - started
+        if failure:
+            self._tool_failed(session, state, call, "raised", failure, elapsed)
+        else:
+            self._emit_event(
+                session,
+                "ToolFinished",
+                state,
+                duration=elapsed,
+                tool=name,
+                tool_call_id=call.get("id"),
+                metadata={
+                    "output_chars": len(observation),
+                    **self._payload(result=observation),
+                },
+            )
         if state is not None:
             state.record_tool_output(len(observation))
         return observation
@@ -2558,6 +2886,33 @@ class Agent:
         except (ValueError, RecursionError):
             return False
         return True
+
+    def _tool_failed(
+        self,
+        session: Session,
+        state: Optional[RunState],
+        call: Dict[str, Any],
+        reason: str,
+        detail: str,
+        duration: Optional[float] = None,
+    ) -> None:
+        """Report a tool call that produced no result.
+
+        ``reason`` names the stage that refused it - ``unknown_tool``,
+        ``invalid_arguments``, ``denied``, ``approval_denied``, ``timeout`` or
+        ``raised`` - so a metrics sink can separate "the tool broke" from "the
+        tool was not allowed to run". These arrive without a preceding
+        ``ToolStarted`` whenever the call never began.
+        """
+        self._emit_event(
+            session,
+            "ToolFailed",
+            state,
+            duration=duration,
+            tool=call.get("name", ""),
+            tool_call_id=call.get("id"),
+            metadata={"reason": reason, "error": detail},
+        )
 
     def _timeout_for(self, tool_obj: Tool) -> Optional[float]:
         """Seconds to wait for this tool: its own setting, else the agent's."""

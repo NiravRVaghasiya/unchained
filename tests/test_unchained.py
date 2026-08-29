@@ -7,6 +7,7 @@ keys or network access are required.
 """
 
 import asyncio
+import dataclasses
 import enum
 import json
 import sys
@@ -4433,3 +4434,415 @@ def test_a_run_with_no_budget_records_state_anyway(budget_tools):
 def test_budget_and_run_state_are_exported():
     assert "Budget" in unchained.__all__
     assert "RunState" in unchained.__all__
+
+
+# ---------------------------------------------------------------------------
+# Tier 14: structured AgentEvents
+#
+# The stream must be complete enough to reconstruct a run, correlated enough
+# to separate concurrent ones, and quiet enough about payloads that it is safe
+# to ship to a log aggregator by default.
+# ---------------------------------------------------------------------------
+_SECRET_ARG = "password-hunter2"
+_SECRET_RESULT = "ada@example.com"
+
+
+def _tool_then_answer(tool_name="peek", usage=None):
+    """One turn requesting a tool, then a final answer."""
+    turns = {"n": 0}
+
+    def handler(messages, tools):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return {
+                "content": "",
+                "tool_calls": [{"name": tool_name, "arguments": {}, "id": "tc-1"}],
+                "usage": usage or {},
+            }
+        return {"content": "final answer", "usage": usage or {}}
+
+    return MockLLM(handler=handler)
+
+
+@pytest.fixture
+def event_tools():
+    @tool
+    def peek(query: str = _SECRET_ARG) -> str:
+        """Returns something sensitive."""
+        return _SECRET_RESULT
+
+    @tool
+    def boom() -> str:
+        """Raises."""
+        raise ValueError("kaboom")
+
+    @tool(permissions={"admin"})
+    def privileged() -> str:
+        """Needs a permission."""
+        return "ok"
+
+    return {"peek": peek, "boom": boom, "privileged": privileged}
+
+
+def _collect(agent, query="go", stream=False):
+    events = []
+    agent.subscribe(events.append)
+    session = agent.session()
+    if stream:
+        list(session.stream(query))
+    else:
+        session.run(query)
+    return events
+
+
+# --- the stream describes the run -----------------------------------------
+def test_a_tool_using_run_emits_the_expected_sequence(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]])
+    types = [e.event_type for e in _collect(agent)]
+    assert types == [
+        "AgentStarted",
+        "AgentIteration",
+        "LLMStarted",
+        "LLMFinished",
+        "ToolStarted",
+        "ToolFinished",
+        "AgentIteration",
+        "LLMStarted",
+        "LLMFinished",
+        "AgentFinished",
+    ]
+
+
+def test_events_carry_correlation_and_identity(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]], name="scribe")
+    events = _collect(agent)
+    run_ids = {e.run_id for e in events}
+    assert len(run_ids) == 1 and run_ids != {""}
+    assert {e.session_id for e in events} == {events[0].session_id}
+    assert {e.agent for e in events} == {"scribe"}
+    assert all(e.timestamp > 0 for e in events)
+
+
+def test_llm_events_carry_model_usage_and_duration(event_tools):
+    usage = {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+    agent = Agent(_tool_then_answer(usage=usage), tools=[event_tools["peek"]])
+    finished = [e for e in _collect(agent) if e.event_type == "LLMFinished"]
+    assert finished[0].model == "mock"
+    assert finished[0].usage["total_tokens"] == 25
+    assert finished[0].duration is not None and finished[0].duration >= 0
+
+
+def test_tool_events_carry_the_tool_and_its_call_id(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]])
+    events = _collect(agent)
+    started = next(e for e in events if e.event_type == "ToolStarted")
+    finished = next(e for e in events if e.event_type == "ToolFinished")
+    assert started.tool == finished.tool == "peek"
+    assert started.tool_call_id == finished.tool_call_id == "tc-1"
+    assert finished.duration is not None
+    assert finished.metadata["output_chars"] == len(_SECRET_RESULT)
+
+
+def test_agent_finished_summarises_the_run(event_tools):
+    usage = {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+    agent = Agent(_tool_then_answer(usage=usage), tools=[event_tools["peek"]])
+    finished = [e for e in _collect(agent) if e.event_type == "AgentFinished"][0]
+    assert finished.metadata["iterations"] == 2
+    assert finished.metadata["tool_calls"] == 1
+    assert finished.usage["total_tokens"] == 50  # both calls
+    assert finished.duration is not None
+
+
+# --- payloads are excluded by default -------------------------------------
+def test_payloads_are_excluded_by_default(event_tools):
+    # An event stream usually ends up in a log aggregator. Prompts, tool
+    # arguments and results are where the personal data lives.
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]])
+    blob = json.dumps([e.as_dict() for e in _collect(agent)])
+    assert _SECRET_ARG not in blob
+    assert _SECRET_RESULT not in blob
+    assert "final answer" not in blob
+
+
+def test_shapes_and_sizes_are_carried_instead(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]])
+    events = _collect(agent)
+    llm_started = next(e for e in events if e.event_type == "LLMStarted")
+    assert llm_started.metadata["messages"] >= 1
+    assert "messages" not in json.dumps(llm_started.metadata).replace('"messages"', "")
+    tool_finished = next(e for e in events if e.event_type == "ToolFinished")
+    assert tool_finished.metadata["output_chars"] == len(_SECRET_RESULT)
+
+
+def test_payloads_can_be_opted_into(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]], event_payloads=True)
+    blob = json.dumps([e.as_dict() for e in _collect(agent)], default=str)
+    assert _SECRET_RESULT in blob
+    assert "final answer" in blob
+
+
+# --- failures --------------------------------------------------------------
+def test_a_raising_tool_emits_tool_failed_after_tool_started(event_tools):
+    agent = Agent(_tool_then_answer("boom"), tools=[event_tools["boom"]])
+    events = _collect(agent)
+    assert [e.event_type for e in events].count("ToolStarted") == 1
+    failed = next(e for e in events if e.event_type == "ToolFailed")
+    assert failed.metadata["reason"] == "raised"
+    assert "kaboom" in failed.metadata["error"]
+    assert failed.duration is not None
+
+
+@pytest.mark.parametrize(
+    "tool_key,tool_name,policy,reason",
+    [
+        (None, "ghost", None, "unknown_tool"),
+        ("privileged", "privileged", "deny", "denied"),
+    ],
+)
+def test_a_refused_call_fails_without_ever_starting(
+    event_tools, tool_key, tool_name, policy, reason
+):
+    # ToolFailed can arrive with no preceding ToolStarted: a call refused
+    # before it ran never started.
+    tools = [event_tools[tool_key]] if tool_key else [event_tools["peek"]]
+    kwargs = {"policy": unchained.PermissionPolicy(granted=set())} if policy else {}
+    agent = Agent(_tool_then_answer(tool_name), tools=tools, **kwargs)
+    events = _collect(agent)
+    assert [e.event_type for e in events].count("ToolStarted") == 0
+    failed = next(e for e in events if e.event_type == "ToolFailed")
+    assert failed.metadata["reason"] == reason
+
+
+def test_invalid_arguments_are_reported_as_a_tool_failure(event_tools):
+    def handler(messages, tools):
+        return {
+            "content": "",
+            "tool_calls": [{"name": "peek", "arguments": {"nope": 1}, "id": "tc-1"}],
+        }
+
+    agent = Agent(MockLLM(handler=handler), tools=[event_tools["peek"]], max_iterations=1)
+    events = _collect(agent)
+    failed = next(e for e in events if e.event_type == "ToolFailed")
+    assert failed.metadata["reason"] == "invalid_arguments"
+
+
+def test_a_failing_run_emits_agent_failed_and_re_raises(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]], budget=Budget(max_tool_calls=0))
+    events = []
+    agent.subscribe(events.append)
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        agent.session().run("go")
+
+    types = [e.event_type for e in events]
+    assert types[0] == "AgentStarted" and types[-1] == "AgentFailed"
+    assert "AgentFinished" not in types
+    failed = events[-1]
+    assert "ToolCallBudgetExceeded" in failed.metadata["error"]
+    assert failed.duration is not None
+
+
+# --- streaming -------------------------------------------------------------
+def test_streaming_runs_are_instrumented_too():
+    agent = Agent(MockLLM(reply="streamed answer"))
+    events = _collect(agent, stream=True)
+    types = [e.event_type for e in events]
+    assert types[0] == "AgentStarted" and types[-1] == "AgentFinished"
+    assert events[-1].metadata["streaming"] is True
+    assert events[-1].metadata["chunks"] > 0
+
+
+# --- concurrency -----------------------------------------------------------
+def test_concurrent_runs_receive_distinct_run_ids():
+    agent = Agent(MockLLM(reply="ok"))
+    run_ids = []
+    agent.subscribe(
+        lambda event: run_ids.append(event.run_id) if event.event_type == "AgentStarted" else None
+    )
+    sessions = [agent.session() for _ in range(12)]
+    start = threading.Barrier(len(sessions))
+
+    def go(session):
+        start.wait()
+        session.run("go")
+
+    threads = [threading.Thread(target=go, args=(s,)) for s in sessions]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(run_ids) == 12
+    assert len(set(run_ids)) == 12  # no two runs share an id
+
+
+def test_run_state_snapshot_carries_the_same_run_id():
+    agent = Agent(MockLLM(reply="ok"))
+    events = []
+    agent.subscribe(events.append)
+    session = agent.session()
+    session.run("go")
+    assert session.last_run.snapshot()["run_id"] == events[0].run_id
+
+
+# --- subscription ----------------------------------------------------------
+def test_subscribe_returns_a_working_unsubscribe():
+    agent = Agent(MockLLM(reply="ok"))
+    events = []
+    stop = agent.subscribe(events.append)
+    agent.session().run("one")
+    assert events
+    before = len(events)
+
+    stop()
+    agent.session().run("two")
+    assert len(events) == before
+
+
+def test_unsubscribing_twice_is_harmless():
+    agent = Agent(MockLLM(reply="ok"))
+    stop = agent.subscribe(lambda event: None)
+    stop()
+    stop()  # must not raise
+
+
+def test_session_level_subscribers_see_only_their_own_conversation():
+    agent = Agent(MockLLM(reply="ok"))
+
+    class Sink(unchained.Callback):
+        def __init__(self):
+            self.events = []
+
+        def on_event(self, event):
+            self.events.append(event)
+
+    everywhere, just_one = Sink(), Sink()
+    agent.callbacks.append(everywhere)
+    agent.session(callbacks=[just_one]).run("mine")
+    agent.session().run("theirs")
+
+    assert len({e.run_id for e in everywhere.events}) == 2
+    assert len({e.run_id for e in just_one.events}) == 1
+
+
+# --- failure isolation -----------------------------------------------------
+def test_a_broken_event_handler_does_not_break_the_run():
+    agent = Agent(MockLLM(reply="answered"))
+
+    def explode(event):
+        raise RuntimeError("sink down")
+
+    agent.subscribe(explode)
+    assert agent.session().run("go") == "answered"
+
+
+def test_strict_callbacks_surface_handler_errors():
+    # A silently broken sink looks like a working one; opt in to find out.
+    agent = Agent(MockLLM(reply="x"), strict_callbacks=True)
+    agent.subscribe(lambda event: (_ for _ in ()).throw(RuntimeError("sink down")))
+    with pytest.raises(RuntimeError, match="sink down"):
+        agent.session().run("go")
+
+
+def test_strict_callbacks_defaults_to_off():
+    assert Agent(MockLLM()).strict_callbacks is False
+    assert Agent(MockLLM()).event_payloads is False
+
+
+# --- the event object ------------------------------------------------------
+def test_events_are_immutable():
+    agent = Agent(MockLLM(reply="ok"))
+    event = _collect(agent)[0]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.event_type = "Tampered"
+
+
+def test_events_are_serialisable_for_structured_logging():
+    agent = Agent(MockLLM(reply="ok"))
+    event = _collect(agent)[0]
+    payload = event.as_dict()
+    json.dumps(payload)
+    assert set(payload) == {
+        "event_type",
+        "run_id",
+        "session_id",
+        "agent",
+        "timestamp",
+        "duration",
+        "model",
+        "tool",
+        "tool_call_id",
+        "usage",
+        "metadata",
+    }
+
+
+def test_event_str_is_a_usable_log_line(event_tools):
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]])
+    line = str(next(e for e in _collect(agent) if e.event_type == "ToolFinished"))
+    assert line.startswith("ToolFinished run=")
+    assert "tool=peek" in line and "ms" in line
+
+
+def test_event_metadata_is_copied_not_aliased():
+    supplied = {"k": "v"}
+    event = unchained.AgentEvent(
+        event_type="AgentStarted", run_id="r", session_id="s", agent="a", metadata=supplied
+    )
+    event.metadata["k"] = "changed"
+    assert supplied == {"k": "v"}
+
+
+def test_agent_event_is_exported():
+    assert "AgentEvent" in unchained.__all__
+
+
+# --- backwards compatibility ----------------------------------------------
+def test_the_older_callbacks_still_fire(event_tools):
+    class Legacy(unchained.Callback):
+        def __init__(self):
+            self.hits = []
+
+        def on_iteration(self, index):
+            self.hits.append(("iteration", index))
+
+        def on_llm_call(self, messages, response):
+            self.hits.append("llm")
+
+        def on_tool_call(self, name, arguments, result):
+            self.hits.append(("tool", name))
+
+        def on_finish(self, answer):
+            self.hits.append("finish")
+
+    legacy = Legacy()
+    agent = Agent(_tool_then_answer(), tools=[event_tools["peek"]], callbacks=[legacy])
+    agent.session().run("go")
+
+    assert ("iteration", 0) in legacy.hits
+    assert ("tool", "peek") in legacy.hits
+    assert "llm" in legacy.hits
+    assert "finish" in legacy.hits
+
+
+def test_a_callback_that_only_implements_old_hooks_is_unaffected():
+    # Never overrides on_event; the base no-op must absorb every event.
+    class OldStyle(unchained.Callback):
+        def __init__(self):
+            self.answers = []
+
+        def on_finish(self, answer):
+            self.answers.append(answer)
+
+    old = OldStyle()
+    agent = Agent(MockLLM(reply="done"), callbacks=[old])
+    assert agent.session().run("go") == "done"
+    assert old.answers == ["done"]
+
+
+def test_logging_callback_handles_events():
+    assert (
+        unchained.LoggingCallback().on_event(
+            unchained.AgentEvent(event_type="AgentStarted", run_id="r", session_id="s", agent="a")
+        )
+        is None
+    )

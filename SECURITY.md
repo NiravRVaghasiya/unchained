@@ -90,6 +90,14 @@ hold even when the model is confused, jailbroken, or adversarial.
   different tools that happen to share one — a `search` over public documents
   and a `search` over internal records — serve each other's cached responses.
   Response formats are keyed by schema for the same reason.
+- **Event payloads are excluded by default.** `AgentEvent` carries shapes
+  and sizes - message counts, character counts, durations, token usage - not
+  prompts, tool arguments, tool results or answers. An event stream usually
+  ends up somewhere with a longer retention and a wider audience than the
+  application itself, and those fields are where personal data and
+  credentials are. `Agent(event_payloads=True)` opts in deliberately; audit
+  events (`on_tool_audit`) carry arguments verbatim regardless, as they
+  always have.
 - **Authorization decisions are audited.** Each decision is emitted to
   `Callback.on_tool_audit` before the tool runs, so the record survives a tool
   that hangs or crashes, and refusals are written to the module logger even

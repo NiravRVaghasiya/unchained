@@ -752,6 +752,57 @@ agent = Agent(llm, tools=[...], callbacks=[LoggingCallback()])
 Write your own by subclassing `Callback` (`on_iteration`, `on_llm_call`,
 `on_tool_call`, `on_finish`). Callback errors are logged, never fatal.
 
+#### Structured events
+
+For logging, metrics and debugging, subscribe to the event stream instead of
+overriding a method per hook:
+
+```python
+stop = agent.subscribe(lambda event: log.info("%s", event))
+# AgentStarted run=09a56d21a187 model=gpt-4o-mini
+# LLMFinished  run=09a56d21a187 model=gpt-4o-mini 412ms tokens=25
+# ToolStarted  run=09a56d21a187 tool=search
+# ToolFinished run=09a56d21a187 tool=search 88ms
+# AgentFinished run=09a56d21a187 1204ms tokens=63
+stop()
+```
+
+Each `AgentEvent` is a frozen record with `event_type`, `run_id`,
+`session_id`, `agent`, `timestamp`, and — where they apply — `duration`,
+`model`, `tool`, `tool_call_id`, `usage` and `metadata`. `as_dict()` gives you
+a JSON-safe dict for structured logging.
+
+| Event | When |
+|---|---|
+| `AgentStarted` / `AgentFinished` / `AgentFailed` | a run begins, answers, or raises |
+| `AgentIteration` | a think/act cycle begins |
+| `LLMStarted` / `LLMFinished` | a provider request goes out and comes back |
+| `ToolStarted` / `ToolFinished` | an authorized tool call runs |
+| `ToolFailed` | a call produced no result |
+
+`ToolFailed` can arrive with no preceding `ToolStarted` — a call refused
+before it ran never started. `metadata["reason"]` says which stage refused it:
+`unknown_tool`, `invalid_arguments`, `denied`, `approval_denied`, `timeout` or
+`raised`. That distinction is the point: "the tool broke" and "the tool was
+not allowed to run" are different numbers on a dashboard.
+
+**`run_id` is unique per run**, so events from concurrent runs never
+interleave ambiguously; `session_id` is stable across a conversation.
+
+> **Payloads are excluded by default.** Prompts, tool arguments, tool results
+> and the final answer are where personal data and credentials live, and an
+> event stream usually ends up in a log aggregator. Events carry shapes and
+> sizes instead — message counts, character counts. Pass
+> `Agent(event_payloads=True)` to include the content itself, deliberately.
+
+Handler errors are logged and swallowed, so a broken metrics sink never costs
+you an answer the model already produced. In tests that hides bugs, so
+`Agent(strict_callbacks=True)` re-raises instead.
+
+`Callback` also gained `on_event`, so a subclass can take the structured
+stream and the older hooks together. Existing subclasses are unaffected — the
+base `on_event` is a no-op.
+
 ### Token usage tracking
 
 Usage is normalised across providers and accumulated per agent:

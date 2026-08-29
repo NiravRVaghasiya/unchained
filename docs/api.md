@@ -18,6 +18,7 @@ Auto-generated from the docstrings in `unchained.py`.
         - Router
         - Callback
         - LoggingCallback
+        - AgentEvent
         - ToolPolicy
         - PermissionPolicy
         - RoutingError
