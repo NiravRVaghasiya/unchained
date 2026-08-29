@@ -12,6 +12,7 @@ Auto-generated from the docstrings in `unchained.py`.
         - Memory
         - RAG
         - Agent
+        - Session
         - Router
         - Callback
         - LoggingCallback

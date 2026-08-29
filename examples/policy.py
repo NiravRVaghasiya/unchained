@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from typing import Any, Dict
 
-from unchained import Agent, Callback, MockLLM, PermissionPolicy, tool
+from unchained import Agent, Callback, MockLLM, PermissionPolicy, Session, tool
 
 # ---------------------------------------------------------------------------
 # 1. A read-only tool. Needs no permission, changes nothing.
@@ -89,8 +89,8 @@ def approve_from_console(request: Dict[str, Any]) -> bool:
     model-controlled.
     """
     print(
-        f"    ?  approval requested: {request['tool']}({request['arguments']}) "
-        f"permissions={request['permissions']}"
+        f"    ?  approval requested by {request['metadata'].get('user', '?')}: "
+        f"{request['tool']}({request['arguments']}) permissions={request['permissions']}"
     )
     # A real implementation would block on input() or a UI event. We approve
     # anything that isn't touching the "ada" account, to show both outcomes.
@@ -100,6 +100,16 @@ def approve_from_console(request: Dict[str, Any]) -> bool:
 def _call(name: str, **arguments: Any) -> Dict[str, Any]:
     """A tool call exactly as a model would emit it."""
     return {"name": name, "arguments": arguments, "id": f"call-{name}"}
+
+
+def ask(session: Session, name: str, **arguments: Any) -> str:
+    """Push one model-requested tool call through the authorization path.
+
+    Real code never calls this - the agent does it for you inside `run()`.
+    Doing it by hand keeps the example on the decisions rather than on
+    scripting an LLM into making them.
+    """
+    return session.agent._execute(session, _call(name, **arguments))
 
 
 def main() -> None:
@@ -114,9 +124,12 @@ def main() -> None:
         policy=PermissionPolicy(granted={"billing:read"}),
         callbacks=[audit],
     )
-    print("   ", support._execute(_call("lookup_order", order_id="A-1")))
-    print("   ", support._execute(_call("apply_refund", order_id="A-1", amount=42.0)))
-    print("   ", support._execute(_call("delete_account", customer="ada")))
+    # One session per caller. Its metadata travels with every tool call, so
+    # the policy and the approval prompt both know who is asking.
+    desk = support.session(metadata={"user": "support-desk"})
+    print("   ", ask(desk, "lookup_order", order_id="A-1"))
+    print("   ", ask(desk, "apply_refund", order_id="A-1", amount=42.0))
+    print("   ", ask(desk, "delete_account", customer="ada"))
 
     # ---- A billing agent that may refund, with admin actions confirmed ---
     print("\nbilling agent - granted {'billing:write', 'account:delete'}, with approval")
@@ -128,16 +141,17 @@ def main() -> None:
         approve=approve_from_console,
         callbacks=[audit],
     )
-    print("   ", billing._execute(_call("apply_refund", order_id="A-1", amount=42.0)))
-    print("   ", billing._execute(_call("delete_account", customer="bob")))
-    print("   ", billing._execute(_call("delete_account", customer="ada")))
-    print("   ", billing._execute(_call("delete_account", customer="root")))
+    finance = billing.session(metadata={"user": "finance"})
+    print("   ", ask(finance, "apply_refund", order_id="A-1", amount=42.0))
+    print("   ", ask(finance, "delete_account", customer="bob"))
+    print("   ", ask(finance, "delete_account", customer="ada"))
+    print("   ", ask(finance, "delete_account", customer="root"))
 
     # ---- The model cannot argue its way past any of this ----------------
     print("\nwhat the model cannot do")
-    print("   ", support._execute(_call("apply_refund", order_id="A-1", amount=0.01)))
-    print("   ", support._execute(_call("drop_database")))
-    print("   ", support._execute(_call("lookup_order", order_id="A-1", admin=True)))
+    print("   ", ask(desk, "apply_refund", order_id="A-1", amount=0.01))
+    print("   ", ask(desk, "drop_database"))
+    print("   ", ask(desk, "lookup_order", order_id="A-1", admin=True))
 
     denied = [e for e in audit.events if e["decision"] not in ("allowed", "approved")]
     print(f"\n{len(audit.events)} decisions recorded, {len(denied)} refused.")

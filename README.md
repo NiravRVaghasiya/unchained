@@ -164,6 +164,67 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+### 👥 Sessions — one agent, many conversations
+
+An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the
+policy. A **`Session`** is one conversation's state: its memory, its token
+counters, its metadata. Build the agent once and give every user a session:
+
+```python
+agent = Agent(llm, tools=[...])  # build once, share freely
+
+alice = agent.session(metadata={"user": "alice"})
+bob = agent.session(metadata={"user": "bob"})
+
+alice.run("my name is Alice")
+bob.run("what is my name?")  # cannot see Alice's history
+```
+
+That makes an agent safe to hold in a module-level variable and serve from many
+request handlers at once. The isolation is structural, not lock-based: each
+session owns its own `Memory` and usage counters, and no conversational state
+lives on the Agent, so two sessions have nothing to contend over.
+
+```python
+alice.usage  # {'prompt_tokens': ..., ...} for this conversation only
+alice.reset()  # start this conversation over
+```
+
+**`agent.run(...)` still works** and is unchanged:
+
+```python
+agent = Agent(llm)
+agent.run("hello")
+agent.run("what did I just say?")  # remembers - one persistent conversation
+```
+
+It uses a single **persistent default session**, created on first use and
+reused for the life of the agent — `agent.memory` and `agent.usage` are that
+session's. Because it persists, `agent.run()` is for single-conversation
+scripts; serving several users means one session each. `agent.reset()` clears
+the default conversation and leaves other sessions alone.
+
+Sessions get their memory from `memory_factory`, so configuration carries into
+every conversation without any two sharing an instance:
+
+```python
+agent = Agent(llm, memory_factory=lambda: Memory(max_messages=50))
+
+# ...or hand one session a specific store, e.g. for per-user persistence:
+session = agent.session(memory=SQLiteMemory(session_id=user_id))
+```
+
+Three things are deliberately shared by every session of an agent, because
+they are resources rather than conversation state: the `llm` (its connection
+pool and response cache), the `rag` knowledge base, and Agent-level
+`callbacks`. Pass `agent.session(callbacks=[...])` for a sink scoped to one
+conversation. A single `Session` is one conversation, so it is not itself
+meant to be driven by two threads at once.
+
+`Router` gives every agent a fresh session per dispatch, so concurrent
+`run_all` calls never land in the same agent's history. See
+[`examples/sessions.py`](examples/sessions.py).
+
 ### 🔒 Tool authorization — a policy layer, not a prompt
 
 A model asking for a tool is a *request*, not a decision. Unchained resolves
@@ -447,6 +508,7 @@ that survives restarts and namespaces conversations by session.
 | [`examples/data_analyst.py`](examples/data_analyst.py) | CSV analysis with a stats tool |
 | [`examples/sqlite_memory.py`](examples/sqlite_memory.py) | Persistent, session-scoped memory backed by SQLite |
 | [`examples/policy.py`](examples/policy.py) | Read-only, side-effecting and approval-required tools under a `ToolPolicy` |
+| [`examples/sessions.py`](examples/sessions.py) | One agent serving many users concurrently, one `Session` each |
 | [`examples/pickmystack/`](examples/pickmystack/) | **Flagship** multi-agent app that recommends an AI stack |
 
 ### PickMyStack
@@ -503,6 +565,7 @@ Unchained is designed to be extended, not forked:
 | Persistent memory | subclass `Memory` — see [`examples/sqlite_memory.py`](examples/sqlite_memory.py) |
 | Custom tracing | subclass `Callback` and pass `callbacks=[...]` |
 | Custom authorization | subclass `ToolPolicy` and pass `policy=...` |
+| Per-user conversations | `agent.session(...)` — one `Session` per conversation |
 | Custom routing | subclass `Router`, override `route()` |
 
 ## License

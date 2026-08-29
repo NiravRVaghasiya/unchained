@@ -227,6 +227,24 @@ agent.run(user_input)
 `asyncio.to_thread`, so it can be awaited from async code (FastAPI, aiohttp,
 ...) without blocking the event loop.
 
+**Configuration vs state.** The loop above runs against a `Session`, not
+against the Agent:
+
+```
+Agent  (shared, safe to reuse)        Session  (one conversation)
+  llm, tools, system_prompt             memory
+  rag, callbacks, policy                usage
+  max_iterations, approve               metadata, callbacks
+```
+
+Every Agent method that touches conversation state takes the session as its
+first argument (`_run(session, ...)`, `_execute(session, call)`), so the
+signatures are the audit trail: a method without a `session` parameter cannot
+reach a conversation. `agent.run()` is `agent.default_session.run()` - one
+persistent session, created on first use, for single-conversation scripts.
+Concurrent users get `agent.session()` each; isolation comes from owning
+separate objects, not from locking.
+
 ### 6. Router (Multi-Agent Orchestration)
 
 ```

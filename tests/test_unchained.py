@@ -92,9 +92,13 @@ def test_tool_error_is_caught_by_agent():
 
     agent = Agent(FakeLLM([{"content": "done"}]), tools=[boom])
     # unknown tool
-    assert "unknown tool" in agent._execute({"name": "ghost", "arguments": {}})
+    assert "unknown tool" in agent._execute(
+        agent.default_session, {"name": "ghost", "arguments": {}}
+    )
     # raising tool
-    assert "Error executing 'boom'" in agent._execute({"name": "boom", "arguments": {"x": 1}})
+    assert "Error executing 'boom'" in agent._execute(
+        agent.default_session, {"name": "boom", "arguments": {"x": 1}}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1515,7 +1519,7 @@ def test_tool_fan_out_is_capped_regardless_of_how_many_calls_the_model_asks_for(
 
     agent = Agent(FakeLLM([]), tools=[slow], max_tool_workers=4)
     calls = [{"name": "slow", "arguments": {"x": i}, "id": f"c{i}"} for i in range(60)]
-    agent._execute_calls(calls)
+    agent._execute_calls(agent.default_session, calls)
 
     assert peak["n"] <= 4, f"pool grew to {peak['n']} concurrent workers"
     # Every call still ran, and the results kept their original order.
@@ -1537,7 +1541,9 @@ def test_single_tool_call_still_skips_the_pool_entirely():
 
     agent = Agent(FakeLLM([]), tools=[echo])
     before = threading.active_count()
-    agent._execute_calls([{"name": "echo", "arguments": {"x": 1}, "id": "c0"}])
+    agent._execute_calls(
+        agent.default_session, [{"name": "echo", "arguments": {"x": 1}, "id": "c0"}]
+    )
     assert threading.active_count() == before
 
 
@@ -1594,7 +1600,9 @@ def test_authorized_tool_executes(policy_tools, ran):
     agent = Agent(
         FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:write"})
     )
-    assert agent._execute(_call("write_row", table="t", value="v")) == "written"
+    assert (
+        agent._execute(agent.default_session, _call("write_row", table="t", value="v")) == "written"
+    )
     assert ran == [("write_row", "t")]
 
 
@@ -1602,7 +1610,7 @@ def test_tool_without_declared_permissions_passes_a_permission_policy(policy_too
     # A tool that declares no permissions requires none. The agent's own
     # tools list is the first allowlist; PermissionPolicy narrows it.
     agent = Agent(FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted=set()))
-    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert agent._execute(agent.default_session, _call("search", query="q")) == "results for q"
     assert ran == [("search", "q")]
 
 
@@ -1611,7 +1619,7 @@ def test_denied_tool_does_not_execute(policy_tools, ran):
     agent = Agent(
         FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:read"})
     )
-    observation = agent._execute(_call("write_row", table="t", value="v"))
+    observation = agent._execute(agent.default_session, _call("write_row", table="t", value="v"))
     assert "db:write" in observation
     assert ran == []  # the function never ran
 
@@ -1645,8 +1653,13 @@ def test_per_tool_allowed_hook_gates_on_arguments(ran):
         return "contents"
 
     agent = Agent(FakeLLM([]), tools=[read_file])
-    assert agent._execute(_call("read_file", path="/safe/notes.txt")) == "contents"
-    assert "refused this call" in agent._execute(_call("read_file", path="/etc/shadow"))
+    assert (
+        agent._execute(agent.default_session, _call("read_file", path="/safe/notes.txt"))
+        == "contents"
+    )
+    assert "refused this call" in agent._execute(
+        agent.default_session, _call("read_file", path="/etc/shadow")
+    )
     assert ran == [("read_file", "/safe/notes.txt")]
 
 
@@ -1658,8 +1671,10 @@ def test_custom_policy_can_deny_on_side_effects(policy_tools, ran):
             super().authorize(tool_obj, arguments, context)
 
     agent = Agent(FakeLLM([]), tools=policy_tools, policy=ReadOnlyWindow())
-    assert agent._execute(_call("search", query="q")) == "results for q"
-    assert "frozen" in agent._execute(_call("write_row", table="t", value="v"))
+    assert agent._execute(agent.default_session, _call("search", query="q")) == "results for q"
+    assert "frozen" in agent._execute(
+        agent.default_session, _call("write_row", table="t", value="v")
+    )
     assert ran == [("search", "q")]
 
 
@@ -1677,8 +1692,10 @@ def test_approval_required_tool_runs_only_when_approved(policy_tools, ran):
         policy=unchained.PermissionPolicy(granted={"db:admin"}),
         approve=approve,
     )
-    assert agent._execute(_call("drop_table", table="scratch")) == "dropped"
-    assert "not approved" in agent._execute(_call("drop_table", table="production"))
+    assert agent._execute(agent.default_session, _call("drop_table", table="scratch")) == "dropped"
+    assert "not approved" in agent._execute(
+        agent.default_session, _call("drop_table", table="production")
+    )
     assert ran == [("drop_table", "scratch")]
 
     # The approver is shown what it needs to decide, including the real args.
@@ -1694,7 +1711,7 @@ def test_approval_required_without_an_approver_fails_closed(policy_tools, ran):
     agent = Agent(
         FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:admin"})
     )
-    observation = agent._execute(_call("drop_table", table="t"))
+    observation = agent._execute(agent.default_session, _call("drop_table", table="t"))
     assert "requires approval" in observation
     assert ran == []
 
@@ -1709,7 +1726,9 @@ def test_an_approver_that_raises_is_a_refusal(policy_tools, ran):
         policy=unchained.PermissionPolicy(granted={"db:admin"}),
         approve=approve,
     )
-    assert "could not be approved" in agent._execute(_call("drop_table", table="t"))
+    assert "could not be approved" in agent._execute(
+        agent.default_session, _call("drop_table", table="t")
+    )
     assert ran == []
 
 
@@ -1722,11 +1741,13 @@ def test_policy_can_escalate_a_granted_permission_to_approval(ran):
 
     policy = unchained.PermissionPolicy(granted={"db:write"}, approval_for={"db:write"})
     denied = Agent(FakeLLM([]), tools=[write_row], policy=policy)
-    assert "requires approval" in denied._execute(_call("write_row", table="t"))
+    assert "requires approval" in denied._execute(
+        denied.default_session, _call("write_row", table="t")
+    )
     assert ran == []
 
     allowed = Agent(FakeLLM([]), tools=[write_row], policy=policy, approve=lambda request: True)
-    assert allowed._execute(_call("write_row", table="t")) == "written"
+    assert allowed._execute(allowed.default_session, _call("write_row", table="t")) == "written"
     assert ran == [("write_row", "t")]
 
 
@@ -1752,14 +1773,14 @@ def test_approval_callback_is_serialised_across_concurrent_tool_calls(ran):
         return True
 
     agent = Agent(FakeLLM([]), tools=[confirmable], approve=approve, max_tool_workers=8)
-    agent._execute_calls([_call("confirmable", x=i) for i in range(12)])
+    agent._execute_calls(agent.default_session, [_call("confirmable", x=i) for i in range(12)])
     assert max(overlaps) == 1, "approval callback was entered concurrently"
 
 
 # --- the model cannot reach an unauthorized tool ---------------------------
 def test_model_requesting_an_unknown_tool_never_reaches_a_function(policy_tools, ran):
     agent = Agent(FakeLLM([]), tools=policy_tools)
-    assert "unknown tool" in agent._execute(_call("rm_rf", path="/"))
+    assert "unknown tool" in agent._execute(agent.default_session, _call("rm_rf", path="/"))
     assert ran == []
 
 
@@ -1772,7 +1793,7 @@ def test_model_cannot_reach_a_tool_the_agent_was_not_given(ran):
 
     # The tool exists in the process, but this agent was never given it.
     agent = Agent(FakeLLM([]), tools=[], policy=unchained.PermissionPolicy(granted={"db:admin"}))
-    assert "unknown tool" in agent._execute(_call("privileged", x=1))
+    assert "unknown tool" in agent._execute(agent.default_session, _call("privileged", x=1))
     assert ran == []
 
 
@@ -1813,16 +1834,22 @@ def test_a_broken_policy_fails_closed(policy_tools, ran):
             raise ValueError("bug in my own policy")
 
     agent = Agent(FakeLLM([]), tools=policy_tools, policy=Broken())
-    assert "not authorized" in agent._execute(_call("search", query="q"))
+    assert "not authorized" in agent._execute(agent.default_session, _call("search", query="q"))
     assert ran == []
 
 
 # --- argument validation ---------------------------------------------------
 def test_invalid_arguments_are_rejected_before_execution(policy_tools, ran):
     agent = Agent(FakeLLM([]), tools=policy_tools)
-    assert "unexpected argument" in agent._execute(_call("search", query="q", sneaky=1))
-    assert "missing required argument" in agent._execute({"name": "search", "arguments": {}})
-    assert "expects an object" in agent._execute({"name": "search", "arguments": "not-a-dict"})
+    assert "unexpected argument" in agent._execute(
+        agent.default_session, _call("search", query="q", sneaky=1)
+    )
+    assert "missing required argument" in agent._execute(
+        agent.default_session, {"name": "search", "arguments": {}}
+    )
+    assert "expects an object" in agent._execute(
+        agent.default_session, {"name": "search", "arguments": "not-a-dict"}
+    )
     assert ran == []
 
 
@@ -1906,11 +1933,20 @@ def test_policy_hooks_receive_tool_arguments_and_context():
         return value
 
     agent = Agent(FakeLLM([]), tools=[probe], name="inspector", policy=Inspecting())
-    agent._execute({"name": "probe", "arguments": {"value": "v"}, "id": "call-9"})
+    session = agent.session(metadata={"user": "alice"}, session_id="s-1")
+    agent._execute(session, {"name": "probe", "arguments": {"value": "v"}, "id": "call-9"})
 
     assert captured["tool"] == "probe"
     assert captured["arguments"] == {"value": "v"}
-    assert captured["context"] == {"agent": "inspector", "tool": "probe", "call_id": "call-9"}
+    # The policy is told who is asking, not just what for: session metadata
+    # is what lets a policy authorize per user rather than per agent.
+    assert captured["context"] == {
+        "agent": "inspector",
+        "tool": "probe",
+        "call_id": "call-9",
+        "session": "s-1",
+        "metadata": {"user": "alice"},
+    }
 
 
 # --- audit -----------------------------------------------------------------
@@ -1930,11 +1966,11 @@ def test_every_decision_is_audited(policy_tools):
         callbacks=[sink],
         name="auditor",
     )
-    agent._execute(_call("search", query="q"))
-    agent._execute(_call("write_row", table="t", value="v"))
-    agent._execute(_call("ghost"))
-    agent._execute(_call("search", query="q", bad=1))
-    agent._execute(_call("drop_table", table="t"))
+    agent._execute(agent.default_session, _call("search", query="q"))
+    agent._execute(agent.default_session, _call("write_row", table="t", value="v"))
+    agent._execute(agent.default_session, _call("ghost"))
+    agent._execute(agent.default_session, _call("search", query="q", bad=1))
+    agent._execute(agent.default_session, _call("drop_table", table="t"))
 
     decisions = [(e["tool"], e["decision"]) for e in sink.events]
     assert decisions == [
@@ -1968,7 +2004,7 @@ def test_audit_records_an_approved_call_distinctly(ran):
 
     sink = Sink()
     agent = Agent(FakeLLM([]), tools=[confirmable], approve=lambda r: True, callbacks=[sink])
-    agent._execute(_call("confirmable", x=1))
+    agent._execute(agent.default_session, _call("confirmable", x=1))
     assert [e["decision"] for e in sink.events] == ["approved"]
 
 
@@ -1978,7 +2014,7 @@ def test_a_failing_audit_callback_never_breaks_the_run(policy_tools, ran):
             raise RuntimeError("audit sink is down")
 
     agent = Agent(FakeLLM([]), tools=policy_tools, callbacks=[Broken()])
-    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert agent._execute(agent.default_session, _call("search", query="q")) == "results for q"
     assert ran == [("search", "q")]
 
 
@@ -2018,8 +2054,10 @@ def test_agent_without_a_policy_gets_the_permissive_default(policy_tools, ran):
     agent = Agent(FakeLLM([]), tools=policy_tools)
     assert isinstance(agent.policy, unchained.ToolPolicy)
     assert agent.approve is None
-    assert agent._execute(_call("search", query="q")) == "results for q"
-    assert agent._execute(_call("write_row", table="t", value="v")) == "written"
+    assert agent._execute(agent.default_session, _call("search", query="q")) == "results for q"
+    assert (
+        agent._execute(agent.default_session, _call("write_row", table="t", value="v")) == "written"
+    )
     assert ran == [("search", "q"), ("write_row", "t")]
 
 
@@ -2033,7 +2071,7 @@ def test_default_policy_still_honours_tool_metadata(ran):
         return "ran"
 
     agent = Agent(FakeLLM([]), tools=[dangerous])
-    assert "requires approval" in agent._execute(_call("dangerous", x=1))
+    assert "requires approval" in agent._execute(agent.default_session, _call("dangerous", x=1))
     assert ran == []
 
 
@@ -2044,4 +2082,448 @@ def test_existing_tool_error_handling_is_unchanged():
         raise ValueError("nope")
 
     agent = Agent(FakeLLM([]), tools=[boom])
-    assert "Error executing 'boom'" in agent._execute(_call("boom", x=1))
+    assert "Error executing 'boom'" in agent._execute(agent.default_session, _call("boom", x=1))
+
+
+# ---------------------------------------------------------------------------
+# Tier 7: Agent configuration vs Session state
+#
+# The invariant: an Agent is configuration and behaviour, safe to share; a
+# Session is one conversation's mutable state. Isolation here is structural -
+# two sessions own separate objects - so these tests assert on *state*, not on
+# locking.
+# ---------------------------------------------------------------------------
+def _echo_llm():
+    """A stateless MockLLM that echoes the last user message back."""
+    return MockLLM(handler=lambda messages, tools: f"echo:{messages[-1]['content']}")
+
+
+# --- independent memory ----------------------------------------------------
+def test_two_sessions_have_independent_memory():
+    agent = Agent(_echo_llm())
+    alice, bob = agent.session(), agent.session()
+
+    alice.run("my name is Alice")
+    bob.run("my name is Bob")
+
+    alice_text = [m["content"] for m in alice.memory.get()]
+    bob_text = [m["content"] for m in bob.memory.get()]
+    assert "my name is Alice" in alice_text
+    assert "my name is Bob" not in alice_text
+    assert "my name is Bob" in bob_text
+    assert "my name is Alice" not in bob_text
+    assert alice.memory is not bob.memory
+
+
+def test_sessions_do_not_touch_the_agents_default_session():
+    agent = Agent(_echo_llm())
+    agent.session().run("in a session")
+    assert agent.memory.get() == []  # the default conversation never started
+
+
+def test_agent_memory_instance_is_not_shared_with_new_sessions():
+    # Requirement: Agent configuration must not accidentally share
+    # conversation memory. Agent(memory=...) seeds the *default* session only.
+    seeded = Memory(max_messages=8)
+    agent = Agent(_echo_llm(), memory=seeded)
+
+    assert agent.memory is seeded  # backwards compatible
+    fresh = agent.session()
+    assert fresh.memory is not seeded
+
+    fresh.run("hello")
+    assert seeded.get() == []  # the seeded memory saw nothing
+
+
+def test_memory_factory_configures_every_new_session():
+    agent = Agent(_echo_llm(), memory_factory=lambda: Memory(max_messages=3))
+    one, two = agent.session(), agent.session()
+    assert one.memory.max_messages == 3
+    assert two.memory.max_messages == 3
+    assert one.memory is not two.memory
+
+
+def test_session_accepts_an_explicit_memory_for_per_user_persistence():
+    store = Memory(max_messages=50)
+    agent = Agent(_echo_llm())
+    session = agent.session(memory=store)
+    session.run("remember this")
+    assert session.memory is store
+    assert any("remember this" in str(m["content"]) for m in store.get())
+
+
+# --- usage isolation -------------------------------------------------------
+def test_usage_is_tracked_per_session():
+    def handler(messages, tools):
+        return {"content": "ok", "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+
+    agent = Agent(MockLLM(handler=handler))
+    busy, idle = agent.session(), agent.session()
+
+    busy.run("one")
+    busy.run("two")
+    idle.run("only once")
+
+    assert busy.usage["prompt_tokens"] == 6
+    assert idle.usage["prompt_tokens"] == 3
+    assert agent.usage["prompt_tokens"] == 0  # the default session did nothing
+    assert busy.usage is not idle.usage
+
+
+def test_session_reset_clears_memory_and_usage():
+    def handler(messages, tools):
+        # MockLLM passes usage through verbatim - real providers derive
+        # total_tokens in _normalize_usage - so state it explicitly here.
+        return {
+            "content": "ok",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        }
+
+    session = Agent(MockLLM(handler=handler)).session()
+    session.run("hello")
+    assert session.memory.get() and session.usage["total_tokens"] > 0
+
+    session.reset()
+    assert session.memory.get() == []
+    assert session.usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+# --- concurrency -----------------------------------------------------------
+def test_sessions_run_concurrently_without_mixing_state():
+    agent = Agent(_echo_llm())
+    sessions = [agent.session(session_id=f"s{i}") for i in range(8)]
+    start = threading.Barrier(len(sessions))
+    errors = []
+
+    def converse(index, session):
+        try:
+            start.wait()
+            for turn in range(6):
+                session.run(f"s{index}-turn{turn}")
+        except Exception as exc:  # pragma: no cover - only on a real failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=converse, args=(i, s)) for i, s in enumerate(sessions)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    for index, session in enumerate(sessions):
+        contents = [str(m["content"]) for m in session.memory.get()]
+        # 6 turns x (user + assistant), and every line belongs to this session.
+        assert len(contents) == 12
+        assert all(f"s{index}-turn" in c for c in contents), contents
+
+
+def test_concurrent_sessions_keep_separate_usage_totals():
+    def handler(messages, tools):
+        return {
+            "content": "ok",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    agent = Agent(MockLLM(handler=handler))
+    sessions = [agent.session() for _ in range(6)]
+    start = threading.Barrier(len(sessions))
+
+    def work(session, turns):
+        start.wait()
+        for _ in range(turns):
+            session.run("x")
+
+    threads = [threading.Thread(target=work, args=(s, i + 1)) for i, s in enumerate(sessions)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for i, session in enumerate(sessions):
+        assert session.usage["total_tokens"] == 2 * (i + 1)
+
+
+@pytest.mark.parametrize("_", range(1))
+def test_concurrent_arun_sessions_are_isolated(_):
+    agent = Agent(_echo_llm())
+
+    async def main():
+        sessions = [agent.session() for _ in range(5)]
+        await asyncio.gather(*(s.arun(f"user-{i}") for i, s in enumerate(sessions)))
+        return sessions
+
+    sessions = asyncio.run(main())
+    for i, session in enumerate(sessions):
+        assert [str(m["content"]) for m in session.memory.get()][0] == f"user-{i}"
+
+
+# --- callback isolation ----------------------------------------------------
+def test_session_callbacks_are_scoped_to_that_session():
+    class Counter(unchained.Callback):
+        def __init__(self):
+            self.finishes = 0
+
+        def on_finish(self, answer):
+            self.finishes += 1
+
+    shared, only_alice = Counter(), Counter()
+    agent = Agent(_echo_llm(), callbacks=[shared])
+    alice = agent.session(callbacks=[only_alice])
+    bob = agent.session()
+
+    alice.run("hi")
+    bob.run("hi")
+    bob.run("again")
+
+    assert shared.finishes == 3  # agent-level callbacks see every session
+    assert only_alice.finishes == 1  # session-level ones see only their own
+
+
+def test_session_callback_list_is_copied_not_aliased():
+    supplied = []
+    session = Agent(_echo_llm()).session(callbacks=supplied)
+    session.callbacks.append(unchained.LoggingCallback())
+    assert supplied == []  # the caller's list was not adopted as shared state
+
+
+def test_session_metadata_is_copied_not_aliased():
+    supplied = {"user": "alice"}
+    session = Agent(_echo_llm()).session(metadata=supplied)
+    session.metadata["tenant"] = "acme"
+    assert supplied == {"user": "alice"}
+
+
+# --- the default session ---------------------------------------------------
+def test_default_session_is_persistent_across_agent_run_calls():
+    # Documented behaviour: agent.run() holds ONE conversation for the life of
+    # the agent. It is not recreated per call.
+    agent = Agent(_echo_llm())
+    agent.run("first")
+    agent.run("second")
+
+    contents = [str(m["content"]) for m in agent.memory.get()]
+    assert "first" in contents and "second" in contents
+    assert agent.default_session is agent.default_session  # same object each time
+
+
+def test_default_session_is_created_lazily():
+    agent = Agent(_echo_llm())
+    assert agent._default_session is None
+    _ = agent.memory
+    assert agent._default_session is not None
+
+
+def test_agent_reset_clears_only_the_default_session():
+    agent = Agent(_echo_llm())
+    other = agent.session()
+    agent.run("default conversation")
+    other.run("other conversation")
+
+    agent.reset()
+    assert agent.memory.get() == []
+    assert other.memory.get() != []  # untouched
+
+
+def test_agent_memory_property_is_assignable_for_backwards_compatibility():
+    agent = Agent(_echo_llm())
+    replacement = Memory(max_messages=4)
+    agent.memory = replacement
+    assert agent.memory is replacement
+    assert agent.default_session.memory is replacement
+
+
+def test_default_session_is_built_once_under_concurrent_first_use():
+    agent = Agent(_echo_llm())
+    seen = []
+    start = threading.Barrier(8)
+
+    def grab():
+        start.wait()
+        seen.append(agent.default_session)
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len({id(s) for s in seen}) == 1  # one session, not eight
+
+
+# --- backwards compatibility ----------------------------------------------
+def test_agent_run_still_works_unchanged():
+    agent = Agent(FakeLLM([{"content": "hello there"}]))
+    assert agent.run("hi") == "hello there"
+
+
+def test_agent_run_with_tools_and_usage_still_works():
+    @tool
+    def add(a: int, b: int) -> int:
+        """Add."""
+        return a + b
+
+    llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [{"name": "add", "arguments": {"a": 2, "b": 3}, "id": "c1"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+            },
+            {
+                "content": "The answer is 5.",
+                "usage": {"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8},
+            },
+        ]
+    )
+    agent = Agent(llm, tools=[add])
+    assert agent.run("what is 2+3?") == "The answer is 5."
+    assert agent.usage == {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+    assert any(m["role"] == "tool" for m in agent.memory.get())
+
+
+def test_agent_stream_still_works_on_the_default_session():
+    agent = Agent(MockLLM(reply="streamed answer"))
+    assert "".join(agent.stream("hi")).strip() == "streamed answer"
+    assert agent.memory.get()[-1]["content"].strip() == "streamed answer"
+
+
+def test_agent_arun_still_works():
+    agent = Agent(FakeLLM([{"content": "async answer"}]))
+    assert asyncio.run(agent.arun("hi")) == "async answer"
+    assert agent.memory.get()[-1]["content"] == "async answer"
+
+
+def test_session_run_supports_structured_output():
+    class Item(BaseModel):
+        name: str
+
+    session = Agent(FakeLLM([{"content": '{"name": "widget"}'}])).session()
+    assert session.run("name it", response_format=Item).name == "widget"
+
+
+# --- Router + sessions -----------------------------------------------------
+def test_router_run_all_uses_a_fresh_session_per_agent():
+    agents = [
+        Agent(_echo_llm(), name="a", description="a specialist"),
+        Agent(_echo_llm(), name="b", description="b specialist"),
+    ]
+    router = Router(FakeLLM([]), agents=agents)
+    results = router.run_all("hello")
+
+    assert set(results) == {"a", "b"}
+    # Nothing leaked into either agent's default conversation.
+    for agent in agents:
+        assert agent.memory.get() == []
+
+
+def test_router_run_routes_into_a_fresh_session():
+    target = Agent(_echo_llm(), name="cost", description="cost specialist")
+    router = Router(FakeLLM([{"content": "cost"}]), agents=[target])
+    router.run("how much?")
+    assert target.memory.get() == []
+
+
+def test_concurrent_router_run_all_calls_do_not_interleave():
+    # Two callers fanning out over the same Router at the same time. Before
+    # sessions, both landed in each agent's single shared memory.
+    agents = [Agent(_echo_llm(), name=f"agent{i}", description=f"specialist {i}") for i in range(3)]
+    router = Router(FakeLLM([]), agents=agents)
+    results = {}
+    start = threading.Barrier(2)
+
+    def caller(tag):
+        start.wait()
+        results[tag] = router.run_all(f"query-{tag}")
+
+    threads = [threading.Thread(target=caller, args=(tag,)) for tag in ("x", "y")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for tag in ("x", "y"):
+        assert set(results[tag]) == {"agent0", "agent1", "agent2"}
+        for answer in results[tag].values():
+            assert f"query-{tag}" in answer  # each caller got its own query back
+    for agent in agents:
+        assert agent.memory.get() == []
+
+
+def test_router_passes_session_metadata_through():
+    seen = []
+
+    class Recording(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            seen.append(context["metadata"])
+
+    @tool
+    def ping() -> str:
+        """Ping."""
+        return "pong"
+
+    script = [
+        {"content": "", "tool_calls": [{"name": "ping", "arguments": {}, "id": "c"}]},
+        {"content": "done"},
+    ]
+    agent = Agent(
+        MockLLM(script=script),
+        name="solo",
+        description="the only one",
+        tools=[ping],
+        policy=Recording(),
+    )
+    Router(FakeLLM([{"content": "solo"}]), agents=[agent]).run("go", metadata={"user": "alice"})
+    assert seen == [{"user": "alice"}]
+
+
+def test_router_synthesize_still_works_with_sessions():
+    agents = [
+        Agent(MockLLM(reply="finding-a"), name="a", description="a"),
+        Agent(MockLLM(reply="finding-b"), name="b", description="b"),
+    ]
+    synth = Agent(MockLLM(reply="FINAL"), name="synth", description="synth")
+    router = Router(FakeLLM([]), agents=agents, synthesizer=synth)
+    assert router.synthesize("question") == "FINAL"
+    assert synth.memory.get() == []  # the synthesizer also got a fresh session
+
+
+# --- the state audit itself ------------------------------------------------
+def test_agent_keeps_no_conversation_state_outside_its_default_session():
+    # A regression guard for the split: if a future change parks a Memory, a
+    # Session or a usage counter on the Agent again, this fails.
+    agent = Agent(FakeLLM([{"content": "hi"}]))
+    agent.run("hello")
+
+    usage_keys = {"prompt_tokens", "completion_tokens", "total_tokens"}
+    permitted = {"_default_memory", "_default_session"}  # the documented default session
+    for name, value in vars(agent).items():
+        if name in permitted:
+            continue
+        assert not isinstance(value, (Memory, unchained.Session)), (
+            f"{name} holds conversation state"
+        )
+        if isinstance(value, dict):
+            assert set(value) != usage_keys, f"{name} looks like usage counters"
+
+
+def test_agent_exposes_no_public_mutable_conversation_attribute():
+    agent = Agent(FakeLLM([]))
+    public = {k: v for k, v in vars(agent).items() if not k.startswith("_")}
+    assert not any(isinstance(v, (Memory, unchained.Session)) for v in public.values())
+    # memory and usage are properties onto the default session, not attributes.
+    assert "memory" not in public
+    assert "usage" not in public
+
+
+def test_session_is_exported_and_constructible_directly():
+    assert "Session" in unchained.__all__
+    agent = Agent(_echo_llm())
+    session = unchained.Session(agent, memory=Memory(), session_id="manual")
+    assert session.run("hi") == "echo:hi"
+    assert session.id == "manual"
+
+
+def test_sessions_get_distinct_ids_by_default():
+    agent = Agent(_echo_llm())
+    ids = {agent.session().id for _ in range(20)}
+    assert len(ids) == 20
+    assert agent.default_session.id == "default"

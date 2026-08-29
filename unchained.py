@@ -27,6 +27,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -70,6 +71,7 @@ __all__ = [
     "Memory",
     "RAG",
     "Agent",
+    "Session",
     "Router",
     "Callback",
     "LoggingCallback",
@@ -1356,6 +1358,33 @@ class Agent:
     model for validated structured output; ``stream`` yields the answer token
     by token. Attach ``callbacks`` for tracing and read ``usage`` for token
     accounting.
+
+    **An Agent is configuration and behaviour; a** :class:`Session` **is one
+    conversation's state.** Nothing about a particular conversation - its
+    memory, its token counters - lives on the Agent, so one Agent can serve
+    many users and many concurrent requests::
+
+        agent = Agent(llm, tools=[...])      # build once, share freely
+        alice = agent.session()              # independent conversations
+        bob = agent.session()
+
+    ``agent.run(...)`` still works and is unchanged for single-conversation
+    scripts: it uses one persistent default session, created on first use.
+    See :meth:`session` and :attr:`default_session`.
+
+    Three things *are* deliberately shared by every session of an Agent,
+    because they are resources rather than conversation state:
+
+    * ``llm`` - its HTTP connection pool and response cache. Sharing is the
+      point; that is what makes them worth having.
+    * ``rag`` - a knowledge base is read by every conversation. Adding
+      documents at runtime affects them all, by design.
+    * ``callbacks`` - Agent-level callbacks observe every session. Pass
+      ``agent.session(callbacks=[...])`` for a sink scoped to one
+      conversation instead.
+
+    Anything you add yourself that holds per-conversation state belongs on a
+    Session, not here.
     """
 
     def __init__(
@@ -1373,13 +1402,32 @@ class Agent:
         max_tool_workers: int = 8,
         policy: Optional[ToolPolicy] = None,
         approve: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        memory_factory: Optional[Callable[[], Memory]] = None,
     ):
+        """``memory`` and ``memory_factory`` differ, and the difference matters.
+
+        ``memory`` is an instance, and it belongs to *the default session
+        only* - the one behind ``agent.run()``. It is never handed to a
+        session from :meth:`session`, because sharing one Memory between
+        conversations is precisely the bug this split exists to prevent.
+
+        ``memory_factory`` is how every other session gets its memory: a
+        zero-argument callable returning a fresh Memory. Use it to carry
+        configuration (a window size, a subclass) into every conversation::
+
+            Agent(llm, memory_factory=lambda: Memory(max_messages=50))
+
+        It defaults to ``Memory``, i.e. framework defaults per session.
+        """
         self.llm = llm
         self.name = name
         self.description = description or system_prompt
         self.system_prompt = system_prompt
         self.tools: Dict[str, Tool] = {t.name: t for t in (tools or [])}
-        self.memory = memory or Memory()
+        # How a new session gets its memory. A factory, not an instance:
+        # handing the same Memory to two sessions would merge two
+        # conversations, which is the failure this whole split prevents.
+        self.memory_factory = memory_factory or Memory
         self.rag = rag
         self.max_iterations = max_iterations
         self.callbacks = list(callbacks or [])
@@ -1397,104 +1445,229 @@ class Agent:
         # set, reach or influence it.
         self.approve = approve
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
-        # dialog must not be re-entered from several workers at once.
+        # dialog must not be re-entered from several workers at once. This
+        # stays on the Agent on purpose: it guards the application's single
+        # approval UI, so it must serialise across sessions too.
         self._approval_lock = threading.Lock()
-        self.usage: Dict[str, int] = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
+        # The default session is built on first use, not here, so an Agent
+        # that only ever serves explicit sessions never allocates one.
+        self._default_memory = memory
+        self._default_session: Optional[Session] = None
+        self._default_session_lock = threading.Lock()
 
+    # -- sessions --
+    def session(
+        self,
+        memory: Optional[Memory] = None,
+        callbacks: Optional[List[Callback]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> Session:
+        """Start a new, independent conversation with this agent.
+
+        The returned :class:`Session` owns its own memory and usage counters,
+        so sessions do not see each other's history and can run concurrently::
+
+            alice = agent.session(metadata={"user": "alice"})
+            bob = agent.session(metadata={"user": "bob"})
+
+        ``memory`` overrides this session's store - the hook for per-user
+        persistence (``agent.session(memory=SQLiteMemory(session_id=uid))``).
+        Otherwise ``memory_factory`` supplies a fresh one.
+
+        ``callbacks`` are additional and scoped to this session; Agent-level
+        callbacks still fire. ``metadata`` is yours - it is passed to
+        :class:`ToolPolicy` hooks as ``context["metadata"]`` and included in
+        audit events, which is how a policy authorizes per user rather than
+        per agent.
+        """
+        return Session(
+            self,
+            memory=memory if memory is not None else self.memory_factory(),
+            callbacks=callbacks,
+            metadata=metadata,
+            session_id=session_id,
+        )
+
+    @property
+    def default_session(self) -> Session:
+        """The one persistent session behind ``agent.run()``.
+
+        Created on first use and reused for the life of the Agent, so a
+        script that calls ``agent.run()`` in a loop holds a single
+        conversation - exactly as it did before sessions existed. It is
+        *not* recreated per call.
+
+        That persistence is why ``agent.run()`` is for single-conversation
+        use. Serving several users from one Agent means one session each
+        (:meth:`session`); leaning on the default session would merge them.
+        Call :meth:`reset` to start the default conversation over.
+        """
+        if self._default_session is None:
+            with self._default_session_lock:
+                if self._default_session is None:
+                    self._default_session = Session(
+                        self,
+                        memory=(
+                            self._default_memory
+                            if self._default_memory is not None
+                            else self.memory_factory()
+                        ),
+                        session_id="default",
+                    )
+        return self._default_session
+
+    def reset(self) -> None:
+        """Clear the default session's memory and usage counters.
+
+        Sessions from :meth:`session` are untouched - they are not the
+        Agent's to clear.
+        """
+        self.default_session.reset()
+
+    @property
+    def memory(self) -> Memory:
+        """The default session's memory. See :attr:`default_session`."""
+        return self.default_session.memory
+
+    @memory.setter
+    def memory(self, value: Memory) -> None:
+        self.default_session.memory = value
+
+    @property
+    def usage(self) -> Dict[str, int]:
+        """The default session's token counters. See :attr:`default_session`.
+
+        Usage is per conversation. There is no Agent-wide total: that would
+        be shared mutable state, and two concurrent sessions would race on
+        it. Sum the sessions you care about in your own code.
+        """
+        return self.default_session.usage
+
+    # -- running a turn --
+    #
+    # Every method below that touches conversation state takes the session
+    # explicitly as its first argument. That is deliberate: the signature is
+    # the audit trail. A method without a ``session`` parameter cannot reach
+    # a conversation's memory or usage, so "what is shared?" is answerable by
+    # reading the signatures rather than the bodies.
     def run(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
-        self.memory.add("user", self._augment_with_rag(user_input))
+        """Take a turn in this agent's persistent default conversation.
+
+        Equivalent to ``agent.default_session.run(...)``. Convenient for
+        scripts and single-conversation use; for concurrent users, give each
+        one its own :meth:`session`.
+        """
+        return self.default_session.run(user_input, response_format)
+
+    def stream(self, user_input: str) -> Iterator[str]:
+        """Stream a turn of the default conversation. See :meth:`run`."""
+        return self.default_session.stream(user_input)
+
+    async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
+        """Await a turn of the default conversation. See :meth:`run`."""
+        return await self.default_session.arun(user_input, response_format)
+
+    def _run(
+        self,
+        session: Session,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+    ) -> Any:
+        """The ReAct loop, against one session's state. See :meth:`Session.run`."""
+        session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         answer: Optional[str] = None
         for i in range(self.max_iterations):
-            self._emit("on_iteration", i)
+            self._emit(session, "on_iteration", i)
             # JSON mode is only requested when no tools are in play; combining
             # tool-calling with JSON mode is unreliable across providers.
             fmt = response_format if not tool_list else None
             result = self._chat(
-                self._build_messages(fmt), tools=tool_list or None, response_format=fmt
+                session,
+                self._build_messages(session, fmt),
+                tools=tool_list or None,
+                response_format=fmt,
             )
             if not result["tool_calls"]:
                 answer = result["content"]
-                self.memory.add("assistant", answer)
+                session.memory.add("assistant", answer)
                 break
-            self.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-            self._execute_calls(result["tool_calls"])
+            session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
+            self._execute_calls(session, result["tool_calls"])
         if answer is None:  # exhausted iterations - force a final answer
             answer = self._chat(
-                self._build_messages(response_format), response_format=response_format
+                session,
+                self._build_messages(session, response_format),
+                response_format=response_format,
             )["content"]
-            self.memory.add("assistant", answer)
+            session.memory.add("assistant", answer)
         if response_format is not None:
             if tool_list:  # dedicated formatting pass so output matches the schema
                 answer = self._chat(
-                    self._build_messages(response_format), response_format=response_format
+                    session,
+                    self._build_messages(session, response_format),
+                    response_format=response_format,
                 )["content"]
-            parsed = self._parse_structured(answer, response_format)
-            self._emit("on_finish", parsed)
+            parsed = self._parse_structured(session, answer, response_format)
+            self._emit(session, "on_finish", parsed)
             return parsed
-        self._emit("on_finish", answer)
+        self._emit(session, "on_finish", answer)
         return answer
 
-    def stream(self, user_input: str) -> Iterator[str]:
-        """Stream the final answer token by token.
+    def _stream(self, session: Session, user_input: str) -> Iterator[str]:
+        """Stream the final answer token by token, against one session.
 
         Any tool calls are resolved first (non-streaming); the final assistant
         reply is then streamed. With no tools, the reply is streamed directly.
         """
-        self.memory.add("user", self._augment_with_rag(user_input))
+        session.memory.add("user", self._augment_with_rag(user_input))
         tool_list = list(self.tools.values())
         if tool_list:
             for i in range(self.max_iterations):
-                self._emit("on_iteration", i)
-                result = self._chat(self._build_messages(None), tools=tool_list)
+                self._emit(session, "on_iteration", i)
+                result = self._chat(session, self._build_messages(session, None), tools=tool_list)
                 if not result["tool_calls"]:
                     break
-                self.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-                self._execute_calls(result["tool_calls"])
+                session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
+                self._execute_calls(session, result["tool_calls"])
         chunks: List[str] = []
-        for chunk in self.llm.stream(self._build_messages(None)):
+        for chunk in self.llm.stream(self._build_messages(session, None)):
             chunks.append(chunk)
             yield chunk
         answer = "".join(chunks)
-        self.memory.add("assistant", answer)
-        self._emit("on_finish", answer)
-
-    async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
-        """Async wrapper around :meth:`run`.
-
-        ``unchained`` has no separate async HTTP stack; this offloads the
-        whole (blocking) turn to a worker thread via ``asyncio.to_thread`` so
-        it can be awaited alongside other coroutines without blocking the
-        event loop. Handy for using an agent inside an async web framework
-        (FastAPI, aiohttp, ...) without switching the whole codebase to a
-        dedicated async HTTP client.
-        """
-        return await asyncio.to_thread(self.run, user_input, response_format)
+        session.memory.add("assistant", answer)
+        self._emit(session, "on_finish", answer)
 
     # -- instrumentation helpers --
     def _chat(
         self,
+        session: Session,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
     ) -> Dict[str, Any]:
         result = self.llm.chat(messages, tools=tools, response_format=response_format)
-        self._track_usage(result.get("usage"))
-        self._emit("on_llm_call", messages, result)
+        self._track_usage(session, result.get("usage"))
+        self._emit(session, "on_llm_call", messages, result)
         return result
 
-    def _track_usage(self, usage: Optional[Dict[str, Any]]) -> None:
+    @staticmethod
+    def _track_usage(session: Session, usage: Optional[Dict[str, Any]]) -> None:
+        """Accumulate token usage on the session that spent it."""
         if not usage:
             return
-        for key in self.usage:
-            self.usage[key] += int(usage.get(key, 0) or 0)
+        for key in session.usage:
+            session.usage[key] += int(usage.get(key, 0) or 0)
 
-    def _emit(self, event: str, *args: Any) -> None:
-        for cb in self.callbacks:
+    def _emit(self, session: Session, event: str, *args: Any) -> None:
+        """Notify this agent's callbacks, then the session's own.
+
+        Agent-level callbacks see every conversation (a tracer, a metrics
+        sink); session-level ones see only theirs, which is what you want for
+        anything that accumulates per conversation.
+        """
+        for cb in (*self.callbacks, *session.callbacks):
             try:
                 getattr(cb, event)(*args)
             except Exception:  # instrumentation must never break the run
@@ -1511,18 +1684,20 @@ class Agent:
             f"Use the following context to answer.\n\nContext:\n{context}\n\nQuestion: {user_input}"
         )
 
-    def _build_messages(self, schema: Optional[Type[BaseModel]]) -> List[Dict[str, Any]]:
+    def _build_messages(
+        self, session: Session, schema: Optional[Type[BaseModel]]
+    ) -> List[Dict[str, Any]]:
         system = self.system_prompt
-        if self.memory.summary:
-            system += f"\n\nConversation summary so far:\n{self.memory.summary}"
+        if session.memory.summary:
+            system += f"\n\nConversation summary so far:\n{session.memory.summary}"
         if schema is not None:
             system += (
                 "\n\nRespond with a single JSON object matching this schema "
                 f"(no prose, no code fences):\n{json.dumps(self._json_schema(schema))}"
             )
-        return [{"role": "system", "content": system}] + self.memory.get()
+        return [{"role": "system", "content": system}] + session.memory.get()
 
-    def _execute_calls(self, calls: List[Dict[str, Any]]) -> None:
+    def _execute_calls(self, session: Session, calls: List[Dict[str, Any]]) -> None:
         """Run one turn's tool calls, add each result to memory in order.
 
         A single call runs inline. Multiple independent calls (the model
@@ -1539,21 +1714,23 @@ class Agent:
         run; only their concurrency is bounded, and results keep their order.
         """
         if len(calls) == 1:
-            observations = [self._execute(calls[0])]
+            observations = [self._execute(session, calls[0])]
         else:
             workers = min(len(calls), self.max_tool_workers)
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                observations = list(pool.map(self._execute, calls))
+                observations = list(pool.map(partial(self._execute, session), calls))
         for call, observation in zip(calls, observations):
-            self._emit("on_tool_call", call["name"], call.get("arguments", {}), observation)
-            self.memory.add(
+            self._emit(
+                session, "on_tool_call", call["name"], call.get("arguments", {}), observation
+            )
+            session.memory.add(
                 "tool",
                 observation,
                 tool_call_id=call.get("id") or call["name"],
                 name=call["name"],
             )
 
-    def _execute(self, call: Dict[str, Any]) -> str:
+    def _execute(self, session: Session, call: Dict[str, Any]) -> str:
         """Authorize, then run, one model-requested tool call.
 
         This is the only path from model output to a tool function, and it is
@@ -1574,37 +1751,49 @@ class Agent:
         tool_obj = self.tools.get(name)
         if tool_obj is None:
             # A hallucinated or out-of-scope name never reaches a function.
-            self._audit(name, arguments, "unknown_tool", "not in this agent's tool set")
+            self._audit(session, name, arguments, "unknown_tool", "not in this agent's tool set")
             return f"Error: unknown tool '{name}'."
-        context = {"agent": self.name, "tool": name, "call_id": call.get("id")}
+        # The policy sees who is asking, not just what for: session metadata
+        # is how a policy authorizes per user rather than per agent.
+        context = {
+            "agent": self.name,
+            "tool": name,
+            "call_id": call.get("id"),
+            "session": session.id,
+            "metadata": session.metadata,
+        }
         try:
             arguments = tool_obj.validate_arguments(arguments)
             self.policy.authorize(tool_obj, arguments, context)
             decision = "allowed"
             if self.policy.requires_approval(tool_obj, arguments, context):
-                self._request_approval(tool_obj, arguments, context)
+                self._request_approval(session, tool_obj, arguments, context)
                 decision = "approved"
         except ToolArgumentValidationError as exc:
-            self._audit(name, arguments, "invalid_arguments", str(exc), tool_obj)
+            self._audit(session, name, arguments, "invalid_arguments", str(exc), tool_obj)
             return f"Error: {exc}"
         except ToolApprovalRequired as exc:
-            self._audit(name, arguments, "approval_denied", str(exc), tool_obj)
+            self._audit(session, name, arguments, "approval_denied", str(exc), tool_obj)
             return f"Error: {exc}"
         except ToolAuthorizationError as exc:
-            self._audit(name, arguments, "denied", str(exc), tool_obj)
+            self._audit(session, name, arguments, "denied", str(exc), tool_obj)
             return f"Error: {exc}"
         except Exception as exc:  # a policy that breaks must not fail open
             logger.exception("policy raised while authorizing '%s'", name)
-            self._audit(name, arguments, "denied", f"policy error: {exc}", tool_obj)
+            self._audit(session, name, arguments, "denied", f"policy error: {exc}", tool_obj)
             return f"Error: tool '{name}' was not authorized (policy error)."
-        self._audit(name, arguments, decision, "", tool_obj)
+        self._audit(session, name, arguments, decision, "", tool_obj)
         try:
             return str(tool_obj.run(arguments))
         except Exception as exc:  # a tool must never crash the loop
             return f"Error executing '{name}': {exc}"
 
     def _request_approval(
-        self, tool_obj: Tool, arguments: Dict[str, Any], context: Dict[str, Any]
+        self,
+        session: Session,
+        tool_obj: Tool,
+        arguments: Dict[str, Any],
+        context: Dict[str, Any],
     ) -> None:
         """Ask the application to confirm one call, or raise ToolApprovalRequired.
 
@@ -1620,6 +1809,8 @@ class Agent:
             )
         request = {
             "agent": self.name,
+            "session": session.id,
+            "metadata": session.metadata,
             "tool": tool_obj.name,
             "arguments": dict(arguments),
             "permissions": sorted(tool_obj.permissions),
@@ -1640,15 +1831,21 @@ class Agent:
 
     def _audit(
         self,
+        session: Session,
         name: str,
         arguments: Any,
         decision: str,
         reason: str = "",
         tool_obj: Optional[Tool] = None,
     ) -> None:
-        """Record one authorization decision, before the tool runs."""
+        """Record one authorization decision, before the tool runs.
+
+        The event carries the session id, so a decision is still traceable to
+        one conversation when many run concurrently.
+        """
         event = {
             "agent": self.name,
+            "session": session.id,
             "tool": name,
             "arguments": arguments,
             "decision": decision,
@@ -1662,13 +1859,13 @@ class Agent:
             # Refusals are logged by the core as well as emitted, so there is
             # a record even when no callback is attached.
             logger.warning("tool %s: %s (%s)", name, decision, reason)
-        self._emit("on_tool_audit", event)
+        self._emit(session, "on_tool_audit", event)
 
     @staticmethod
     def _json_schema(schema: Type[BaseModel]) -> Dict[str, Any]:
         return _pydantic_schema(schema)
 
-    def _parse_structured(self, content: str, schema: Type[BaseModel]):
+    def _parse_structured(self, session: Session, content: str, schema: Type[BaseModel]):
         """Validate content against the schema, repairing via the LLM on failure."""
         data = self._loads_object(content)
         for attempt in range(self.structured_retries + 1):
@@ -1681,6 +1878,7 @@ class Agent:
                     "structured output failed validation; repair attempt %d", attempt + 1
                 )
                 content = self._chat(
+                    session,
                     [
                         {
                             "role": "system",
@@ -1715,13 +1913,102 @@ class Agent:
         return {}
 
 
-# --- 8. Router (multi-agent orchestration) ---------------------------------
+# --- 8. Session (one conversation's state) ---------------------------------
+class Session:
+    """One conversation with an :class:`Agent`: its memory, usage and metadata.
+
+    An Agent is configuration and behaviour - safe to build once and share
+    across users, requests and threads. A Session is the mutable state of a
+    single conversation, so each one gets its own::
+
+        agent = Agent(llm, tools=[...])
+        alice = agent.session(metadata={"user": "alice"})
+        bob = agent.session(metadata={"user": "bob"})
+
+        alice.run("my name is Alice")
+        bob.run("what is my name?")     # cannot see Alice's history
+
+    Sessions are isolated by construction rather than by locking: each owns
+    its own :class:`Memory` and usage counters, and no conversational state
+    lives on the Agent, so two sessions have nothing to contend over. They
+    can therefore run concurrently - subject to the resources you chose to
+    share between them (``llm``, ``rag``, Agent-level callbacks; see the
+    Agent docstring).
+
+    A single Session is *not* itself concurrency-safe: it is one
+    conversation, and two threads adding to the same history interleave. One
+    session per conversation, not per request to the same conversation.
+
+    Create these with :meth:`Agent.session`; constructing one directly is
+    fine but you must supply the memory yourself.
+    """
+
+    def __init__(
+        self,
+        agent: Agent,
+        memory: Optional[Memory] = None,
+        callbacks: Optional[List[Callback]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ):
+        self.agent = agent
+        self.memory = memory if memory is not None else Memory()
+        # Copied, not aliased: a caller's dict must not become shared state.
+        self.callbacks = list(callbacks or [])
+        self.metadata: Dict[str, Any] = dict(metadata or {})
+        self.id = session_id or uuid.uuid4().hex[:12]
+        self.usage: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def run(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
+        """Take one turn in this conversation.
+
+        Optionally pass a Pydantic model as ``response_format`` for validated
+        structured output. The agent's ReAct loop does the work; this session
+        supplies the history it reads and the counters it updates.
+        """
+        return self.agent._run(self, user_input, response_format)
+
+    def stream(self, user_input: str) -> Iterator[str]:
+        """Stream this turn's answer token by token. See :meth:`run`."""
+        return self.agent._stream(self, user_input)
+
+    async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
+        """Await one turn off the event loop.
+
+        No separate async HTTP stack: this offloads the blocking turn to a
+        worker thread with ``asyncio.to_thread``. Because sessions are
+        independent, awaiting several at once is safe - which is the point of
+        having them in an async server.
+        """
+        return await asyncio.to_thread(self.run, user_input, response_format)
+
+    def reset(self) -> None:
+        """Start this conversation over: clear memory, summary and counters."""
+        self.memory.clear()
+        for key in self.usage:
+            self.usage[key] = 0
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Session {self.id} of {self.agent.name}: {len(self.memory.get())} messages>"
+
+
+# --- 9. Router (multi-agent orchestration) ---------------------------------
 class Router:
     """Coordinate several agents: route to one, run all, or run all and fuse.
 
     :meth:`route` fails closed - if the model's choice is empty, evasive,
     hallucinated or ambiguous it raises :class:`RoutingError` rather than
     guessing. Pass ``fallback=`` to nominate an agent for those queries.
+
+    Every dispatch runs in a **fresh** :class:`Session` per agent, so a
+    router can serve concurrent queries without two of them landing in the
+    same agent's history. It never touches an agent's default session. Pass
+    ``metadata=`` to hand the caller's identity to each session, and so to
+    :class:`ToolPolicy`.
     """
 
     _WORD_RE = re.compile(r"[a-z0-9_]+")
@@ -1797,20 +2084,34 @@ class Router:
             "Router(..., fallback=agent) to handle unroutable queries explicitly."
         )
 
-    def run(self, query: str) -> Any:
-        return self.route(query).run(query)
+    def run(self, query: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
+        """Route the query to one agent and run it in a fresh session."""
+        return self.route(query).session(metadata=metadata).run(query)
 
-    def run_all(self, query: str, parallel: bool = True) -> Dict[str, Any]:
-        """Run every agent (in parallel by default) and collect their results."""
+    def run_all(
+        self,
+        query: str,
+        parallel: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run every agent (in parallel by default) and collect their results.
+
+        Each agent runs in its own new session. That is what makes the
+        parallel path safe: the agents share no conversation state, and two
+        concurrent ``run_all`` calls cannot interleave in one agent's
+        history. Nothing is retained afterwards - these are one-shot
+        conversations, so the answers do not accumulate anywhere.
+        """
         results: Dict[str, Any] = {}
+        work = {a: partial(a.session(metadata=metadata).run, query) for a in self.agents}
         if parallel and len(self.agents) > 1:
             with ThreadPoolExecutor(max_workers=len(self.agents)) as pool:
-                futures = {pool.submit(a.run, query): a for a in self.agents}
+                futures = {pool.submit(fn): agent for agent, fn in work.items()}
                 for future, agent in futures.items():
                     results[agent.name] = self._safe(future.result)
         else:
-            for agent in self.agents:
-                results[agent.name] = self._safe(partial(agent.run, query))
+            for agent, fn in work.items():
+                results[agent.name] = self._safe(fn)
         return results
 
     @staticmethod
@@ -1820,13 +2121,21 @@ class Router:
         except Exception as exc:  # one failing agent shouldn't sink the rest
             return f"Error: {exc}"
 
-    def synthesize(self, query: str, parallel: bool = True) -> Any:
-        """Run all agents, then fuse their findings with the synthesizer."""
-        results = self.run_all(query, parallel=parallel)
+    def synthesize(
+        self,
+        query: str,
+        parallel: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Run all agents, then fuse their findings with the synthesizer.
+
+        The synthesizer also gets a fresh session, for the same reason.
+        """
+        results = self.run_all(query, parallel=parallel, metadata=metadata)
         combined = "\n\n".join(f"### {n}\n{r}" for n, r in results.items())
         if self.synthesizer is None:
             return combined
-        return self.synthesizer.run(
+        return self.synthesizer.session(metadata=metadata).run(
             f"Original query: {query}\n\nFindings from specialist agents:\n{combined}"
             "\n\nSynthesize these into a single, well-reasoned final answer."
         )

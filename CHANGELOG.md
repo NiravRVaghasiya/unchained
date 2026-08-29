@@ -7,6 +7,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`Session`: agent configuration is now separate from conversation state.**
+  An `Agent` holds the LLM, tools, prompt, RAG, callbacks and policy - things
+  that are safe to share. A `Session` holds one conversation's memory, usage
+  counters and metadata. One agent can therefore serve many users and many
+  concurrent requests:
+
+  ```python
+  agent = Agent(llm, tools=[...])  # build once, share freely
+  alice = agent.session(metadata={"user": "alice"})
+  bob = agent.session()
+  ```
+
+  The isolation is structural rather than lock-based: each session owns its
+  own `Memory` and counters, and no conversational state remains on the Agent,
+  so two sessions have nothing to contend over.
+  - `Agent.session(memory=, callbacks=, metadata=, session_id=)` starts an
+    independent conversation. `metadata` reaches `ToolPolicy` hooks as
+    `context["metadata"]` and appears in audit events and approval requests,
+    which is how a policy authorizes per user rather than per agent.
+  - `Agent.memory_factory` (default `Memory`) supplies each new session's
+    memory. `Agent(memory=<instance>)` still works and now seeds the *default
+    session only* - it is deliberately not shared with `agent.session()`.
+  - `Session.run/stream/arun/reset`, and `Agent.reset()` for the default one.
+  - Session-level callbacks fire only for that conversation; Agent-level
+    callbacks still see every session.
+  - Audit events and approval requests now carry the session id.
+
+### Changed
+- `agent.run()`, `agent.stream()` and `agent.arun()` are unchanged, and
+  `agent.memory` / `agent.usage` still work: they now address a **persistent
+  default session**, created on first use and reused for the life of the
+  agent. Because it persists, `agent.run()` remains a single-conversation
+  API; serving several users means one session each.
+- `agent.usage` is per conversation. There is deliberately no Agent-wide
+  total, which would reintroduce the shared mutable state this change
+  removes; sum the sessions you care about.
+- **`Router` now runs every dispatch in a fresh session per agent**, so
+  concurrent `run_all` / `synthesize` calls no longer interleave in one
+  agent's history, and routing never touches an agent's default session.
+  Results are returned as before but are no longer retained in agent memory.
+  `run`, `run_all` and `synthesize` accept `metadata=` to pass the caller's
+  identity through to each session and its policy.
 - **Tool authorization layer.** A model requesting a tool is now a request
   that is granted or refused in Python, before the function runs - not a
   prompt asking the model to behave.

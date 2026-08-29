@@ -58,6 +58,13 @@ hold even when the model is confused, jailbroken, or adversarial.
   and missing required parameters, so malformed model output cannot reach the
   function. Note the limit: this is structural, not type validation (see
   below).
+- **Conversations are isolated by construction.** An `Agent` holds no
+  conversation state; each `Session` owns its own memory and usage counters.
+  One user's history cannot leak into another's through a shared agent, and
+  the separation is structural rather than lock-based. `Agent.session(...)`
+  per user; `agent.run()` is one persistent conversation, so do not use it to
+  serve several. Session `metadata` reaches `ToolPolicy` as
+  `context["metadata"]`, which is how a policy authorizes per user.
 - **Authorization decisions are audited.** Each decision is emitted to
   `Callback.on_tool_audit` before the tool runs, so the record survives a tool
   that hangs or crashes, and refusals are written to the module logger even
