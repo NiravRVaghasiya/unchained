@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **RAG silently mis-scored mismatched embeddings.** A vector of the wrong
+  width was zipped against a longer one and compared on the overlap, so a
+  2-dimensional vector scored 1.0 against a 3-dimensional corpus. The index
+  now fixes its dimension on the first vector it accepts and rejects any
+  later document or query vector that does not match; `RAG.dimension`
+  reports it.
+- **`embed_fn` returning the wrong number of vectors corrupted the index.**
+  Documents and embeddings drifted apart - too few silently dropped
+  documents from every search, too many raised `IndexError` from `search()`
+  long afterwards. It must now return exactly one vector per text.
+- **A negative `top_k` returned the wrong documents.** `search(q, top_k=-1)`
+  sliced the ranked list from the end, returning everything except the best
+  match. `top_k` must now be an integer of at least 1, and non-integers are
+  rejected rather than reaching the slice.
+- **A failing or rejected batch left the index half-updated.** Documents were
+  appended before `embed_fn` was called, so an exception left documents with
+  no embeddings. Everything is validated before anything is stored.
+- **Empty and non-finite vectors are rejected.** A zero-width vector can
+  never rank anything, and a NaN propagates into every score it touches. A
+  *zero* vector is still accepted - some models emit one - and scores 0.0.
+- **`_cosine` no longer compares a prefix.** Mismatched lengths raise instead
+  of zipping to the shorter vector, results are clamped to `[-1.0, 1.0]`, and
+  a magnitude that overflows the squared sum returns 0.0 rather than NaN,
+  which would corrupt the ranking.
+- **Empty documents are rejected.** They can never match and only dilute
+  results. Non-string documents get a distinct message.
+- **A TF-IDF query with no indexable tokens returns nothing** instead of the
+  first `top_k` documents scored 0.0. Nothing to search *with* is not the
+  same as having searched and found nothing.
+
 ### Added
 - **Tool execution semantics.** A model can request several tools in one turn
   and they all ran concurrently, with no way to say that a tool must not

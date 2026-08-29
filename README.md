@@ -607,6 +607,29 @@ use dense embeddings instead — TF-IDF stays the zero-dependency default:
 rag = RAG(embed_fn=my_embedding_model)  # e.g. OpenAI or sentence-transformers
 ```
 
+**Inputs are validated, because the failures here are silent ones.** A vector
+of the wrong width used to be zipped against a longer one and scored a perfect
+1.0; a negative `top_k` sliced the ranked list from the end and returned
+everything *except* the best match. So:
+
+- `embed_fn` must return exactly one vector per text, in order.
+- The index fixes its dimension on the first vector it accepts; every later
+  vector — document or query — must match. `rag.dimension` reports it.
+- Vectors must be non-empty and finite. A **zero vector is fine** — some
+  models emit one for input they can't represent — and scores 0.0.
+- Documents must be non-empty strings; `top_k` must be an integer ≥ 1.
+- **Nothing is stored until all of it validates**, so a failing `embed_fn`
+  leaves the index exactly as it was rather than half-added.
+
+In TF-IDF mode a query with no indexable tokens (`""`, `"!!!"`) returns
+nothing. Having nothing to search *with* is different from having searched and
+found nothing similar, and returning arbitrary documents scored 0.0 only looks
+like a result.
+
+Duplicate documents are kept rather than merged — the same text can
+legitimately arrive twice from different sources — and equal scores keep
+insertion order.
+
 ### 📦 Structured output — validated with Pydantic
 
 ```python

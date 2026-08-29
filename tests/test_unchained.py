@@ -5103,3 +5103,326 @@ def test_the_scheduler_does_not_infer_dependencies(overlap_tools):
         {"name": "par", "arguments": {}, "id": "second"},
     ]
     assert len(agent._schedule(calls)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 16: RAG validation
+#
+# The failures here were all silent ones - a wrong-width vector scored 1.0, a
+# negative top_k sliced the ranked list from the end - so each test asserts the
+# rejection AND that the index is untouched by it.
+# ---------------------------------------------------------------------------
+def _fixed_embedder(dimension=3, count=None):
+    """An embed_fn returning `dimension`-wide vectors, one per text by default."""
+
+    def embed(texts):
+        n = len(texts) if count is None else count
+        return [[float(i + 1)] + [0.0] * (dimension - 1) for i in range(n)]
+
+    return embed
+
+
+# --- metadata / text length mismatch --------------------------------------
+def test_metadata_length_mismatch_is_rejected_and_indexes_nothing():
+    rag = RAG()
+    with pytest.raises(ValueError, match="metadatas"):
+        rag.add_many(["a", "b", "c"], [{}, {}])
+    assert len(rag) == 0
+
+
+def test_matching_metadata_lengths_are_accepted():
+    rag = RAG()
+    rag.add_many(["a", "b"], [{"i": 1}, {"i": 2}])
+    assert len(rag) == 2
+    assert rag.metadata == [{"i": 1}, {"i": 2}]
+
+
+# --- embedding dimension ---------------------------------------------------
+def test_the_index_takes_its_dimension_from_the_first_vector():
+    rag = RAG(embed_fn=_fixed_embedder(4))
+    assert rag.dimension is None
+    rag.add_many(["a", "b"])
+    assert rag.dimension == 4
+
+
+def test_a_document_vector_of_the_wrong_width_is_rejected():
+    # It used to be zipped against the longer one and scored as a match.
+    def uneven(texts):
+        return [[1.0, 0.0, 0.0] if text == "a" else [1.0, 0.0] for text in texts]
+
+    rag = RAG(embed_fn=uneven)
+    with pytest.raises(ValueError, match="dimension"):
+        rag.add_many(["a", "b"])
+    assert len(rag) == 0 and rag.dimension is None
+
+
+def test_a_later_batch_of_a_different_width_is_rejected():
+    rag = RAG(embed_fn=_fixed_embedder(2))
+    rag.add_many(["a"])
+    rag.embed_fn = _fixed_embedder(5)
+    with pytest.raises(ValueError, match="dimension"):
+        rag.add_many(["b"])
+    assert len(rag) == 1 and rag.dimension == 2  # unchanged
+
+
+def test_a_query_vector_of_the_wrong_width_is_rejected():
+    rag = RAG(embed_fn=_fixed_embedder(3))
+    rag.add_many(["a", "b"])
+    rag.embed_fn = _fixed_embedder(2)
+    with pytest.raises(ValueError, match="the query"):
+        rag.search("q")
+
+
+def test_a_matching_query_width_searches_normally():
+    rag = RAG(embed_fn=_fixed_embedder(3))
+    rag.add_many(["a", "b"])
+    hits = rag.search("q", top_k=2)
+    assert len(hits) == 2
+    assert all(-1.0 <= hit["score"] <= 1.0 for hit in hits)
+
+
+# --- embed_fn contract -----------------------------------------------------
+@pytest.mark.parametrize("count", [0, 1, 5])
+def test_embed_fn_must_return_one_vector_per_text(count):
+    rag = RAG(embed_fn=_fixed_embedder(2, count=count))
+    with pytest.raises(ValueError, match="vectors for"):
+        rag.add_many(["a", "b", "c"])
+    assert len(rag) == 0 and len(rag._embeddings) == 0
+
+
+def test_embed_fn_must_return_a_sequence():
+    rag = RAG(embed_fn=lambda texts: 42)
+    with pytest.raises(ValueError, match="sequence of vectors"):
+        rag.add_many(["a"])
+
+
+def test_a_query_embedder_returning_several_vectors_is_rejected():
+    rag = RAG(embed_fn=_fixed_embedder(2))
+    rag.add_many(["a"])
+    rag.embed_fn = lambda texts: [[1.0, 0.0], [0.0, 1.0]]
+    with pytest.raises(ValueError, match="one query"):
+        rag.search("q")
+
+
+# --- vector contents -------------------------------------------------------
+def test_an_empty_vector_is_rejected():
+    rag = RAG(embed_fn=lambda texts: [[] for _ in texts])
+    with pytest.raises(ValueError, match="empty vector"):
+        rag.add_many(["a"])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_vector_values_are_rejected(bad):
+    rag = RAG(embed_fn=lambda texts: [[bad, 1.0] for _ in texts])
+    with pytest.raises(ValueError, match="non-finite"):
+        rag.add_many(["a"])
+    assert len(rag) == 0
+
+
+def test_non_numeric_vector_values_are_rejected():
+    rag = RAG(embed_fn=lambda texts: [["x", 1.0] for _ in texts])
+    with pytest.raises(ValueError, match="non-numeric"):
+        rag.add_many(["a"])
+
+
+def test_a_zero_vector_is_allowed_and_scores_zero():
+    # Some models emit one for input they cannot represent. It is not a
+    # caller error, and cosine handles it.
+    rag = RAG(embed_fn=lambda texts: [[0.0, 0.0] for _ in texts])
+    rag.add_many(["a"])
+    assert len(rag) == 1
+    assert rag.search("q")[0]["score"] == 0.0
+
+
+# --- documents -------------------------------------------------------------
+@pytest.mark.parametrize("empty", ["", "   ", "\n\t "])
+def test_empty_documents_are_rejected(empty):
+    rag = RAG()
+    with pytest.raises(ValueError, match="empty document"):
+        rag.add(empty)
+    assert len(rag) == 0
+
+
+def test_a_non_string_document_is_rejected_with_a_clear_message():
+    rag = RAG()
+    with pytest.raises(ValueError, match="must be strings"):
+        rag.add_many([123])
+
+
+def test_one_bad_document_rejects_the_whole_batch():
+    rag = RAG()
+    with pytest.raises(ValueError, match="position 1"):
+        rag.add_many(["real content", ""])
+    assert len(rag) == 0  # the good one was not half-added
+
+
+def test_punctuation_only_documents_are_allowed():
+    # Real text with no TF-IDF tokens; meaningful under an embed_fn.
+    rag = RAG()
+    rag.add("!!!")
+    assert len(rag) == 1
+
+
+# --- top_k -----------------------------------------------------------------
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_top_k_below_one_is_rejected(bad):
+    # -1 used to slice the ranked list from the end and return everything
+    # except the best-scoring document.
+    rag = RAG()
+    rag.add_many(["alpha", "beta"])
+    with pytest.raises(ValueError, match="at least 1"):
+        rag.search("alpha", top_k=bad)
+
+
+@pytest.mark.parametrize("bad", [None, 1.5, "3", True])
+def test_a_non_integer_top_k_is_rejected(bad):
+    rag = RAG()
+    rag.add_many(["alpha"])
+    with pytest.raises(ValueError, match="must be an integer"):
+        rag.search("alpha", top_k=bad)
+
+
+def test_top_k_larger_than_the_corpus_returns_everything():
+    rag = RAG()
+    rag.add_many(["alpha one", "beta two"])
+    assert len(rag.search("alpha", top_k=99)) == 2
+
+
+def test_top_k_is_validated_before_the_corpus_is_checked():
+    # Consistent: an invalid top_k is a caller error whether or not the
+    # index happens to be empty.
+    with pytest.raises(ValueError):
+        RAG().search("q", top_k=0)
+
+
+# --- empty corpus ----------------------------------------------------------
+def test_searching_an_empty_corpus_returns_nothing():
+    assert RAG().search("anything") == []
+    assert len(RAG()) == 0
+    assert RAG().dimension is None
+
+
+def test_adding_no_documents_is_a_no_op_and_never_calls_embed_fn():
+    called = []
+    rag = RAG(embed_fn=lambda texts: called.append(texts) or [])
+    rag.add_many([])
+    assert len(rag) == 0
+    assert called == []
+
+
+# --- duplicates ------------------------------------------------------------
+def test_duplicate_documents_are_kept_with_their_own_metadata():
+    # The same text can legitimately arrive twice from different sources.
+    rag = RAG()
+    rag.add_many(["same", "same", "other"], [{"src": "a"}, {"src": "b"}, {"src": "c"}])
+    assert len(rag) == 3
+    hits = rag.search("same", top_k=3)
+    assert [hit["metadata"]["src"] for hit in hits] == ["a", "b", "c"]
+
+
+def test_equal_scores_keep_insertion_order():
+    rag = RAG()
+    rag.add_many(["dup", "dup", "dup"], [{"i": 0}, {"i": 1}, {"i": 2}])
+    hits = rag.search("dup", top_k=3)
+    assert [hit["metadata"]["i"] for hit in hits] == [0, 1, 2]
+
+
+# --- cosine ----------------------------------------------------------------
+def test_cosine_rejects_mismatched_lengths():
+    with pytest.raises(ValueError, match="equal length"):
+        RAG._cosine([1.0, 0.0, 5.0], [1.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "a,b,expected",
+    [
+        ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], 1.0),
+        ([1.0, 0.0], [-1.0, 0.0], -1.0),
+        ([1.0, 0.0], [0.0, 1.0], 0.0),
+        ([0.0, 0.0], [1.0, 1.0], 0.0),
+        ([0.0, 0.0], [0.0, 0.0], 0.0),
+    ],
+)
+def test_cosine_known_values(a, b, expected):
+    assert abs(RAG._cosine(a, b) - expected) < 1e-12
+
+
+def test_cosine_stays_within_range():
+    for a, b in [
+        ([0.3, -0.9, 0.1], [0.5, 0.2, -0.8]),
+        ([1e-8, 1e-8], [1e-8, 1e-8]),
+        ([1.0, 1.0], [1.0, 1.0000000001]),
+    ]:
+        assert -1.0 <= RAG._cosine(a, b) <= 1.0
+
+
+def test_cosine_returns_zero_rather_than_nan_on_overflow():
+    # NaN would corrupt the sort; the ranking is not recoverable either way.
+    assert RAG._cosine([1e200, 1e200], [1e200, 1e200]) == 0.0
+
+
+# --- queries ---------------------------------------------------------------
+@pytest.mark.parametrize("query", ["", "   ", "!!!", "...???"])
+def test_a_query_with_no_indexable_tokens_returns_nothing(query):
+    # Nothing to search *with* is different from having searched and found
+    # nothing; returning arbitrary documents scored 0.0 only looks like a
+    # result.
+    rag = RAG()
+    rag.add_many(["alpha one", "beta two"])
+    assert rag.search(query) == []
+
+
+def test_a_non_string_query_is_rejected():
+    rag = RAG()
+    rag.add_many(["alpha"])
+    with pytest.raises(ValueError, match="string query"):
+        rag.search(None)
+
+
+def test_a_query_that_matches_nothing_still_ranks_the_corpus():
+    # Distinct from the case above: there were tokens, they just did not hit.
+    rag = RAG()
+    rag.add_many(["alpha one", "beta two"])
+    hits = rag.search("zebra", top_k=2)
+    assert len(hits) == 2
+    assert all(hit["score"] == 0.0 for hit in hits)
+
+
+# --- atomicity -------------------------------------------------------------
+def test_a_failing_embed_fn_leaves_the_index_untouched():
+    rag = RAG(embed_fn=lambda texts: (_ for _ in ()).throw(RuntimeError("provider down")))
+    with pytest.raises(RuntimeError):
+        rag.add_many(["a", "b"])
+    assert (len(rag.docs), len(rag._embeddings), rag.dimension) == (0, 0, None)
+
+
+def test_a_rejected_batch_leaves_an_existing_index_intact():
+    rag = RAG(embed_fn=_fixed_embedder(2))
+    rag.add_many(["first"])
+    rag.embed_fn = _fixed_embedder(9)
+    with pytest.raises(ValueError):
+        rag.add_many(["second"])
+    assert (len(rag.docs), len(rag._embeddings), rag.dimension) == (1, 1, 2)
+    assert rag.docs == ["first"]
+
+
+def test_documents_and_embeddings_never_drift_apart():
+    rag = RAG(embed_fn=_fixed_embedder(3))
+    rag.add_many(["a", "b"])
+    rag.add_many(["c"])
+    assert len(rag.docs) == len(rag._embeddings) == len(rag.metadata) == 3
+
+
+# --- the TF-IDF path is unchanged -----------------------------------------
+def test_tfidf_ranking_still_works():
+    rag = RAG()
+    rag.add_many(
+        [
+            "Python is a programming language",
+            "Cats are small domestic animals",
+            "Rust is a systems programming language",
+        ]
+    )
+    top = rag.search("systems programming", top_k=1)[0]
+    assert "Rust" in top["text"]
+    assert top["score"] > 0

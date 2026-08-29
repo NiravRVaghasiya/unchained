@@ -1527,6 +1527,23 @@ class RAG:
     Pass ``embed_fn`` (``list[str] -> list[list[float]]``) to switch to dense
     embeddings instead - e.g. an OpenAI or sentence-transformers model. The
     search interface is identical either way.
+
+    Inputs are validated rather than trusted, because the failures here are
+    silent ones: a vector of the wrong length used to be zipped against a
+    longer one and scored 1.0, and a negative ``top_k`` used to slice the
+    result list from the end. Specifically:
+
+    * ``embed_fn`` must return exactly one vector per text.
+    * The index takes its dimension from the first vector it accepts, and
+      every later vector - document or query - must match it.
+    * Vectors must be non-empty and finite.
+    * Documents must be non-empty; ``top_k`` must be an integer of at least 1.
+    * Nothing is stored until all of it validates, so a failing ``embed_fn``
+      leaves the index exactly as it was.
+
+    Duplicate documents are kept, not merged: the same text can legitimately
+    arrive twice with different metadata. Both are returned, and equal scores
+    keep insertion order.
     """
 
     _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -1540,6 +1557,13 @@ class RAG:
         self._vectors: List[Dict[str, float]] = []
         self._norms: List[float] = []
         self._embeddings: List[List[float]] = []
+        # Fixed by the first vector accepted; everything after must match.
+        self._dimension: Optional[int] = None
+
+    @property
+    def dimension(self) -> Optional[int]:
+        """The embedding width this index has settled on, or None if empty."""
+        return self._dimension
 
     def _tokenize(self, text: str) -> List[str]:
         return self._TOKEN_RE.findall(text.lower())
@@ -1550,26 +1574,108 @@ class RAG:
     def add_many(self, texts: List[str], metadatas: Optional[List[Dict[str, Any]]] = None) -> None:
         """Index several documents at once.
 
+        Everything is checked before anything is stored, so a rejected batch
+        leaves the index exactly as it was - half-adding a batch is how an
+        index ends up with more embeddings than documents and an
+        ``IndexError`` from ``search()`` much later, far from the cause.
+
         ``metadatas``, when given, must line up one-to-one with ``texts``.
-        A mismatch raises: zipping the two used to truncate to the shorter
-        list, which silently dropped documents in TF-IDF mode and, with an
-        ``embed_fn``, left more embeddings than documents - an index that
-        raised ``IndexError`` later, from ``search()``, far from the cause.
+        Zipping the two used to truncate to the shorter list, silently
+        dropping documents.
         """
-        if metadatas is not None and len(metadatas) != len(texts):
-            raise ValueError(
-                f"add_many() got {len(texts)} texts but {len(metadatas)} metadatas; "
-                "they must be the same length."
-            )
-        metadatas = metadatas or [{} for _ in texts]
-        for text, meta in zip(texts, metadatas):
-            self.docs.append(text)
-            self.metadata.append(meta or {})
-            self._tf.append(Counter(self._tokenize(text)))
+        texts = list(texts)
+        if metadatas is not None:
+            metadatas = list(metadatas)
+            if len(metadatas) != len(texts):
+                raise ValueError(
+                    f"add_many() got {len(texts)} texts but {len(metadatas)} metadatas; "
+                    "they must be the same length."
+                )
+        if not texts:
+            return  # nothing to do, and no reason to call embed_fn with nothing
+        for position, text in enumerate(texts):
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"add_many() got a {type(text).__name__} at position {position}; "
+                    "documents must be strings."
+                )
+            if not text.strip():
+                raise ValueError(
+                    f"add_many() got an empty document at position {position}. An empty "
+                    "document can never match anything and only dilutes results."
+                )
+        embeddings, dimension = (None, self._dimension)
         if self.embed_fn is not None:
-            self._embeddings.extend(self.embed_fn(list(texts)))
+            embeddings, dimension = self._embed(texts)
+
+        # Everything validated; commit.
+        self.docs.extend(texts)
+        self.metadata.extend(meta or {} for meta in (metadatas or [{} for _ in texts]))
+        self._tf.extend(Counter(self._tokenize(text)) for text in texts)
+        self._dimension = dimension
+        if embeddings is not None:
+            self._embeddings.extend(embeddings)
         else:
             self._rebuild_index()
+
+    def _embed(self, texts: List[str]) -> tuple:
+        """Embed a batch and validate it. Returns ``(vectors, dimension)``.
+
+        Nothing here touches the index: the dimension is returned rather than
+        assigned, so a batch that fails half-way cannot leave the index
+        claiming a width it never accepted a vector for.
+        """
+        assert self.embed_fn is not None
+        produced = self.embed_fn(list(texts))
+        try:
+            vectors = [list(vector) for vector in produced]
+        except TypeError:
+            raise ValueError(
+                "embed_fn must return a sequence of vectors, one per text, "
+                f"but returned {type(produced).__name__}."
+            ) from None
+        if len(vectors) != len(texts):
+            raise ValueError(
+                f"embed_fn returned {len(vectors)} vectors for {len(texts)} texts. "
+                "It must return exactly one per text, in order, or documents and "
+                "embeddings drift apart."
+            )
+        dimension = self._dimension
+        for position, vector in enumerate(vectors):
+            dimension = self._check_vector(vector, f"document {position}", dimension)
+        return vectors, dimension
+
+    @staticmethod
+    def _check_vector(vector: List[float], what: str, dimension: Optional[int]) -> int:
+        """Validate one vector against the index width. Returns the width.
+
+        A zero vector is allowed - some models emit one for input they cannot
+        represent, and cosine handles it - but an *empty* one is not, since a
+        zero-width index can never rank anything.
+        """
+        if not vector:
+            raise ValueError(
+                f"embed_fn produced an empty vector for {what}. A vector needs at "
+                "least one dimension to be comparable."
+            )
+        if dimension is not None and len(vector) != dimension:
+            raise ValueError(
+                f"{what} has {len(vector)} dimensions, but this index is "
+                f"{dimension}-dimensional. Mixed widths cannot be compared - the "
+                "shorter one used to be silently zipped against the longer and "
+                "scored as if it matched."
+            )
+        for value in vector:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"{what} contains a non-numeric value ({value!r}); vectors must be numbers."
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"{what} contains {value!r}; a non-finite value makes every "
+                    "score involving it meaningless."
+                )
+        return len(vector)
 
     def _rebuild_index(self) -> None:
         n = len(self.docs)
@@ -1588,7 +1694,29 @@ class RAG:
             self._norms.append(math.sqrt(sum(v * v for v in vec.values())) or 1.0)
 
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Return the ``top_k`` best matches, highest score first.
+
+        An empty index returns nothing. In TF-IDF mode a query with no
+        indexable tokens also returns nothing - there is nothing to search
+        *with*, which is different from having searched and found nothing
+        similar, and returning arbitrary documents scored 0.0 only looks like
+        a result. Embedding mode leaves that judgement to ``embed_fn``.
+
+        Equal scores keep insertion order, so duplicate documents come back
+        in the order they were added.
+        """
+        if not isinstance(query, str):
+            raise ValueError(f"search() needs a string query, got {type(query).__name__}.")
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ValueError(f"top_k must be an integer, got {type(top_k).__name__}.")
+        if top_k < 1:
+            raise ValueError(
+                f"top_k must be at least 1, got {top_k}. A negative value used to slice "
+                "the ranked list from the end and quietly return the wrong documents."
+            )
         if not self.docs:
+            return []
+        if self.embed_fn is None and not self._tokenize(query):
             return []
         scores = self._embedding_scores(query) if self.embed_fn else self._tfidf_scores(query)
         results: List[Dict[str, Any]] = [
@@ -1610,16 +1738,46 @@ class RAG:
         return scores
 
     def _embedding_scores(self, query: str) -> List[float]:
+        """Score the corpus against the query vector, which must match its width."""
         assert self.embed_fn is not None
-        q = self.embed_fn([query])[0]
-        return [self._cosine(q, emb) for emb in self._embeddings]
+        produced = list(self.embed_fn([query]))
+        if len(produced) != 1:
+            raise ValueError(
+                f"embed_fn returned {len(produced)} vectors for one query; it must "
+                "return exactly one."
+            )
+        vector = list(produced[0])
+        self._check_vector(vector, "the query", self._dimension)
+        return [self._cosine(vector, embedding) for embedding in self._embeddings]
 
     @staticmethod
     def _cosine(a: List[float], b: List[float]) -> float:
+        """Cosine similarity, in ``[-1.0, 1.0]``.
+
+        Raises on mismatched lengths rather than zipping to the shorter one,
+        which silently compared a prefix and could report a perfect match
+        between vectors of different widths.
+
+        A zero vector has no direction, so its similarity to anything is
+        undefined; 0.0 is returned rather than raising, because a model
+        emitting one for unrepresentable input is not a caller error. Values
+        large enough to overflow the squared sum also give 0.0 - the ranking
+        is not recoverable, and NaN would corrupt the sort.
+        """
+        if len(a) != len(b):
+            raise ValueError(
+                f"cosine similarity needs vectors of equal length, got {len(a)} and {len(b)}."
+            )
         dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a)) or 1.0
-        nb = math.sqrt(sum(y * y for y in b)) or 1.0
-        return dot / (na * nb)
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        if na == 0.0 or nb == 0.0:
+            return 0.0
+        score = dot / (na * nb)
+        if not math.isfinite(score):
+            return 0.0
+        # Rounding can push an identical pair a hair past 1.0.
+        return max(-1.0, min(1.0, score))
 
     def __len__(self) -> int:
         return len(self.docs)
