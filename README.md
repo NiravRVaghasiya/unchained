@@ -143,6 +143,37 @@ def set_thermostat(mode: Literal["heat", "cool", "off"], degrees: int) -> str:
     ...
 ```
 
+**That schema is what the model is shown — and arguments are validated
+independently of it before your function runs.** The schema is advice the
+model may ignore; what actually arrives is checked against the Python
+signature (using Pydantic, already a dependency) and normalised to the types
+you annotated. Inside `set_thermostat`, `degrees` is an `int` even if the
+model sent `"21"`.
+
+A call of `{"mode": "warm", "degrees": "hot"}` never reaches the function.
+The model gets an observation naming each field and the rule it broke, so it
+can correct itself on the next turn:
+
+```
+Error: tool 'set_thermostat' got invalid arguments - mode: Input should be
+'heat', 'cool' or 'off'; degrees: Input should be a valid integer, unable to
+parse string as an integer
+```
+
+Rejected: missing required arguments, wrong types, malformed nested
+structures, and unknown argument names (unless the tool takes `**kwargs`).
+Nested Pydantic models are validated all the way down, and errors point at the
+exact path — `person.address.zip`.
+
+Validation errors never repeat the offending *value*, only its location and
+the rule. That text goes to the model, into memory, and into the audit log, so
+a tool taking a token or a customer record cannot leak it by failing
+validation.
+
+Two notes on normalisation: an `Enum`-annotated parameter receives the enum
+member (`Color.red`, not `"red"`), and a parameter with no annotation accepts
+anything, since the plain Python function would too.
+
 Tools can be `async def` too — `tool.run(...)` drives them to completion, or
 await `Agent.arun(...)` to run a whole turn (including async tools) off the
 event loop:
@@ -159,7 +190,150 @@ price = await Agent(llm, tools=[fetch_price]).arun("What's AAPL trading at?")
 
 When a model requests more than one tool call in the same turn, Unchained runs
 them concurrently on a thread pool (most tools are I/O-bound), then feeds the
-results back in the original order.
+results back in the original order. How many calls arrive in a turn is decided
+by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather than
+sized to the request. Extra calls queue and still run; only concurrency is
+bounded.
+
+### 👥 Sessions — one agent, many conversations
+
+An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the
+policy. A **`Session`** is one conversation's state: its memory, its token
+counters, its metadata. Build the agent once and give every user a session:
+
+```python
+agent = Agent(llm, tools=[...])  # build once, share freely
+
+alice = agent.session(metadata={"user": "alice"})
+bob = agent.session(metadata={"user": "bob"})
+
+alice.run("my name is Alice")
+bob.run("what is my name?")  # cannot see Alice's history
+```
+
+That makes an agent safe to hold in a module-level variable and serve from many
+request handlers at once. The isolation is structural, not lock-based: each
+session owns its own `Memory` and usage counters, and no conversational state
+lives on the Agent, so two sessions have nothing to contend over.
+
+```python
+alice.usage  # {'prompt_tokens': ..., ...} for this conversation only
+alice.reset()  # start this conversation over
+```
+
+**`agent.run(...)` still works** and is unchanged:
+
+```python
+agent = Agent(llm)
+agent.run("hello")
+agent.run("what did I just say?")  # remembers - one persistent conversation
+```
+
+It uses a single **persistent default session**, created on first use and
+reused for the life of the agent — `agent.memory` and `agent.usage` are that
+session's. Because it persists, `agent.run()` is for single-conversation
+scripts; serving several users means one session each. `agent.reset()` clears
+the default conversation and leaves other sessions alone.
+
+Sessions get their memory from `memory_factory`, so configuration carries into
+every conversation without any two sharing an instance:
+
+```python
+agent = Agent(llm, memory_factory=lambda: Memory(max_messages=50))
+
+# ...or hand one session a specific store, e.g. for per-user persistence:
+session = agent.session(memory=SQLiteMemory(session_id=user_id))
+```
+
+Three things are deliberately shared by every session of an agent, because
+they are resources rather than conversation state: the `llm` (its connection
+pool and response cache), the `rag` knowledge base, and Agent-level
+`callbacks`. Pass `agent.session(callbacks=[...])` for a sink scoped to one
+conversation. A single `Session` is one conversation, so it is not itself
+meant to be driven by two threads at once.
+
+`Router` gives every agent a fresh session per dispatch, so concurrent
+`run_all` calls never land in the same agent's history. See
+[`examples/sessions.py`](examples/sessions.py).
+
+### 🔒 Tool authorization — a policy layer, not a prompt
+
+A model asking for a tool is a *request*, not a decision. Unchained resolves
+that request in Python, before the function runs — never by telling the model
+which tools are safe, which is advice, not a boundary.
+
+Tools carry optional metadata. It is never shown to the model:
+
+```python
+@tool
+def lookup_order(order_id: str) -> str:
+    """Read-only: needs no permission, changes nothing."""
+
+
+@tool(permissions={"billing:write"}, side_effects=True)
+def apply_refund(order_id: str, amount: float) -> str:
+    """Side-effecting: gated on a permission the agent must be granted."""
+
+
+@tool(permissions={"account:delete"}, requires_approval=True, side_effects=True)
+def delete_account(customer: str) -> str:
+    """Destructive: a human confirms every call."""
+```
+
+A policy decides; the application, not the model, answers approval requests:
+
+```python
+from unchained import Agent, PermissionPolicy
+
+agent = Agent(
+    llm,
+    tools=[lookup_order, apply_refund, delete_account],
+    policy=PermissionPolicy(granted={"billing:write"}),
+    approve=lambda request: input(f"run {request['tool']}{request['arguments']}? ") == "y",
+)
+```
+
+`lookup_order` runs. `apply_refund` runs. `delete_account` is refused — and
+would still be refused if you granted `account:delete` but wired up no
+approver, because an unanswerable question is a refusal, not a pass.
+
+Every model-requested call takes the same path, with no way around it:
+
+```
+locate tool → validate arguments → policy.authorize() → approval → execute → audit
+```
+
+A refusal comes back to the model as an observation, so it learns and can try
+something else rather than crashing the run. Every decision is auditable:
+
+```python
+class AuditLog(Callback):
+    def on_tool_audit(self, event):  # decision, tool, arguments, reason, permissions
+        log.info("%(decision)s %(tool)s", event)
+```
+
+Write your own rules by subclassing `ToolPolicy` — raise
+`ToolAuthorizationError` to deny:
+
+```python
+class BusinessHoursOnly(ToolPolicy):
+    def authorize(self, tool, arguments, context):
+        if tool.side_effects and not is_working_hours():
+            raise ToolAuthorizationError("no writes outside business hours")
+        super().authorize(tool, arguments, context)
+```
+
+For a rule that depends on the arguments, put it on the tool itself:
+
+```python
+@tool(allowed=lambda arguments, context: arguments["path"].startswith("/safe/"))
+def read_file(path: str) -> str: ...
+```
+
+With no `policy=`, an agent behaves exactly as it did before this existed:
+everything it was given is allowed. The boundary is always there; its default
+answer is yes. See [`examples/policy.py`](examples/policy.py) for a runnable
+walkthrough, and [SECURITY.md](SECURITY.md) for what is and isn't enforced.
 
 ### 🧠 Memory — sliding window with compression
 
@@ -235,6 +409,27 @@ router.run_all("Compare these options")  # every agent, in parallel
 router.synthesize("Recommend a stack for my team")  # run all, then fuse
 ```
 
+**Routing fails closed.** Agents differ in the tools — and so the privileges —
+they carry, so picking the wrong one is an authorization mistake, not just a
+quality one. `route()` accepts an exact agent name, or a whole-word mention of
+exactly one agent. An empty, evasive, hallucinated or ambiguous reply raises
+`RoutingError` rather than quietly dispatching to an agent nobody chose:
+
+```python
+from unchained import RoutingError
+
+try:
+    agent = router.route(query)
+except RoutingError:
+    ...  # ask the user, or refuse
+```
+
+Prefer a default destination? Name it, and the choice stays visible in the code:
+
+```python
+router = Router(llm, agents=[...], fallback=triage_agent)
+```
+
 ## The agent loop
 
 Every agent runs the classic ReAct cycle until the model stops asking for tools:
@@ -290,7 +485,36 @@ memory indefinitely:
 
 ```python
 llm = LLM(provider="openai", cache=True, cache_size=256, cache_ttl=300)  # 5-minute TTL
+llm.clear_cache()  # invalidate everything
 ```
+
+**Tool-call responses are not cached.** A plain answer is a fact worth
+remembering; a response asking to call `refund(order_id="A-1")` is a *decision
+to act*. Caching that would replay the decision on the next identical prompt —
+the same refund, the same email — without the model being asked again, and
+without a request going out to reveal it. The world the decision was made in
+has moved on; the cached answer has not.
+
+So `cache=True` means `"final_only"`: plain answers are stored, tool-call
+responses are returned to the caller but never kept.
+
+```python
+LLM(provider="openai", cache=True)  # "final_only" — the default
+LLM(provider="openai", cache="none")  # off
+LLM(provider="openai", cache="all")  # also cache tool-call decisions
+```
+
+Use `"all"` only when every tool in play is read-only. Even then the cache
+only decides *what the model is taken to have said* — it never executes
+anything. Every tool call still passes the [tool policy](#-tool-authorization--a-policy-layer-not-a-prompt)
+and any approval hook before it runs, cached or fresh.
+
+The cache key covers everything that can change the answer: provider, base
+URL, model, temperature, `max_tokens`, the messages, the **full tool schemas**,
+and the response-format schema. Tools are keyed by schema rather than name
+because two tools can share a name and differ completely — a `search` over
+public docs and a `search` over internal records — and response formats are
+keyed by schema because unrelated models are so often both called `Item`.
 
 ### Connection reuse
 
@@ -343,6 +567,8 @@ that survives restarts and namespaces conversations by session.
 | [`examples/coder.py`](examples/coder.py) | Runs Python in an isolated subprocess with a timeout (not a full sandbox) |
 | [`examples/data_analyst.py`](examples/data_analyst.py) | CSV analysis with a stats tool |
 | [`examples/sqlite_memory.py`](examples/sqlite_memory.py) | Persistent, session-scoped memory backed by SQLite |
+| [`examples/policy.py`](examples/policy.py) | Read-only, side-effecting and approval-required tools under a `ToolPolicy` |
+| [`examples/sessions.py`](examples/sessions.py) | One agent serving many users concurrently, one `Session` each |
 | [`examples/pickmystack/`](examples/pickmystack/) | **Flagship** multi-agent app that recommends an AI stack |
 
 ### PickMyStack
@@ -392,12 +618,15 @@ Unchained is designed to be extended, not forked:
 | Extension | How |
 |---|---|
 | New tool | `@tool` on any function (sync or async) |
+| Stricter argument rules | annotate the parameter with a Pydantic model |
 | New LLM provider | add a `_provider()` method to `LLM` |
 | OpenAI-compatible provider | reuse `provider="openai"` with a different `base_url` |
 | True async HTTP | subclass `LLM` and override `chat()`/`_request()` with an async client |
 | Better retrieval | swap `RAG._rebuild_index()` + `search()` |
 | Persistent memory | subclass `Memory` — see [`examples/sqlite_memory.py`](examples/sqlite_memory.py) |
 | Custom tracing | subclass `Callback` and pass `callbacks=[...]` |
+| Custom authorization | subclass `ToolPolicy` and pass `policy=...` |
+| Per-user conversations | `agent.session(...)` — one `Session` per conversation |
 | Custom routing | subclass `Router`, override `route()` |
 
 ## License

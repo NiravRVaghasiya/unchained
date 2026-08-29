@@ -218,14 +218,67 @@ agent.run(user_input)
               ├── IF no tool_calls → return content (DONE)
               │
               └── IF tool_calls:
-                   ├── Execute all of this turn's tools (concurrently if >1)
+                   ├── Authorize + execute each (concurrently if >1)
                    ├── Add each tool call + result to memory, in order
                    └── Continue loop (LLM sees results next iteration)
 ```
 
+Every model-requested tool call reaches a function through one fixed path in
+`Agent._execute`, and there is no branch around it:
+
+```
+model asks for a tool
+     │
+     ├── locate it in this agent's tools      → unknown  ─┐
+     ├── Tool.validate_arguments(...)         → invalid  ─┤
+     ├── ToolPolicy.authorize(...)            → denied   ─┤
+     ├── approval, if the policy wants it     → refused  ─┤
+     │                                                    │
+     ├── tool.func(**arguments)                           │
+     └── audit the decision  ◄─────────────────────────────┘
+                                    (refusals become an observation
+                                     for the model; the loop continues)
+```
+
+Three jobs are kept separate inside `Tool`, and conflating them is how
+frameworks end up trusting the model's own paperwork:
+
+| | what it is | trusted? |
+|---|---|---|
+| `Tool.schema` | JSON Schema shown to the model | no — advice the model may ignore |
+| `Tool.validate_arguments()` | checks + normalises what arrived, from the **signature** | yes — the gate |
+| `Tool.run()` | calls the function | only with validated arguments |
+
+Validation is built from `inspect.signature` + `get_type_hints`, never from
+`schema`. Enforcing the schema would mean enforcing the same document the
+model was free to disregard.
+
+The policy is Python, not prompt text: nothing the model emits can widen what
+it is allowed to call. With no `policy=`, the default allows everything the
+agent was given, so agents written before this layer existed are unaffected.
+See the Tool authorization section of the README and `SECURITY.md`.
+
 `agent.arun(...)` offloads the whole method above to a worker thread via
 `asyncio.to_thread`, so it can be awaited from async code (FastAPI, aiohttp,
 ...) without blocking the event loop.
+
+**Configuration vs state.** The loop above runs against a `Session`, not
+against the Agent:
+
+```
+Agent  (shared, safe to reuse)        Session  (one conversation)
+  llm, tools, system_prompt             memory
+  rag, callbacks, policy                usage
+  max_iterations, approve               metadata, callbacks
+```
+
+Every Agent method that touches conversation state takes the session as its
+first argument (`_run(session, ...)`, `_execute(session, call)`), so the
+signatures are the audit trail: a method without a `session` parameter cannot
+reach a conversation. `agent.run()` is `agent.default_session.run()` - one
+persistent session, created on first use, for single-conversation scripts.
+Concurrent users get `agent.session()` each; isolation comes from owning
+separate objects, not from locking.
 
 ### 6. Router (Multi-Agent Orchestration)
 
@@ -234,8 +287,15 @@ router.route(query)              router.run_all(query)
      │                                │
      ├── Build agent descriptions     ├── For each agent:
      ├── Ask LLM: "which agent?"      │   └── agent.run(query)
-     ├── Fuzzy-match agent name       │
-     └── Delegate to chosen agent     └── Return {name: result}
+     ├── Match exactly one name       │
+     └── Delegate, or RoutingError    └── Return {name: result}
+
+Routing fails closed. The reply must be an agent's exact name, or mention
+exactly one agent by whole word; an empty, evasive, hallucinated or ambiguous
+reply raises `RoutingError` rather than falling back to an arbitrary agent.
+Agents differ in the tools - and so the privileges - they hold, so this is an
+authorization decision, and it is enforced in Python rather than by trusting
+the router prompt. `Router(..., fallback=agent)` names a default explicitly.
 
 PickMyStack uses run_all() → Synthesizer pattern:
   ┌──────────┐  ┌──────────┐  ┌──────────┐
@@ -263,9 +323,10 @@ User → Agent → LLM → Response
 
 ### Pattern 2: Tool-Augmented
 ```
-User → Agent → LLM → [tool_call] → Tool → LLM → Response
-                ↑                              │
-                └──────────── loop ────────────┘
+User → Agent → LLM → [tool_call] → Policy → Tool → LLM → Response
+                ↑                     │                   │
+                │                     └── denied ─────────┤
+                └──────────── loop ────────────────────────┘
 ```
 
 ### Pattern 3: RAG-Augmented
@@ -412,6 +473,7 @@ Unchained is designed to be extended, not forked:
 | Extension | How | Difficulty |
 |---|---|---|
 | New tools | `@tool` decorator on any function (sync or async) | Easy |
+| Tool authorization | Subclass `ToolPolicy`, pass `policy=` to `Agent` | Easy |
 | New LLM provider | Add `_provider_name()` method to `LLM` | Easy |
 | OpenAI-compatible provider | Reuse `provider="openai"` with a different `base_url` | Easy |
 | Better retrieval | Replace `RAG._rebuild_index()` + `search()` | Medium |

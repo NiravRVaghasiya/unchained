@@ -320,3 +320,64 @@ def test_recommend_isolates_a_failing_specialist(monkeypatch):
     result = app.recommend(use_case="Build a bot", monthly_requests=1_000)
     assert all(v.startswith("(unavailable:") for v in result["findings"].values())
     assert result["recommendation"].startswith("(synthesizer unavailable:")
+
+
+# ---------------------------------------------------------------------------
+# examples/policy.py
+# ---------------------------------------------------------------------------
+def test_policy_example_read_only_agent_cannot_write():
+    from examples.policy import TOOLS, apply_refund
+    from unchained import Agent, MockLLM, PermissionPolicy
+
+    agent = Agent(MockLLM(), tools=TOOLS, policy=PermissionPolicy(granted={"billing:read"}))
+    before = dict(apply_refund.func.__globals__["ORDERS"]["A-1"])
+    observation = agent._execute(
+        agent.session(),
+        {"name": "apply_refund", "arguments": {"order_id": "A-1", "amount": 42.0}, "id": "c"},
+    )
+    assert "billing:write" in observation
+    assert apply_refund.func.__globals__["ORDERS"]["A-1"] == before  # nothing changed
+
+
+def test_policy_example_approval_hook_is_consulted():
+    from examples.policy import approve_from_console
+
+    base = {"tool": "delete_account", "permissions": [], "metadata": {"user": "finance"}}
+    assert approve_from_console({**base, "arguments": {"customer": "bob"}})
+    assert not approve_from_console({**base, "arguments": {"customer": "ada"}})
+
+
+def test_policy_example_runs_end_to_end(capsys):
+    from examples.policy import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "decisions recorded" in out
+    assert "unknown_tool" in out
+    assert "approval_denied" in out
+    assert "invalid_arguments" in out
+
+
+# ---------------------------------------------------------------------------
+# examples/sessions.py
+# ---------------------------------------------------------------------------
+def test_sessions_example_keeps_users_apart():
+    from examples.sessions import handle_request, session_for
+
+    handle_request("ada", "my name is Ada")
+    handle_request("grace", "my name is Grace")
+
+    ada = [str(m["content"]) for m in session_for("ada").memory.get()]
+    grace = [str(m["content"]) for m in session_for("grace").memory.get()]
+    assert any("Ada" in m for m in ada)
+    assert not any("Grace" in m for m in ada)
+    assert any("Grace" in m for m in grace)
+
+
+def test_sessions_example_runs_end_to_end(capsys):
+    from examples.sessions import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "0 errors" in out
+    assert "every session's history contains only its own turns" in out

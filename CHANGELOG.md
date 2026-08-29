@@ -6,6 +6,200 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Tool-call responses are no longer cached by default.** A cached response
+  carrying `tool_calls` is a stored decision to act: an identical later prompt
+  replayed it without the model being consulted, and without a request going
+  out to make the replay visible — the same refund issued twice from one
+  model decision. `LLM(cache=True)` now means the `"final_only"` policy:
+  plain answers are cached, tool-call responses are returned to the caller but
+  never stored.
+- **The cache key no longer collides across different tools sharing a name.**
+  Tools were keyed by name alone, so a `search` over public documents and a
+  `search` over internal records — or the same tool before and after its
+  description or parameters changed — served each other's cached responses.
+  Tools are now keyed by their full schema, sorted so that offering the same
+  tools in a different order still hits.
+- **Response formats are keyed by schema, not by class name.** Two unrelated
+  Pydantic models both called `Item` previously collided.
+- **`max_tokens`, `base_url` and `provider` are now part of the cache key.**
+  `max_tokens` is sent to Anthropic and truncates the reply, so two `LLM`s
+  differing only in it returned each other's answers.
+- **Cached responses are handed out as private copies.** Every hit previously
+  returned the same dict, and `Agent` puts responses into conversation memory
+  — so one conversation mutating a response silently rewrote what the cache
+  served the next.
+
+### Added
+- `LLM(cache=...)` accepts a policy name as well as a bool: `"none"`,
+  `"final_only"` (the default, and what `cache=True` means) or `"all"` for
+  read-only tool sets that want tool-call responses cached too. An unknown
+  name raises. The active policy is readable as `llm.cache_policy`.
+- `LLM.clear_cache()` to invalidate every entry.
+- **Runtime argument validation before every tool execution.** Type
+  annotations previously only generated the JSON schema shown to the model;
+  what actually arrived reached the function after structural checks only. A
+  model sending `{"degrees": "hot"}` for an `int` parameter got a `TypeError`
+  from inside the tool, if it failed at all.
+
+  Arguments are now validated against a Pydantic model built from the Python
+  **signature** — deliberately not from `Tool.schema`, since enforcing the
+  same document the model is free to ignore would guarantee nothing. Every
+  annotation the schema builder understands is enforced: `str`, `int`,
+  `float`, `bool`, lists and dicts including item types, `Optional`,
+  `Literal`, `Enum`, and Pydantic models nested to any depth. Rejected:
+  missing required arguments, wrong types, malformed nested structures, and
+  unknown argument names (unless the tool declares `**kwargs`).
+  - Validation runs in `Tool.run()`, so no model-facing path can skip it.
+    `Agent` validates first, so a `ToolPolicy` now sees normalised,
+    correctly-typed arguments.
+  - Failures come back to the model as an observation naming the field and
+    the rule (`person.address.zip: Input should be a valid integer`), so it
+    can correct itself; the tool does not run.
+  - Errors never repeat the offending **value**. Pydantic's own message
+    embeds `input_value=...`, which would reach the model, conversation
+    memory and the audit log; only the field path and rule are reported, and
+    the exception is raised outside the `except` block so neither
+    `__cause__` nor `__context__` retains the original.
+  - No new dependency: Pydantic was already required.
+
+### Changed
+- **Arguments are now normalised**, reversing an earlier deliberate choice not
+  to coerce. A function receives what its annotations promise: `"42"` arrives
+  as `42` for an `int`, and a nested dict arrives as the declared model.
+  - **An `Enum`-annotated parameter now receives the enum member** (`Color.red`)
+    rather than the raw value (`"red"`). Tools annotated with an `Enum` that
+    assumed a string need `.value`.
+  - A parameter with **no annotation** accepts anything, matching the plain
+    Python function. The schema still advertises it as a string.
+- `Tool.run(dict)` validates; `Tool.__call__` (`my_tool(1, 2)`) still calls
+  straight through, unvalidated — it is your code calling your function.
+- Tools with parameters named `model_name`, `json` or `schema` no longer emit
+  Pydantic shadowing warnings at decoration time.
+- **`Session`: agent configuration is now separate from conversation state.**
+  An `Agent` holds the LLM, tools, prompt, RAG, callbacks and policy - things
+  that are safe to share. A `Session` holds one conversation's memory, usage
+  counters and metadata. One agent can therefore serve many users and many
+  concurrent requests:
+
+  ```python
+  agent = Agent(llm, tools=[...])  # build once, share freely
+  alice = agent.session(metadata={"user": "alice"})
+  bob = agent.session()
+  ```
+
+  The isolation is structural rather than lock-based: each session owns its
+  own `Memory` and counters, and no conversational state remains on the Agent,
+  so two sessions have nothing to contend over.
+  - `Agent.session(memory=, callbacks=, metadata=, session_id=)` starts an
+    independent conversation. `metadata` reaches `ToolPolicy` hooks as
+    `context["metadata"]` and appears in audit events and approval requests,
+    which is how a policy authorizes per user rather than per agent.
+  - `Agent.memory_factory` (default `Memory`) supplies each new session's
+    memory. `Agent(memory=<instance>)` still works and now seeds the *default
+    session only* - it is deliberately not shared with `agent.session()`.
+  - `Session.run/stream/arun/reset`, and `Agent.reset()` for the default one.
+  - Session-level callbacks fire only for that conversation; Agent-level
+    callbacks still see every session.
+  - Audit events and approval requests now carry the session id.
+
+### Changed
+- `agent.run()`, `agent.stream()` and `agent.arun()` are unchanged, and
+  `agent.memory` / `agent.usage` still work: they now address a **persistent
+  default session**, created on first use and reused for the life of the
+  agent. Because it persists, `agent.run()` remains a single-conversation
+  API; serving several users means one session each.
+- `agent.usage` is per conversation. There is deliberately no Agent-wide
+  total, which would reintroduce the shared mutable state this change
+  removes; sum the sessions you care about.
+- **`Router` now runs every dispatch in a fresh session per agent**, so
+  concurrent `run_all` / `synthesize` calls no longer interleave in one
+  agent's history, and routing never touches an agent's default session.
+  Results are returned as before but are no longer retained in agent memory.
+  `run`, `run_all` and `synthesize` accept `metadata=` to pass the caller's
+  identity through to each session and its policy.
+- **Tool authorization layer.** A model requesting a tool is now a request
+  that is granted or refused in Python, before the function runs - not a
+  prompt asking the model to behave.
+  - `@tool` accepts optional security metadata: `permissions`,
+    `requires_approval`, `side_effects`, and an `allowed(arguments, context)`
+    hook for per-call rules. `@tool` bare is unchanged. None of this metadata
+    is sent to the model.
+  - `ToolPolicy` decides: `authorize()` (raise `ToolAuthorizationError` to
+    deny) and `requires_approval()`. It is also the default policy, and the
+    default is permissive - an agent with no `policy=` behaves exactly as it
+    did before, except that a tool marked `requires_approval` is now gated
+    rather than decorative.
+  - `PermissionPolicy(granted=..., approval_for=...)` allows only tools whose
+    declared permissions have all been granted.
+  - `Agent(policy=..., approve=...)`. The approval callback is supplied by the
+    application and is unreachable from model output; it is serialised with a
+    lock so a turn's concurrent tool calls cannot re-enter your prompt.
+  - `Tool.validate_arguments()` rejects non-mappings, non-string argument
+    names, unknown parameter names and missing required parameters before the
+    call. Structural only - types are not coerced.
+  - `Callback.on_tool_audit(event)` records every decision before execution.
+  - New exceptions: `ToolAuthorizationError`, `ToolApprovalRequired`,
+    `ToolArgumentValidationError`.
+  - Fail-closed throughout: a policy that raises denies, an approval callback
+    that raises is a refusal, and a tool needing approval with no approver
+    configured does not run.
+  - See `examples/policy.py` and the SECURITY.md boundary list.
+
+### Fixed
+- **Memory compression no longer produces an unsendable window.** When the
+  sliding window overflowed, the boundary could fall between an assistant
+  message carrying `tool_calls` and the `tool` messages answering them,
+  leaving the window starting with an orphaned tool result. Providers reject
+  that outright (OpenAI: HTTP 400, "messages with role 'tool' must be a
+  response to a preceding message with 'tool_calls'"; Anthropic rejects the
+  equivalent `tool_result` block), so any sufficiently long tool-using
+  conversation eventually failed. The boundary now moves back to the start of
+  the tool group.
+- **`RAG.add_many()` no longer loses documents silently.** Passing `metadatas`
+  of a different length to `texts` used to `zip()` down to the shorter list:
+  in TF-IDF mode documents simply vanished, and with an `embed_fn` it left
+  more embeddings than documents, so `search()` raised `IndexError` later,
+  far from the cause. It now raises `ValueError` at the call site.
+- **No placeholder credential is sent when no API key is configured.**
+  `provider="openai"` with no key sent the literal header
+  `Authorization: Bearer None`; Anthropic sent `x-api-key: `. Both headers are
+  now omitted entirely, which is also what local OpenAI-compatible servers
+  (vLLM, LM Studio, llama.cpp) expect. Affects both `chat()` and `stream()`.
+
+### Changed
+- **BREAKING - `Router.route()` now fails closed.** It previously fell back to
+  `agents[0]` whenever the model's reply didn't match an agent, and matched by
+  substring in both directions - so an empty reply matched *every* agent (and
+  returned the longest-named one), and an agent named `fit` matched a reply
+  mentioning "profit". A query could therefore be dispatched to an agent
+  nobody chose, which matters because agents differ in the tools, and so the
+  privileges, they carry. Matching is now exact-name-first, then whole-word,
+  and must resolve to exactly one agent; an empty, evasive, hallucinated or
+  ambiguous reply raises the new `RoutingError`.
+
+  To restore a default destination, name it explicitly:
+
+  ```python
+  Router(llm, agents=[...], fallback=triage_agent)
+  ```
+- **BREAKING - `RAG.add_many()` raises `ValueError`** on a `texts`/`metadatas`
+  length mismatch instead of silently truncating (see Fixed, above).
+- **Tool fan-out is bounded.** `Agent` sized its thread pool to the number of
+  tool calls in a turn, but that count is chosen by the model, so one response
+  could spawn a thread per call (250 calls produced ~176 live threads). The
+  pool is now capped by the new `Agent(max_tool_workers=8)`. Excess calls
+  queue and still run, in the same order; only their concurrency is bounded.
+- `Memory` may now keep slightly more than `max_messages` (or `max_tokens`)
+  rather than split a tool group - a window one group over budget is still
+  sendable, whereas one starting with an orphaned tool result is not.
+
+### Added
+- `RoutingError`, exported from the package, raised by `Router.route()` when
+  no single agent can be identified.
+- `Router(fallback=...)` to nominate an agent for unroutable queries.
+- `Agent(max_tool_workers=8)` to tune the tool-call concurrency cap.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added
