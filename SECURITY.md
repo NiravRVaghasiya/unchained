@@ -26,6 +26,86 @@ remediation progress.
 - Treat all model output as untrusted when feeding it into tools, shells, or
   file operations.
 
+## Trust boundaries
+
+Unchained distinguishes five sources of text, and they are not equal:
+
+| Level | Source | Trusted for instructions? |
+|---|---|---|
+| 1 | **System prompt** — your `system_prompt` | yes; it is your code |
+| 2 | **Application config** — tools, policy, budgets, agent descriptions | yes; it is your code |
+| 3 | **User input** — the person you are serving | as a *request*, never as configuration |
+| 4 | **Retrieved documents** and **tool results** | **no — data only** |
+| 5 | **Model output** — including the memory summary | **no — data only** |
+
+Levels 4 and 5 are the ones that bite. A document in your corpus may have
+been written by anyone who can add to it; a tool result may come from a
+system that is itself relaying attacker-controlled text; and a summary is
+generated *from* those things.
+
+**Structurally**, untrusted text is fenced before it reaches a provider:
+
+```
+<<document-9f2a1c4b7e8d0a35>>
+[score=0.87]
+...retrieved text...
+<</document-9f2a1c4b7e8d0a35>>
+```
+
+The marker carries a random per-agent value, and any occurrence of it is
+stripped from the text being fenced — so a document cannot close its own
+block and continue at instruction level. Tool results and the memory summary
+are fenced the same way. The summary matters especially: it is spliced into
+the **system** message, so unfenced it is a path from a tool result straight
+into your instructions.
+
+Documents are stored *beside* the user's turn rather than spliced into it, so
+memory records what the user actually said, and fencing happens per-send with
+the current agent's marker — a conversation reloaded from disk never carries
+a dead agent's markers.
+
+The system prompt also states the boundary. **That is the weakest layer, and
+it is not a solution.**
+
+### What this does not do
+
+**Prompt injection is not solved here, and no system prompt solves it.** A
+sufficiently persuasive document may still talk a model into saying something
+you did not want. What the fencing buys is that the model is *told* where the
+boundary is, and that the boundary is one the data cannot move.
+
+Two limits worth stating:
+
+- The marker is per agent, not per run, so it appears in every prompt for
+  that agent's life. An attacker who can both observe a response echoing the
+  marker *and then* plant new content could forge a block. Rotating per run
+  would close this and make the system prompt uncacheable.
+- Fencing constrains *structure*, not persuasion. A document that simply
+  argues convincingly is unaffected by any delimiter.
+
+**So the boundary that actually holds is in Python.** A forged fence does not
+widen what any tool may do:
+
+- Tool `permissions` are a `frozenset` fixed at decoration time. Nothing at
+  runtime reads content to decide them.
+- `ToolPolicy` receives the tool, the validated arguments, and a context
+  built from the agent, the session and the call — never from retrieved or
+  returned text. Session `metadata` comes from your `agent.session(...)` call.
+- Approval is an application callback, unreachable from model output.
+- Every model-requested call takes one path, `Agent._execute`, which
+  authorizes before it executes.
+
+Assume the model *will* eventually be talked into requesting the wrong tool,
+and make sure the policy refuses it. That is the design.
+
+### A tool is code; its output is data
+
+Installing a tool is trusting code — it runs in-process with everything your
+process can reach. Nothing here sandboxes a hostile tool, and a malicious
+tool could reach into the framework directly. The boundary described above is
+about *content*: what a tool **returns**, and what a retriever **finds**, is
+never trusted. Choose your tools the way you choose dependencies.
+
 ## Boundaries enforced in code
 
 Unchained enforces these in Python, not by asking the model to behave. They
@@ -90,6 +170,14 @@ hold even when the model is confused, jailbroken, or adversarial.
   different tools that happen to share one — a `search` over public documents
   and a `search` over internal records — serve each other's cached responses.
   Response formats are keyed by schema for the same reason.
+- **Event payloads are excluded by default.** `AgentEvent` carries shapes
+  and sizes - message counts, character counts, durations, token usage - not
+  prompts, tool arguments, tool results or answers. An event stream usually
+  ends up somewhere with a longer retention and a wider audience than the
+  application itself, and those fields are where personal data and
+  credentials are. `Agent(event_payloads=True)` opts in deliberately; audit
+  events (`on_tool_audit`) carry arguments verbatim regardless, as they
+  always have.
 - **Authorization decisions are audited.** Each decision is emitted to
   `Callback.on_tool_audit` before the tool runs, so the record survives a tool
   that hangs or crashes, and refusals are written to the module logger even
@@ -158,6 +246,14 @@ Known non-boundaries, by design:
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).
+- **Concurrent tool calls are not serialised unless you say so.** A model can
+  request several tools in one turn and they run concurrently by default. A
+  tool whose concurrent calls would race — a read-modify-write, an append, a
+  non-reentrant client — must be marked `@tool(concurrency="exclusive")`.
+  `side_effects=True` does **not** do this: it describes the tool to a policy
+  and the audit log, and says nothing about thread safety. Exclusivity holds
+  within one turn; two concurrent sessions can still overlap, so
+  process-wide exclusion needs a lock inside the tool.
 - **Tool timeouts bound the agent's wait, not the tool's work.** Python cannot
   cancel a running thread. `@tool(timeout=...)` and `Agent(tool_timeout=...)`
   stop the agent hanging, but the abandoned call keeps running, keeps its
@@ -169,6 +265,19 @@ Known non-boundaries, by design:
 - **A tool timeout does not abort network I/O.** HTTP tools must still set
   their own timeout (`requests.get(url, timeout=20)`); otherwise the request
   outlives the timeout and holds a connection.
+- **Run budgets bound cost and runaway loops, not behaviour.** `Budget`
+  limits what one run may consume — iterations, tool calls, tokens, tool
+  output, wall clock, estimated spend — and stops the run deterministically
+  when a limit is reached. Every model-requested tool call is claimed against
+  it on the single path such calls take, before the tool is located or
+  authorized, so unknown and denied calls count too. It is resource
+  governance: it does not decide *whether* a tool may run (that is
+  `ToolPolicy`) and it cannot interrupt a call already in flight.
+- **Cost is an estimate, never an invoice.** It is computed from the
+  provider's reported token counts and rates you supply. Unchained ships no
+  price table, because a stale one would silently under-report. A model with
+  no pricing entry raises rather than being costed as zero when `max_cost` is
+  set, and sets `cost_is_complete = False` when it is not.
 - **Tool output limits are a context and cost boundary, not a sandbox.**
   `@tool(max_output_size=...)` and `Agent(max_tool_output_size=...)` bound
   what a tool *sends onward* into the transcript. They do not stop a tool

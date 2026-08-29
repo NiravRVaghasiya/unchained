@@ -6,7 +6,156 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Untrusted text is now structurally separated from instructions.**
+  Retrieved documents and tool results were inserted into the conversation
+  verbatim, with nothing marking them as data. Both are now fenced with a
+  random per-agent marker, and any occurrence of that marker is stripped from
+  the text, so content cannot close its own block and continue at instruction
+  level.
+- **The conversation summary reached the system prompt unfenced.** Summaries
+  are written by the model from earlier turns - which include tool results
+  and retrieved documents - and spliced into the *system* message, the
+  highest-trust slot there is. That was a path from a tool result straight
+  into the instructions. It is fenced now.
+- **Retrieved documents are no longer spliced into the user's turn.** They
+  are stored beside it and rendered at send time, so memory records what the
+  user actually said, a document can no longer forge the `Question:` boundary
+  the old wrapper used, and a conversation reloaded from disk never carries a
+  dead agent's markers.
+- **The retrieval framing is descriptive rather than imperative.** It said
+  "Use the following context to answer", which tells the model to act on
+  whatever the corpus contains.
+- The system prompt now states the data boundary when a run can contain
+  untrusted content. This is **one layer and the weakest**: prompt injection
+  is not solved by a system prompt, and SECURITY.md says so. The boundary
+  that holds is in Python - `permissions` are a frozenset fixed at
+  decoration, and `ToolPolicy` never sees retrieved or returned text.
+- SECURITY.md gains a trust ladder for the five sources of text, what is
+  enforced structurally, and what is explicitly not defended against.
+
+### Fixed
+- **RAG silently mis-scored mismatched embeddings.** A vector of the wrong
+  width was zipped against a longer one and compared on the overlap, so a
+  2-dimensional vector scored 1.0 against a 3-dimensional corpus. The index
+  now fixes its dimension on the first vector it accepts and rejects any
+  later document or query vector that does not match; `RAG.dimension`
+  reports it.
+- **`embed_fn` returning the wrong number of vectors corrupted the index.**
+  Documents and embeddings drifted apart - too few silently dropped
+  documents from every search, too many raised `IndexError` from `search()`
+  long afterwards. It must now return exactly one vector per text.
+- **A negative `top_k` returned the wrong documents.** `search(q, top_k=-1)`
+  sliced the ranked list from the end, returning everything except the best
+  match. `top_k` must now be an integer of at least 1, and non-integers are
+  rejected rather than reaching the slice.
+- **A failing or rejected batch left the index half-updated.** Documents were
+  appended before `embed_fn` was called, so an exception left documents with
+  no embeddings. Everything is validated before anything is stored.
+- **Empty and non-finite vectors are rejected.** A zero-width vector can
+  never rank anything, and a NaN propagates into every score it touches. A
+  *zero* vector is still accepted - some models emit one - and scores 0.0.
+- **`_cosine` no longer compares a prefix.** Mismatched lengths raise instead
+  of zipping to the shorter vector, results are clamped to `[-1.0, 1.0]`, and
+  a magnitude that overflows the squared sum returns 0.0 rather than NaN,
+  which would corrupt the ranking.
+- **Empty documents are rejected.** They can never match and only dilute
+  results. Non-string documents get a distinct message.
+- **A TF-IDF query with no indexable tokens returns nothing** instead of the
+  first `top_k` documents scored 0.0. Nothing to search *with* is not the
+  same as having searched and found nothing.
+
 ### Added
+- **Tool execution semantics.** A model can request several tools in one turn
+  and they all ran concurrently, with no way to say that a tool must not
+  overlap with itself. `@tool(concurrency="exclusive")` marks one that runs
+  alone: nothing else from that turn runs while it does.
+  - `concurrency="parallel"` is the default and is exactly the previous
+    behaviour - a turn of only parallel tools is still a single concurrent
+    batch. An unknown mode raises at decoration time.
+  - Mixed turns are defined: calls keep the order the model asked for,
+    consecutive parallel ones are grouped, and an exclusive call is a group
+    of one.
+  - `side_effects=True` still does **not** serialise anything - it describes
+    a tool to a policy and to the audit log. A tool whose concurrent calls
+    would race needs `concurrency="exclusive"` as well. Making
+    `side_effects` imply exclusivity would silently change scheduling for
+    tools already marked with it.
+  - The framework does not infer dependencies between different tools, and
+    the docs say so: a tool-call list expresses no ordering, and none can be
+    recovered from it. Exclusivity holds within a turn - two concurrent
+    sessions can still overlap, so process-wide exclusion needs a lock
+    inside the tool.
+- **Structured `AgentEvent` observability.** A flat, immutable event stream
+  for logging, metrics and debugging - no OpenTelemetry, no new dependency,
+  no tracing framework:
+
+  ```python
+  stop = agent.subscribe(lambda event: log.info("%s", event))
+  ```
+
+  - Events: `AgentStarted`, `AgentIteration`, `LLMStarted`, `LLMFinished`,
+    `ToolStarted`, `ToolFinished`, `ToolFailed`, `AgentFinished`,
+    `AgentFailed`. Each carries `run_id`, `session_id`, `agent`,
+    `timestamp`, and where they apply `duration`, `model`, `tool`,
+    `tool_call_id`, `usage` and `metadata`. `as_dict()` is JSON-safe.
+  - `run_id` is unique per run, so concurrent runs never interleave
+    ambiguously. `RunState.snapshot()` reports the same id.
+  - `ToolFailed` may arrive without a preceding `ToolStarted` - a call
+    refused before it ran never started - and `metadata["reason"]`
+    distinguishes `unknown_tool`, `invalid_arguments`, `denied`,
+    `approval_denied`, `timeout` and `raised`.
+  - **Payloads are excluded by default**: prompts, tool arguments, tool
+    results and answers are omitted in favour of counts and sizes, because
+    an event stream usually ends up in a log aggregator.
+    `Agent(event_payloads=True)` opts in.
+  - `Agent.subscribe(fn)` returns an unsubscribe. `Callback.on_event` is the
+    class-based form; existing `Callback` subclasses are unaffected, since
+    the base `on_event` is a no-op and every older hook still fires.
+  - Handler errors stay logged and swallowed; `Agent(strict_callbacks=True)`
+    re-raises them, which is what you want in tests.
+- **Run budgets.** `Budget` bounds what a single run may consume, so a
+  runaway agent stops deterministically instead of looping until something
+  else gives out:
+
+  ```python
+  Agent(
+      llm,
+      tools=[...],
+      budget=Budget(
+          max_tool_calls=20,
+          max_total_tokens=50_000,
+          max_tool_output=200_000,
+          timeout=60,
+      ),
+  )
+  ```
+
+  - `BudgetExceededError` with `TokenBudgetExceeded`,
+    `ToolCallBudgetExceeded`, `ToolOutputBudgetExceeded`,
+    `TimeBudgetExceeded` and `CostBudgetExceeded`. Each carries
+    `.limit_name`, `.limit` and `.used`.
+  - `max_iterations` keeps its existing contract: exhausting it forces a
+    final answer rather than raising, and it defaults to the agent's own
+    `max_iterations`, so existing agents are unchanged. It is the only
+    budget that does not raise, and there is deliberately no iteration
+    exception for one that never fires.
+  - Budgets are **per run**. `session.usage` still accumulates over the
+    session's lifetime. `agent.session(budget=...)` overrides per caller.
+  - No tool call escapes: the budget is claimed on the single path every
+    model-requested call takes, before the tool is located or authorized, so
+    unknown and policy-denied calls count too.
+  - `session.last_run` exposes a `RunState` with iterations, tool calls,
+    output characters, usage, elapsed time, estimated cost and which limit
+    stopped the run; `.snapshot()` returns it as a JSON-safe dict.
+  - `max_tool_output` is the run total, distinct from `Tool.max_output_size`,
+    which caps a single result.
+  - **Cost is an estimate and needs your rates.** Unchained ships no price
+    table - published prices change and a stale table would under-report.
+    `Budget(max_cost=...)` without `pricing` raises at construction, and a
+    model absent from `pricing` raises rather than being costed as zero.
+  - Budgets are checked before spending, so a call already under way can
+    carry the total slightly past a limit; the run stops immediately after.
 - **Tool output limits.** A tool could return megabytes straight into the
   transcript - overflowing the context window, costing money on every
   subsequent turn, and growing memory. `@tool(max_output_size=8_000)` bounds

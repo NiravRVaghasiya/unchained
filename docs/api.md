@@ -13,9 +13,12 @@ Auto-generated from the docstrings in `unchained.py`.
         - RAG
         - Agent
         - Session
+        - Budget
+        - RunState
         - Router
         - Callback
         - LoggingCallback
+        - AgentEvent
         - ToolPolicy
         - PermissionPolicy
         - RoutingError

@@ -195,6 +195,43 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+Concurrency is fine until a tool races with itself. Mark those `exclusive`:
+
+```python
+@tool(concurrency="exclusive", side_effects=True)
+def append_ledger(entry: str) -> str:
+    """Two of these at once would interleave, so it runs alone."""
+```
+
+An exclusive call **runs on its own** — nothing else from that turn runs while
+it does. Calls keep the order the model asked for, with consecutive parallel
+ones grouped:
+
+```
+model asks for:  [read, read, append_ledger, read, append_ledger]
+runs as:         {read, read} → append_ledger → read → append_ledger
+```
+
+A turn of only parallel tools is a single group, which is exactly what every
+tool did before this existed — so nothing changes unless you opt in.
+
+> **`side_effects=True` does not serialize anything.** It describes a tool to
+> your `ToolPolicy` and to the audit log. If two concurrent calls would race,
+> you must also set `concurrency="exclusive"`.
+
+**The framework cannot infer dependencies, and does not pretend to.** A model
+emits a *list* of calls it wants; nothing in the protocol says the second
+depends on the first, and no amount of inspection can recover an ordering the
+model never expressed. `exclusive` is the one thing you can declare: *this
+tool must not overlap*. If two different tools must run in a particular order,
+that is a relationship only you know — express it in the tools themselves (one
+tool that does both steps), not by hoping the scheduler guesses.
+
+The guarantee is also **per turn**. Two exclusive calls in the same turn never
+overlap; the same tool called from two concurrent sessions still can, because
+those are separate runs. For process-wide exclusion, take a lock inside the
+tool.
+
 ### ⏱️ Tool timeouts — bounding the wait, not the work
 
 An LLM call has a timeout; a Python tool can block forever. Give a tool a
@@ -238,6 +275,95 @@ thread, and Unchained does not pretend otherwise:
 
 Concurrent calls each get their own budget, so one hanging tool does not delay
 its siblings or the turn.
+
+### 💰 Run budgets — making a run's cost predictable
+
+Individual limits stop individual things. A budget bounds a whole run:
+
+```python
+from unchained import Agent, Budget, BudgetExceededError
+
+agent = Agent(
+    llm,
+    tools=[...],
+    budget=Budget(
+        max_tool_calls=20,
+        max_total_tokens=50_000,
+        max_tool_output=200_000,
+        timeout=60,
+    ),
+)
+
+try:
+    answer = session.run("research this thoroughly")
+except BudgetExceededError as exc:
+    print(exc.limit_name, exc.limit, exc.used)
+```
+
+| Budget | Bounds | On exhaustion |
+|---|---|---|
+| `max_iterations` | think/act cycles | **forces a final answer** (no raise) |
+| `max_tool_calls` | tool calls in the run | `ToolCallBudgetExceeded` |
+| `max_total_tokens` | prompt + completion tokens | `TokenBudgetExceeded` |
+| `max_tool_output` | total characters of tool output | `ToolOutputBudgetExceeded` |
+| `timeout` | wall-clock seconds | `TimeBudgetExceeded` |
+| `max_cost` | estimated spend | `CostBudgetExceeded` |
+
+All subclass `BudgetExceededError`, and each carries `.limit_name`, `.limit`
+and `.used`.
+
+**`max_iterations` is the exception that does not raise.** Running out of
+turns ends with one final call and an answer, exactly as it did before
+budgets existed — ending a turn with nothing is worse than one more call. It
+defaults to the agent's own `max_iterations`, so existing agents are
+unchanged.
+
+**Budgets are per run**, not per session: a ten-turn conversation gets the
+budget ten times. Lifetime token accounting is `session.usage`, which keeps
+accumulating. A session can carry its own budget, so one agent can serve
+callers on different allowances:
+
+```python
+agent.session(budget=Budget(max_tool_calls=5))  # overrides the agent's
+```
+
+**No tool call escapes the budget.** It is claimed on the single path every
+model-requested call takes — before the tool is located or authorized — so
+unknown and policy-denied calls count too.
+
+#### Reading what a run spent
+
+`session.last_run` holds the accounting, and stays there afterwards —
+including when a budget stopped the run:
+
+```python
+session.last_run.snapshot()
+# {'iterations': 3, 'tool_calls': 7, 'tool_output_chars': 4120,
+#  'usage': {...}, 'elapsed': 2.41, 'estimated_cost': 0.0032,
+#  'cost_is_complete': True, 'exceeded': None}
+```
+
+#### Cost, honestly
+
+Unchained ships **no price table**. Published prices change, and a table
+baked into this file would quietly go stale — a cost cap computed from stale
+numbers is worse than no cap. You supply the rates, per 1M tokens:
+
+```python
+Budget(max_cost=0.50, pricing={"gpt-4o-mini": (0.15, 0.60)})
+```
+
+- `Budget(max_cost=...)` **without** `pricing` raises at construction.
+- A model missing from `pricing` while `max_cost` is set raises
+  `CostBudgetExceeded` rather than costing it as zero — a cap that cannot be
+  computed cannot be enforced.
+- With no cap, an unpriced call just sets `cost_is_complete = False`.
+- The figure is `estimated_cost`, derived from the provider's own token
+  counts. It is an estimate, never an invoice.
+
+Budgets are checked before spending, but a call's cost is not known until it
+returns — so the last call can carry the total slightly past a limit, and the
+run stops immediately after. This is runtime governance, not billing.
 
 ### 📏 Tool output limits — bounding what reaches the context
 
@@ -294,6 +420,40 @@ tool succeeded, and a shortened result is still useful.
 > To contain a hostile tool you need process isolation and a policy — see
 > [`examples/coder.py`](examples/coder.py) and
 > [Tool authorization](#-tool-authorization--a-policy-layer-not-a-prompt).
+
+### 🧱 Trust boundaries — retrieved and returned text is data
+
+A retrieved document and a tool result are **not** instructions. Both are
+fenced with a random per-agent marker before they reach a provider, and any
+occurrence of that marker is stripped from the text, so the content cannot
+close its own block:
+
+```
+<<document-9f2a1c4b7e8d0a35>>
+[score=0.87]
+...retrieved text...
+<</document-9f2a1c4b7e8d0a35>>
+
+what is my balance?
+```
+
+The conversation summary is fenced too — it is written by the model from
+earlier turns and spliced into the *system* message, so unfenced it is a path
+from a tool result into your instructions.
+
+Retrieved documents are stored beside the user's turn rather than spliced
+into it, so `session.memory` records what the user actually said.
+
+> **This does not solve prompt injection, and no system prompt does.** A
+> persuasive document may still talk a model into something you did not want.
+> Fencing means the model is *told* where the boundary is and the data cannot
+> *move* it. The boundary that holds is in Python: `permissions` are a
+> frozenset fixed at decoration, `ToolPolicy` sees the tool, the arguments and
+> a context built from your code — never from retrieved or returned text — and
+> approval is your callback. Assume the model will eventually request the
+> wrong tool, and make the policy refuse it.
+>
+> See [SECURITY.md](SECURITY.md) for the full trust ladder and its limits.
 
 ### 👥 Sessions — one agent, many conversations
 
@@ -481,6 +641,29 @@ use dense embeddings instead — TF-IDF stays the zero-dependency default:
 rag = RAG(embed_fn=my_embedding_model)  # e.g. OpenAI or sentence-transformers
 ```
 
+**Inputs are validated, because the failures here are silent ones.** A vector
+of the wrong width used to be zipped against a longer one and scored a perfect
+1.0; a negative `top_k` sliced the ranked list from the end and returned
+everything *except* the best match. So:
+
+- `embed_fn` must return exactly one vector per text, in order.
+- The index fixes its dimension on the first vector it accepts; every later
+  vector — document or query — must match. `rag.dimension` reports it.
+- Vectors must be non-empty and finite. A **zero vector is fine** — some
+  models emit one for input they can't represent — and scores 0.0.
+- Documents must be non-empty strings; `top_k` must be an integer ≥ 1.
+- **Nothing is stored until all of it validates**, so a failing `embed_fn`
+  leaves the index exactly as it was rather than half-added.
+
+In TF-IDF mode a query with no indexable tokens (`""`, `"!!!"`) returns
+nothing. Having nothing to search *with* is different from having searched and
+found nothing similar, and returning arbitrary documents scored 0.0 only looks
+like a result.
+
+Duplicate documents are kept rather than merged — the same text can
+legitimately arrive twice from different sources — and equal scores keep
+insertion order.
+
 ### 📦 Structured output — validated with Pydantic
 
 ```python
@@ -662,6 +845,57 @@ agent = Agent(llm, tools=[...], callbacks=[LoggingCallback()])
 
 Write your own by subclassing `Callback` (`on_iteration`, `on_llm_call`,
 `on_tool_call`, `on_finish`). Callback errors are logged, never fatal.
+
+#### Structured events
+
+For logging, metrics and debugging, subscribe to the event stream instead of
+overriding a method per hook:
+
+```python
+stop = agent.subscribe(lambda event: log.info("%s", event))
+# AgentStarted run=09a56d21a187 model=gpt-4o-mini
+# LLMFinished  run=09a56d21a187 model=gpt-4o-mini 412ms tokens=25
+# ToolStarted  run=09a56d21a187 tool=search
+# ToolFinished run=09a56d21a187 tool=search 88ms
+# AgentFinished run=09a56d21a187 1204ms tokens=63
+stop()
+```
+
+Each `AgentEvent` is a frozen record with `event_type`, `run_id`,
+`session_id`, `agent`, `timestamp`, and — where they apply — `duration`,
+`model`, `tool`, `tool_call_id`, `usage` and `metadata`. `as_dict()` gives you
+a JSON-safe dict for structured logging.
+
+| Event | When |
+|---|---|
+| `AgentStarted` / `AgentFinished` / `AgentFailed` | a run begins, answers, or raises |
+| `AgentIteration` | a think/act cycle begins |
+| `LLMStarted` / `LLMFinished` | a provider request goes out and comes back |
+| `ToolStarted` / `ToolFinished` | an authorized tool call runs |
+| `ToolFailed` | a call produced no result |
+
+`ToolFailed` can arrive with no preceding `ToolStarted` — a call refused
+before it ran never started. `metadata["reason"]` says which stage refused it:
+`unknown_tool`, `invalid_arguments`, `denied`, `approval_denied`, `timeout` or
+`raised`. That distinction is the point: "the tool broke" and "the tool was
+not allowed to run" are different numbers on a dashboard.
+
+**`run_id` is unique per run**, so events from concurrent runs never
+interleave ambiguously; `session_id` is stable across a conversation.
+
+> **Payloads are excluded by default.** Prompts, tool arguments, tool results
+> and the final answer are where personal data and credentials live, and an
+> event stream usually ends up in a log aggregator. Events carry shapes and
+> sizes instead — message counts, character counts. Pass
+> `Agent(event_payloads=True)` to include the content itself, deliberately.
+
+Handler errors are logged and swallowed, so a broken metrics sink never costs
+you an answer the model already produced. In tests that hides bugs, so
+`Agent(strict_callbacks=True)` re-raises instead.
+
+`Callback` also gained `on_event`, so a subclass can take the structured
+stream and the older hooks together. Existing subclasses are unaffected — the
+base `on_event` is a no-op.
 
 ### Token usage tracking
 
