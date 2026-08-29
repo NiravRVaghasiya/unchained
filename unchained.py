@@ -25,6 +25,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -42,6 +44,7 @@ from typing import (
     get_args,
     get_origin,
     get_type_hints,
+    overload,
 )
 
 import requests
@@ -70,7 +73,12 @@ __all__ = [
     "Router",
     "Callback",
     "LoggingCallback",
+    "ToolPolicy",
+    "PermissionPolicy",
     "RoutingError",
+    "ToolAuthorizationError",
+    "ToolApprovalRequired",
+    "ToolArgumentValidationError",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
@@ -87,6 +95,22 @@ class RoutingError(RuntimeError):
     Pass ``Router(..., fallback=agent)`` to nominate an explicit destination
     for unroutable queries.
     """
+
+
+class ToolAuthorizationError(RuntimeError):
+    """Raised when a :class:`ToolPolicy` refuses a tool call outright."""
+
+
+class ToolApprovalRequired(RuntimeError):
+    """Raised when a tool call needs approval that was not granted.
+
+    Also raised when a tool is marked ``requires_approval`` but the agent has
+    no approval callback: an unanswerable question is a refusal, not a pass.
+    """
+
+
+class ToolArgumentValidationError(RuntimeError):
+    """Raised when model-supplied arguments do not fit the tool's signature."""
 
 
 class _RetryableStatus(Exception):
@@ -130,14 +154,89 @@ class Tool:
     to completion via ``asyncio.run`` (see the "Async" note on ``run`` for the
     one caveat - it cannot be called from inside a running event loop; use
     ``await tool.func(...)`` directly in that case, or ``Agent.arun``).
+
+    A tool may also carry security metadata, which is inert on its own - it
+    is what a :class:`ToolPolicy` reads when deciding whether a model may
+    call this tool:
+
+    * ``permissions``  - what this tool needs, e.g. ``{"db:write"}``.
+    * ``requires_approval`` - a human must confirm each call.
+    * ``side_effects`` - True if calling it changes something.
+    * ``allowed``      - ``fn(arguments, context) -> bool`` for a per-call
+      check that depends on the arguments (a path prefix, a row limit, ...).
+
+    None of this is sent to the model. Metadata describes the tool to your
+    policy; it is not a hint the model can read, argue with, or override.
     """
 
-    def __init__(self, func: Callable[..., Any]):
+    def __init__(
+        self,
+        func: Callable[..., Any],
+        *,
+        permissions: Optional[Iterable[str]] = None,
+        requires_approval: bool = False,
+        side_effects: bool = False,
+        allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+    ):
         self.func = func
         self.name = func.__name__
         self.description = (inspect.getdoc(func) or "").strip()
         self.is_async = inspect.iscoroutinefunction(func)
+        # Security metadata is configuration, fixed at decoration time and
+        # never rewritten during a run (frozenset, not set, on purpose).
+        self.permissions = frozenset(permissions or ())
+        self.requires_approval = requires_approval
+        self.side_effects = side_effects
+        self.allowed = allowed
+        self.accepts_kwargs = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in inspect.signature(func).parameters.values()
+        )
         self.schema = self._build_schema(func)
+
+    def validate_arguments(self, arguments: Any) -> Dict[str, Any]:
+        """Check model-supplied arguments against this tool's signature.
+
+        Structural only: it rejects a non-mapping, non-string argument names,
+        unknown parameter names, and missing required parameters - the shapes
+        that would otherwise raise ``TypeError`` from inside the call, where
+        the failure reads as a tool bug rather than a bad request. Tools
+        declaring ``**kwargs`` accept unknown names by definition, so the
+        unknown-name check is skipped for them.
+
+        It deliberately does not coerce or deep-check types: guessing whether
+        ``"3"`` means ``3`` is the kind of silent repair that hides real
+        model errors. Annotate a parameter with a Pydantic model when you
+        want full validation.
+
+        Returns the validated arguments. Raises ToolArgumentValidationError.
+        """
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ToolArgumentValidationError(
+                f"tool '{self.name}' expects an object of arguments, got {type(arguments).__name__}"
+            )
+        properties = self.schema["function"]["parameters"]["properties"]
+        required = self.schema["function"]["parameters"]["required"]
+        unnamed = sorted(repr(key) for key in arguments if not isinstance(key, str))
+        if unnamed:
+            raise ToolArgumentValidationError(
+                f"tool '{self.name}' got non-string argument name(s): {', '.join(unnamed)}"
+            )
+        if not self.accepts_kwargs:
+            unknown = sorted(set(arguments) - set(properties))
+            if unknown:
+                raise ToolArgumentValidationError(
+                    f"tool '{self.name}' got unexpected argument(s): {', '.join(unknown)}. "
+                    f"It accepts: {', '.join(sorted(properties)) or '(none)'}"
+                )
+        missing = [name for name in required if name not in arguments]
+        if missing:
+            raise ToolArgumentValidationError(
+                f"tool '{self.name}' is missing required argument(s): {', '.join(missing)}"
+            )
+        return arguments
 
     def _build_schema(self, func: Callable[..., Any]) -> Dict[str, Any]:
         sig = inspect.signature(func)
@@ -222,9 +321,52 @@ class Tool:
         return f"<Tool {self.name}>"
 
 
-def tool(func: Callable[..., Any]) -> Tool:
-    """Decorator: turn any function into a Tool with an auto-generated schema."""
-    return Tool(func)
+@overload
+def tool(func: Callable[..., Any]) -> Tool: ...
+
+
+@overload
+def tool(
+    *,
+    permissions: Optional[Iterable[str]] = ...,
+    requires_approval: bool = ...,
+    side_effects: bool = ...,
+    allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = ...,
+) -> Callable[[Callable[..., Any]], Tool]: ...
+
+
+def tool(
+    func: Optional[Callable[..., Any]] = None,
+    *,
+    permissions: Optional[Iterable[str]] = None,
+    requires_approval: bool = False,
+    side_effects: bool = False,
+    allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+) -> Any:
+    """Decorator: turn any function into a Tool with an auto-generated schema.
+
+    Use it bare, or with security metadata for a :class:`ToolPolicy` to act
+    on::
+
+        @tool
+        def search(query: str) -> str:
+            "Read-only: needs no permission and has no side effects."
+
+        @tool(permissions={"db:write"}, side_effects=True, requires_approval=True)
+        def delete_record(record_id: str) -> str:
+            "Destructive: gated by policy, and confirmed per call."
+    """
+
+    def wrap(target: Callable[..., Any]) -> Tool:
+        return Tool(
+            target,
+            permissions=permissions,
+            requires_approval=requires_approval,
+            side_effects=side_effects,
+            allowed=allowed,
+        )
+
+    return wrap(func) if func is not None else wrap
 
 
 # --- 2. LLM backend (unified across providers) -----------------------------
@@ -1063,6 +1205,19 @@ class Callback:
     def on_tool_call(self, name: str, arguments: Dict[str, Any], result: str) -> None:
         """Called after each tool executes."""
 
+    def on_tool_audit(self, event: Dict[str, Any]) -> None:
+        """Called with every tool authorization decision, before execution.
+
+        ``event`` carries ``agent``, ``tool``, ``arguments``, ``decision``
+        (one of ``allowed``, ``approved``, ``denied``, ``approval_denied``,
+        ``invalid_arguments``, ``unknown_tool``), ``reason``, ``permissions``
+        and ``side_effects``.
+
+        It fires before the tool runs, so the record survives a tool that
+        hangs or crashes. ``arguments`` are verbatim - redact them in your
+        sink if your tools take secrets.
+        """
+
     def on_finish(self, answer: Any) -> None:
         """Called once with the final answer."""
 
@@ -1087,11 +1242,113 @@ class LoggingCallback(Callback):
     def on_tool_call(self, name: str, arguments: Dict[str, Any], result: str) -> None:
         self.log.info("tool: %s(%s) -> %s", name, arguments, str(result)[:120])
 
+    def on_tool_audit(self, event: Dict[str, Any]) -> None:
+        self.log.info(
+            "audit: %s %s(%s)%s",
+            event.get("decision"),
+            event.get("tool"),
+            event.get("arguments"),
+            f" - {event['reason']}" if event.get("reason") else "",
+        )
+
     def on_finish(self, answer: Any) -> None:
         self.log.info("finished (%d chars)", len(str(answer)))
 
 
-# --- 6. Agent core (ReAct loop) --------------------------------------------
+# --- 6. Tool authorization (policy layer) ----------------------------------
+class ToolPolicy:
+    """Decide whether a model-requested tool call may run.
+
+    An LLM choosing a tool is a *request*, not a decision. This is where the
+    request is granted or refused, in Python, before the function is called.
+    Nothing here is expressed to the model as an instruction: a policy is not
+    a prompt saying "only call safe tools", and no wording the model emits
+    can widen what it is allowed to do.
+
+    This base class is also the default policy, and it is permissive: it
+    allows any tool the agent was given and asks for approval only when the
+    tool itself is marked ``requires_approval``. An agent written before this
+    layer existed therefore behaves exactly as it did - the boundary is
+    always present, its default answer is "yes".
+
+    Subclass to restrict. Deny by raising :class:`ToolAuthorizationError`;
+    the agent turns that into an observation for the model rather than
+    crashing the run, so the model learns it was refused and can try
+    something else::
+
+        class BusinessHoursOnly(ToolPolicy):
+            def authorize(self, tool, arguments, context):
+                if tool.side_effects and not is_working_hours():
+                    raise ToolAuthorizationError("no writes outside business hours")
+                super().authorize(tool, arguments, context)
+
+    Both hooks receive the tool, the arguments (already through
+    :meth:`Tool.validate_arguments`, so the shape is known-good), and a
+    context dict of ``agent``, ``tool`` and ``call_id``. A policy that raises
+    anything else is treated as a denial - a broken policy must not fail open.
+    """
+
+    def authorize(self, tool: Tool, arguments: Dict[str, Any], context: Dict[str, Any]) -> None:
+        """Allow the call by returning; deny it by raising ToolAuthorizationError."""
+        if tool.allowed is not None and not tool.allowed(arguments, context):
+            raise ToolAuthorizationError(
+                f"tool '{tool.name}' refused this call (its allowed() hook returned False)"
+            )
+
+    def requires_approval(
+        self, tool: Tool, arguments: Dict[str, Any], context: Dict[str, Any]
+    ) -> bool:
+        """Return True if a human must confirm this call before it runs."""
+        return tool.requires_approval
+
+
+class PermissionPolicy(ToolPolicy):
+    """Allow only tools whose declared ``permissions`` have all been granted.
+
+    The tool declares what it needs; the application grants what this agent
+    may have. Anything ungranted is denied, so a tool added to the agent
+    later without a matching grant is refused rather than quietly allowed::
+
+        read_only = PermissionPolicy(granted={"db:read"})
+        writer = PermissionPolicy(granted={"db:read", "db:write"},
+                                  approval_for={"db:write"})
+
+    ``approval_for`` names granted permissions that must still be confirmed
+    per call, on top of any tool marked ``requires_approval``.
+
+    Note the deliberate limit: a tool that declares *no* permissions requires
+    none, and passes. The agent's own ``tools`` list is the first allowlist -
+    this policy narrows it, it does not replace it. Declare permissions on
+    every tool you intend to gate, and watch the audit log (which records the
+    permissions of each call) for tools you forgot to label.
+    """
+
+    def __init__(
+        self,
+        granted: Optional[Iterable[str]] = None,
+        approval_for: Optional[Iterable[str]] = None,
+    ):
+        self.granted = frozenset(granted or ())
+        self.approval_for = frozenset(approval_for or ())
+
+    def authorize(self, tool: Tool, arguments: Dict[str, Any], context: Dict[str, Any]) -> None:
+        ungranted = tool.permissions - self.granted
+        if ungranted:
+            raise ToolAuthorizationError(
+                f"tool '{tool.name}' requires permission(s) {sorted(ungranted)}, "
+                f"which this agent was not granted"
+            )
+        super().authorize(tool, arguments, context)
+
+    def requires_approval(
+        self, tool: Tool, arguments: Dict[str, Any], context: Dict[str, Any]
+    ) -> bool:
+        return super().requires_approval(tool, arguments, context) or bool(
+            tool.permissions & self.approval_for
+        )
+
+
+# --- 7. Agent core (ReAct loop) --------------------------------------------
 class Agent:
     """A ReAct agent: think (LLM) -> act (tool) -> observe -> repeat.
 
@@ -1114,6 +1371,8 @@ class Agent:
         callbacks: Optional[List[Callback]] = None,
         structured_retries: int = 1,
         max_tool_workers: int = 8,
+        policy: Optional[ToolPolicy] = None,
+        approve: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ):
         self.llm = llm
         self.name = name
@@ -1130,6 +1389,16 @@ class Agent:
         # without a cap a single response sizes the thread pool. See
         # _execute_calls.
         self.max_tool_workers = max(1, max_tool_workers)
+        # Every model-requested tool call goes through this policy; the
+        # default one allows what the agent was already given. See _execute.
+        self.policy = policy or ToolPolicy()
+        # Approval is application-controlled by construction: this callback
+        # comes from the caller of Agent(), and nothing the model emits can
+        # set, reach or influence it.
+        self.approve = approve
+        # A turn's tool calls run concurrently, but a CLI prompt or a modal
+        # dialog must not be re-entered from several workers at once.
+        self._approval_lock = threading.Lock()
         self.usage: Dict[str, int] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -1285,13 +1554,115 @@ class Agent:
             )
 
     def _execute(self, call: Dict[str, Any]) -> str:
-        tool_obj = self.tools.get(call["name"])
+        """Authorize, then run, one model-requested tool call.
+
+        This is the only path from model output to a tool function, and it is
+        a fixed sequence: locate the tool, validate the arguments, ask the
+        policy, get approval if the policy wants it, execute, and record the
+        decision. There is no branch that reaches ``tool.run`` without
+        passing the policy first, and the model cannot choose a different
+        route through it.
+
+        A refusal at any step becomes an observation string, so the model
+        learns it was refused and the loop continues; a denied tool is never
+        a way to crash the run. Application code calling ``tool.run(...)``
+        directly is trusted and deliberately not policed - this boundary is
+        for model intent.
+        """
+        name = call.get("name", "")
+        arguments = call.get("arguments", {})
+        tool_obj = self.tools.get(name)
         if tool_obj is None:
-            return f"Error: unknown tool '{call['name']}'."
+            # A hallucinated or out-of-scope name never reaches a function.
+            self._audit(name, arguments, "unknown_tool", "not in this agent's tool set")
+            return f"Error: unknown tool '{name}'."
+        context = {"agent": self.name, "tool": name, "call_id": call.get("id")}
         try:
-            return str(tool_obj.run(call.get("arguments", {})))
+            arguments = tool_obj.validate_arguments(arguments)
+            self.policy.authorize(tool_obj, arguments, context)
+            decision = "allowed"
+            if self.policy.requires_approval(tool_obj, arguments, context):
+                self._request_approval(tool_obj, arguments, context)
+                decision = "approved"
+        except ToolArgumentValidationError as exc:
+            self._audit(name, arguments, "invalid_arguments", str(exc), tool_obj)
+            return f"Error: {exc}"
+        except ToolApprovalRequired as exc:
+            self._audit(name, arguments, "approval_denied", str(exc), tool_obj)
+            return f"Error: {exc}"
+        except ToolAuthorizationError as exc:
+            self._audit(name, arguments, "denied", str(exc), tool_obj)
+            return f"Error: {exc}"
+        except Exception as exc:  # a policy that breaks must not fail open
+            logger.exception("policy raised while authorizing '%s'", name)
+            self._audit(name, arguments, "denied", f"policy error: {exc}", tool_obj)
+            return f"Error: tool '{name}' was not authorized (policy error)."
+        self._audit(name, arguments, decision, "", tool_obj)
+        try:
+            return str(tool_obj.run(arguments))
         except Exception as exc:  # a tool must never crash the loop
-            return f"Error executing '{call['name']}': {exc}"
+            return f"Error executing '{name}': {exc}"
+
+    def _request_approval(
+        self, tool_obj: Tool, arguments: Dict[str, Any], context: Dict[str, Any]
+    ) -> None:
+        """Ask the application to confirm one call, or raise ToolApprovalRequired.
+
+        With no ``approve`` callback configured the call is refused: a tool
+        marked ``requires_approval`` must not run merely because nobody wired
+        up an approver. An approver that raises is likewise a refusal (it is
+        caught upstream in _execute), never a pass.
+        """
+        if self.approve is None:
+            raise ToolApprovalRequired(
+                f"tool '{tool_obj.name}' requires approval, but this agent has no "
+                "approval callback configured (pass Agent(approve=...))"
+            )
+        request = {
+            "agent": self.name,
+            "tool": tool_obj.name,
+            "arguments": dict(arguments),
+            "permissions": sorted(tool_obj.permissions),
+            "side_effects": tool_obj.side_effects,
+            "call_id": context.get("call_id"),
+        }
+        try:
+            with self._approval_lock:
+                granted = self.approve(request)
+        except Exception as exc:  # an approver that breaks refuses, never passes
+            logger.exception("approval callback failed for '%s'", tool_obj.name)
+            raise ToolApprovalRequired(
+                f"tool '{tool_obj.name}' could not be approved: the approval "
+                f"callback raised {type(exc).__name__}"
+            ) from exc
+        if not granted:
+            raise ToolApprovalRequired(f"tool '{tool_obj.name}' was not approved")
+
+    def _audit(
+        self,
+        name: str,
+        arguments: Any,
+        decision: str,
+        reason: str = "",
+        tool_obj: Optional[Tool] = None,
+    ) -> None:
+        """Record one authorization decision, before the tool runs."""
+        event = {
+            "agent": self.name,
+            "tool": name,
+            "arguments": arguments,
+            "decision": decision,
+            "reason": reason,
+            "permissions": sorted(tool_obj.permissions) if tool_obj else [],
+            "side_effects": bool(tool_obj and tool_obj.side_effects),
+        }
+        if decision in ("allowed", "approved"):
+            logger.debug("tool %s: %s", name, decision)
+        else:
+            # Refusals are logged by the core as well as emitted, so there is
+            # a record even when no callback is attached.
+            logger.warning("tool %s: %s (%s)", name, decision, reason)
+        self._emit("on_tool_audit", event)
 
     @staticmethod
     def _json_schema(schema: Type[BaseModel]) -> Dict[str, Any]:
@@ -1344,7 +1715,7 @@ class Agent:
         return {}
 
 
-# --- 7. Router (multi-agent orchestration) ---------------------------------
+# --- 8. Router (multi-agent orchestration) ---------------------------------
 class Router:
     """Coordinate several agents: route to one, run all, or run all and fuse.
 

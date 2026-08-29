@@ -15,4 +15,9 @@ Auto-generated from the docstrings in `unchained.py`.
         - Router
         - Callback
         - LoggingCallback
+        - ToolPolicy
+        - PermissionPolicy
         - RoutingError
+        - ToolAuthorizationError
+        - ToolApprovalRequired
+        - ToolArgumentValidationError

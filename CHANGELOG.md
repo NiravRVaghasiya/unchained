@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Tool authorization layer.** A model requesting a tool is now a request
+  that is granted or refused in Python, before the function runs - not a
+  prompt asking the model to behave.
+  - `@tool` accepts optional security metadata: `permissions`,
+    `requires_approval`, `side_effects`, and an `allowed(arguments, context)`
+    hook for per-call rules. `@tool` bare is unchanged. None of this metadata
+    is sent to the model.
+  - `ToolPolicy` decides: `authorize()` (raise `ToolAuthorizationError` to
+    deny) and `requires_approval()`. It is also the default policy, and the
+    default is permissive - an agent with no `policy=` behaves exactly as it
+    did before, except that a tool marked `requires_approval` is now gated
+    rather than decorative.
+  - `PermissionPolicy(granted=..., approval_for=...)` allows only tools whose
+    declared permissions have all been granted.
+  - `Agent(policy=..., approve=...)`. The approval callback is supplied by the
+    application and is unreachable from model output; it is serialised with a
+    lock so a turn's concurrent tool calls cannot re-enter your prompt.
+  - `Tool.validate_arguments()` rejects non-mappings, non-string argument
+    names, unknown parameter names and missing required parameters before the
+    call. Structural only - types are not coerced.
+  - `Callback.on_tool_audit(event)` records every decision before execution.
+  - New exceptions: `ToolAuthorizationError`, `ToolApprovalRequired`,
+    `ToolArgumentValidationError`.
+  - Fail-closed throughout: a policy that raises denies, an approval callback
+    that raises is a refusal, and a tool needing approval with no approver
+    configured does not run.
+  - See `examples/policy.py` and the SECURITY.md boundary list.
+
 ### Fixed
 - **Memory compression no longer produces an unsendable window.** When the
   sliding window overflowed, the boundary could fall between an assistant

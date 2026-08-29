@@ -164,6 +164,85 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+### 🔒 Tool authorization — a policy layer, not a prompt
+
+A model asking for a tool is a *request*, not a decision. Unchained resolves
+that request in Python, before the function runs — never by telling the model
+which tools are safe, which is advice, not a boundary.
+
+Tools carry optional metadata. It is never shown to the model:
+
+```python
+@tool
+def lookup_order(order_id: str) -> str:
+    """Read-only: needs no permission, changes nothing."""
+
+
+@tool(permissions={"billing:write"}, side_effects=True)
+def apply_refund(order_id: str, amount: float) -> str:
+    """Side-effecting: gated on a permission the agent must be granted."""
+
+
+@tool(permissions={"account:delete"}, requires_approval=True, side_effects=True)
+def delete_account(customer: str) -> str:
+    """Destructive: a human confirms every call."""
+```
+
+A policy decides; the application, not the model, answers approval requests:
+
+```python
+from unchained import Agent, PermissionPolicy
+
+agent = Agent(
+    llm,
+    tools=[lookup_order, apply_refund, delete_account],
+    policy=PermissionPolicy(granted={"billing:write"}),
+    approve=lambda request: input(f"run {request['tool']}{request['arguments']}? ") == "y",
+)
+```
+
+`lookup_order` runs. `apply_refund` runs. `delete_account` is refused — and
+would still be refused if you granted `account:delete` but wired up no
+approver, because an unanswerable question is a refusal, not a pass.
+
+Every model-requested call takes the same path, with no way around it:
+
+```
+locate tool → validate arguments → policy.authorize() → approval → execute → audit
+```
+
+A refusal comes back to the model as an observation, so it learns and can try
+something else rather than crashing the run. Every decision is auditable:
+
+```python
+class AuditLog(Callback):
+    def on_tool_audit(self, event):  # decision, tool, arguments, reason, permissions
+        log.info("%(decision)s %(tool)s", event)
+```
+
+Write your own rules by subclassing `ToolPolicy` — raise
+`ToolAuthorizationError` to deny:
+
+```python
+class BusinessHoursOnly(ToolPolicy):
+    def authorize(self, tool, arguments, context):
+        if tool.side_effects and not is_working_hours():
+            raise ToolAuthorizationError("no writes outside business hours")
+        super().authorize(tool, arguments, context)
+```
+
+For a rule that depends on the arguments, put it on the tool itself:
+
+```python
+@tool(allowed=lambda arguments, context: arguments["path"].startswith("/safe/"))
+def read_file(path: str) -> str: ...
+```
+
+With no `policy=`, an agent behaves exactly as it did before this existed:
+everything it was given is allowed. The boundary is always there; its default
+answer is yes. See [`examples/policy.py`](examples/policy.py) for a runnable
+walkthrough, and [SECURITY.md](SECURITY.md) for what is and isn't enforced.
+
 ### 🧠 Memory — sliding window with compression
 
 ```python
@@ -367,6 +446,7 @@ that survives restarts and namespaces conversations by session.
 | [`examples/coder.py`](examples/coder.py) | Runs Python in an isolated subprocess with a timeout (not a full sandbox) |
 | [`examples/data_analyst.py`](examples/data_analyst.py) | CSV analysis with a stats tool |
 | [`examples/sqlite_memory.py`](examples/sqlite_memory.py) | Persistent, session-scoped memory backed by SQLite |
+| [`examples/policy.py`](examples/policy.py) | Read-only, side-effecting and approval-required tools under a `ToolPolicy` |
 | [`examples/pickmystack/`](examples/pickmystack/) | **Flagship** multi-agent app that recommends an AI stack |
 
 ### PickMyStack
@@ -422,6 +502,7 @@ Unchained is designed to be extended, not forked:
 | Better retrieval | swap `RAG._rebuild_index()` + `search()` |
 | Persistent memory | subclass `Memory` — see [`examples/sqlite_memory.py`](examples/sqlite_memory.py) |
 | Custom tracing | subclass `Callback` and pass `callbacks=[...]` |
+| Custom authorization | subclass `ToolPolicy` and pass `policy=...` |
 | Custom routing | subclass `Router`, override `route()` |
 
 ## License

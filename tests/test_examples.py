@@ -320,3 +320,41 @@ def test_recommend_isolates_a_failing_specialist(monkeypatch):
     result = app.recommend(use_case="Build a bot", monthly_requests=1_000)
     assert all(v.startswith("(unavailable:") for v in result["findings"].values())
     assert result["recommendation"].startswith("(synthesizer unavailable:")
+
+
+# ---------------------------------------------------------------------------
+# examples/policy.py
+# ---------------------------------------------------------------------------
+def test_policy_example_read_only_agent_cannot_write():
+    from examples.policy import TOOLS, apply_refund
+    from unchained import Agent, MockLLM, PermissionPolicy
+
+    agent = Agent(MockLLM(), tools=TOOLS, policy=PermissionPolicy(granted={"billing:read"}))
+    before = dict(apply_refund.func.__globals__["ORDERS"]["A-1"])
+    observation = agent._execute(
+        {"name": "apply_refund", "arguments": {"order_id": "A-1", "amount": 42.0}, "id": "c"}
+    )
+    assert "billing:write" in observation
+    assert apply_refund.func.__globals__["ORDERS"]["A-1"] == before  # nothing changed
+
+
+def test_policy_example_approval_hook_is_consulted():
+    from examples.policy import approve_from_console
+
+    assert approve_from_console(
+        {"tool": "delete_account", "arguments": {"customer": "bob"}, "permissions": []}
+    )
+    assert not approve_from_console(
+        {"tool": "delete_account", "arguments": {"customer": "ada"}, "permissions": []}
+    )
+
+
+def test_policy_example_runs_end_to_end(capsys):
+    from examples.policy import main
+
+    main()
+    out = capsys.readouterr().out
+    assert "decisions recorded" in out
+    assert "unknown_tool" in out
+    assert "approval_denied" in out
+    assert "invalid_arguments" in out

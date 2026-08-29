@@ -1546,3 +1546,502 @@ def test_routing_error_message_truncates_a_runaway_model_reply():
     with pytest.raises(unchained.RoutingError) as excinfo:
         router._match("x" * 5000)
     assert len(str(excinfo.value)) < 400
+
+
+# ---------------------------------------------------------------------------
+# Tier 6: tool authorization (policy layer)
+#
+# The invariant under test throughout: a model-requested call reaches a
+# function only after Tool.validate_arguments and ToolPolicy.authorize have
+# both passed. Each test asserts on a side-effect log, not just the returned
+# string, so "was refused" means "did not run" rather than "said no".
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def ran():
+    """Records which tool functions actually executed."""
+    return []
+
+
+@pytest.fixture
+def policy_tools(ran):
+    @tool
+    def search(query: str) -> str:
+        """Read-only lookup."""
+        ran.append(("search", query))
+        return f"results for {query}"
+
+    @tool(permissions={"db:write"}, side_effects=True)
+    def write_row(table: str, value: str) -> str:
+        """Insert a row."""
+        ran.append(("write_row", table))
+        return "written"
+
+    @tool(permissions={"db:admin"}, side_effects=True, requires_approval=True)
+    def drop_table(table: str) -> str:
+        """Destructive."""
+        ran.append(("drop_table", table))
+        return "dropped"
+
+    return [search, write_row, drop_table]
+
+
+def _call(name, **arguments):
+    return {"name": name, "arguments": arguments, "id": "call-1"}
+
+
+# --- authorized execution --------------------------------------------------
+def test_authorized_tool_executes(policy_tools, ran):
+    agent = Agent(
+        FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:write"})
+    )
+    assert agent._execute(_call("write_row", table="t", value="v")) == "written"
+    assert ran == [("write_row", "t")]
+
+
+def test_tool_without_declared_permissions_passes_a_permission_policy(policy_tools, ran):
+    # A tool that declares no permissions requires none. The agent's own
+    # tools list is the first allowlist; PermissionPolicy narrows it.
+    agent = Agent(FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted=set()))
+    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert ran == [("search", "q")]
+
+
+# --- denied execution ------------------------------------------------------
+def test_denied_tool_does_not_execute(policy_tools, ran):
+    agent = Agent(
+        FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:read"})
+    )
+    observation = agent._execute(_call("write_row", table="t", value="v"))
+    assert "db:write" in observation
+    assert ran == []  # the function never ran
+
+
+def test_denial_is_reported_to_the_model_not_raised(policy_tools, ran):
+    # A denied tool must not crash the run: the model sees an observation and
+    # the ReAct loop continues, so it can choose something else.
+    script = [
+        {
+            "content": "",
+            "tool_calls": [
+                {"name": "write_row", "arguments": {"table": "t", "value": "v"}, "id": "x"}
+            ],
+        },
+        {"content": "I was refused, so here is a plain answer."},
+    ]
+    agent = Agent(
+        MockLLM(script=script),
+        tools=policy_tools,
+        policy=unchained.PermissionPolicy(granted={"db:read"}),
+    )
+    assert agent.run("write something") == "I was refused, so here is a plain answer."
+    assert ran == []
+
+
+def test_per_tool_allowed_hook_gates_on_arguments(ran):
+    @tool(allowed=lambda arguments, context: arguments["path"].startswith("/safe/"))
+    def read_file(path: str) -> str:
+        """Read a file."""
+        ran.append(("read_file", path))
+        return "contents"
+
+    agent = Agent(FakeLLM([]), tools=[read_file])
+    assert agent._execute(_call("read_file", path="/safe/notes.txt")) == "contents"
+    assert "refused this call" in agent._execute(_call("read_file", path="/etc/shadow"))
+    assert ran == [("read_file", "/safe/notes.txt")]
+
+
+def test_custom_policy_can_deny_on_side_effects(policy_tools, ran):
+    class ReadOnlyWindow(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            if tool_obj.side_effects:
+                raise unchained.ToolAuthorizationError("writes are frozen right now")
+            super().authorize(tool_obj, arguments, context)
+
+    agent = Agent(FakeLLM([]), tools=policy_tools, policy=ReadOnlyWindow())
+    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert "frozen" in agent._execute(_call("write_row", table="t", value="v"))
+    assert ran == [("search", "q")]
+
+
+# --- approval --------------------------------------------------------------
+def test_approval_required_tool_runs_only_when_approved(policy_tools, ran):
+    requests = []
+
+    def approve(request):
+        requests.append(request)
+        return request["arguments"]["table"] == "scratch"
+
+    agent = Agent(
+        FakeLLM([]),
+        tools=policy_tools,
+        policy=unchained.PermissionPolicy(granted={"db:admin"}),
+        approve=approve,
+    )
+    assert agent._execute(_call("drop_table", table="scratch")) == "dropped"
+    assert "not approved" in agent._execute(_call("drop_table", table="production"))
+    assert ran == [("drop_table", "scratch")]
+
+    # The approver is shown what it needs to decide, including the real args.
+    assert requests[0]["tool"] == "drop_table"
+    assert requests[0]["arguments"] == {"table": "scratch"}
+    assert requests[0]["permissions"] == ["db:admin"]
+    assert requests[0]["side_effects"] is True
+
+
+def test_approval_required_without_an_approver_fails_closed(policy_tools, ran):
+    # An unanswerable question is a refusal. A tool marked requires_approval
+    # must not run just because nobody wired up an approver.
+    agent = Agent(
+        FakeLLM([]), tools=policy_tools, policy=unchained.PermissionPolicy(granted={"db:admin"})
+    )
+    observation = agent._execute(_call("drop_table", table="t"))
+    assert "requires approval" in observation
+    assert ran == []
+
+
+def test_an_approver_that_raises_is_a_refusal(policy_tools, ran):
+    def approve(request):
+        raise RuntimeError("approval backend is down")
+
+    agent = Agent(
+        FakeLLM([]),
+        tools=policy_tools,
+        policy=unchained.PermissionPolicy(granted={"db:admin"}),
+        approve=approve,
+    )
+    assert "could not be approved" in agent._execute(_call("drop_table", table="t"))
+    assert ran == []
+
+
+def test_policy_can_escalate_a_granted_permission_to_approval(ran):
+    @tool(permissions={"db:write"}, side_effects=True)
+    def write_row(table: str) -> str:
+        """Insert a row."""
+        ran.append(("write_row", table))
+        return "written"
+
+    policy = unchained.PermissionPolicy(granted={"db:write"}, approval_for={"db:write"})
+    denied = Agent(FakeLLM([]), tools=[write_row], policy=policy)
+    assert "requires approval" in denied._execute(_call("write_row", table="t"))
+    assert ran == []
+
+    allowed = Agent(FakeLLM([]), tools=[write_row], policy=policy, approve=lambda request: True)
+    assert allowed._execute(_call("write_row", table="t")) == "written"
+    assert ran == [("write_row", "t")]
+
+
+def test_approval_callback_is_serialised_across_concurrent_tool_calls(ran):
+    # A turn's calls run concurrently, but a CLI prompt or modal dialog must
+    # not be re-entered from several workers at once.
+    overlaps = []
+    inside = {"n": 0}
+    guard = threading.Lock()
+
+    @tool(requires_approval=True)
+    def confirmable(x: int) -> str:
+        """Needs confirmation."""
+        return f"ok{x}"
+
+    def approve(request):
+        with guard:
+            inside["n"] += 1
+            overlaps.append(inside["n"])
+        time.sleep(0.005)
+        with guard:
+            inside["n"] -= 1
+        return True
+
+    agent = Agent(FakeLLM([]), tools=[confirmable], approve=approve, max_tool_workers=8)
+    agent._execute_calls([_call("confirmable", x=i) for i in range(12)])
+    assert max(overlaps) == 1, "approval callback was entered concurrently"
+
+
+# --- the model cannot reach an unauthorized tool ---------------------------
+def test_model_requesting_an_unknown_tool_never_reaches_a_function(policy_tools, ran):
+    agent = Agent(FakeLLM([]), tools=policy_tools)
+    assert "unknown tool" in agent._execute(_call("rm_rf", path="/"))
+    assert ran == []
+
+
+def test_model_cannot_reach_a_tool_the_agent_was_not_given(ran):
+    @tool(permissions={"db:admin"})
+    def privileged(x: int) -> str:
+        """Not handed to the agent."""
+        ran.append(("privileged", x))
+        return "ran"
+
+    # The tool exists in the process, but this agent was never given it.
+    agent = Agent(FakeLLM([]), tools=[], policy=unchained.PermissionPolicy(granted={"db:admin"}))
+    assert "unknown tool" in agent._execute(_call("privileged", x=1))
+    assert ran == []
+
+
+def test_every_model_driven_path_goes_through_the_policy(policy_tools, ran):
+    # Both run() and stream() must funnel tool calls through _execute. If a
+    # future refactor adds a path that calls tool.run() directly, this fails.
+    seen = []
+
+    class Recording(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            seen.append(tool_obj.name)
+            raise unchained.ToolAuthorizationError("nothing is allowed here")
+
+    call = {"name": "search", "arguments": {"query": "q"}, "id": "x"}
+    agent = Agent(
+        MockLLM(script=[{"content": "", "tool_calls": [call]}, {"content": "done"}]),
+        tools=policy_tools,
+        policy=Recording(),
+    )
+    agent.run("go")
+
+    streamer = Agent(
+        MockLLM(script=[{"content": "", "tool_calls": [call]}, {"content": "done"}]),
+        tools=policy_tools,
+        policy=Recording(),
+    )
+    list(streamer.stream("go"))
+
+    assert seen == ["search", "search"]  # once per path
+    assert ran == []
+
+
+def test_a_broken_policy_fails_closed(policy_tools, ran):
+    # A policy that raises something unexpected must deny, not fall through
+    # to execution and not crash the run.
+    class Broken(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            raise ValueError("bug in my own policy")
+
+    agent = Agent(FakeLLM([]), tools=policy_tools, policy=Broken())
+    assert "not authorized" in agent._execute(_call("search", query="q"))
+    assert ran == []
+
+
+# --- argument validation ---------------------------------------------------
+def test_invalid_arguments_are_rejected_before_execution(policy_tools, ran):
+    agent = Agent(FakeLLM([]), tools=policy_tools)
+    assert "unexpected argument" in agent._execute(_call("search", query="q", sneaky=1))
+    assert "missing required argument" in agent._execute({"name": "search", "arguments": {}})
+    assert "expects an object" in agent._execute({"name": "search", "arguments": "not-a-dict"})
+    assert ran == []
+
+
+def test_validate_arguments_rules():
+    @tool
+    def sample(a: str, b: int = 2) -> str:
+        """Sample."""
+        return a
+
+    assert sample.validate_arguments({"a": "x"}) == {"a": "x"}
+    assert sample.validate_arguments({"a": "x", "b": 5}) == {"a": "x", "b": 5}
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments({"b": 5})  # missing required 'a'
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments({"a": "x", "c": 1})  # unknown name
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments({"a": "x", 1: "y"})  # non-string name
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments(["a"])  # not a mapping
+
+
+def test_validate_arguments_treats_a_missing_arguments_dict_as_empty():
+    @tool
+    def no_args() -> str:
+        """Takes nothing."""
+        return "ok"
+
+    assert no_args.validate_arguments(None) == {}
+    assert no_args.validate_arguments({}) == {}
+
+
+def test_validate_arguments_allows_unknown_names_for_kwargs_tools():
+    @tool
+    def flexible(a: str, **rest: str) -> str:
+        """Accepts extras by design."""
+        return a
+
+    assert flexible.accepts_kwargs is True
+    assert flexible.validate_arguments({"a": "x", "anything": 1}) == {"a": "x", "anything": 1}
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        flexible.validate_arguments({"anything": 1})  # 'a' is still required
+
+
+def test_argument_validation_does_not_coerce_types():
+    # Deliberate: silently turning "3" into 3 would hide real model errors.
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        return str(n)
+
+    assert counted.validate_arguments({"n": "3"}) == {"n": "3"}
+
+
+# --- exceptions ------------------------------------------------------------
+def test_policy_exceptions_are_exported_and_catchable():
+    for name in (
+        "ToolPolicy",
+        "PermissionPolicy",
+        "ToolAuthorizationError",
+        "ToolApprovalRequired",
+        "ToolArgumentValidationError",
+    ):
+        assert name in unchained.__all__, name
+    assert issubclass(unchained.ToolAuthorizationError, RuntimeError)
+    assert issubclass(unchained.ToolApprovalRequired, RuntimeError)
+    assert issubclass(unchained.ToolArgumentValidationError, RuntimeError)
+
+
+def test_policy_hooks_receive_tool_arguments_and_context():
+    captured = {}
+
+    class Inspecting(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            captured["tool"] = tool_obj.name
+            captured["arguments"] = arguments
+            captured["context"] = context
+
+    @tool(permissions={"x"})
+    def probe(value: str) -> str:
+        """Probe."""
+        return value
+
+    agent = Agent(FakeLLM([]), tools=[probe], name="inspector", policy=Inspecting())
+    agent._execute({"name": "probe", "arguments": {"value": "v"}, "id": "call-9"})
+
+    assert captured["tool"] == "probe"
+    assert captured["arguments"] == {"value": "v"}
+    assert captured["context"] == {"agent": "inspector", "tool": "probe", "call_id": "call-9"}
+
+
+# --- audit -----------------------------------------------------------------
+def test_every_decision_is_audited(policy_tools):
+    class Sink(unchained.Callback):
+        def __init__(self):
+            self.events = []
+
+        def on_tool_audit(self, event):
+            self.events.append(event)
+
+    sink = Sink()
+    agent = Agent(
+        FakeLLM([]),
+        tools=policy_tools,
+        policy=unchained.PermissionPolicy(granted={"db:read"}),
+        callbacks=[sink],
+        name="auditor",
+    )
+    agent._execute(_call("search", query="q"))
+    agent._execute(_call("write_row", table="t", value="v"))
+    agent._execute(_call("ghost"))
+    agent._execute(_call("search", query="q", bad=1))
+    agent._execute(_call("drop_table", table="t"))
+
+    decisions = [(e["tool"], e["decision"]) for e in sink.events]
+    assert decisions == [
+        ("search", "allowed"),
+        ("write_row", "denied"),
+        ("ghost", "unknown_tool"),
+        ("search", "invalid_arguments"),
+        ("drop_table", "denied"),  # ungranted db:admin is refused before approval
+    ]
+    allowed_event = sink.events[0]
+    assert allowed_event["agent"] == "auditor"
+    assert allowed_event["side_effects"] is False
+    assert sink.events[1]["permissions"] == ["db:write"]
+    assert sink.events[1]["side_effects"] is True
+    assert "db:write" in sink.events[1]["reason"]
+
+
+def test_audit_records_an_approved_call_distinctly(ran):
+    class Sink(unchained.Callback):
+        def __init__(self):
+            self.events = []
+
+        def on_tool_audit(self, event):
+            self.events.append(event)
+
+    @tool(requires_approval=True)
+    def confirmable(x: int) -> str:
+        """Needs confirmation."""
+        ran.append(("confirmable", x))
+        return "ok"
+
+    sink = Sink()
+    agent = Agent(FakeLLM([]), tools=[confirmable], approve=lambda r: True, callbacks=[sink])
+    agent._execute(_call("confirmable", x=1))
+    assert [e["decision"] for e in sink.events] == ["approved"]
+
+
+def test_a_failing_audit_callback_never_breaks_the_run(policy_tools, ran):
+    class Broken(unchained.Callback):
+        def on_tool_audit(self, event):
+            raise RuntimeError("audit sink is down")
+
+    agent = Agent(FakeLLM([]), tools=policy_tools, callbacks=[Broken()])
+    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert ran == [("search", "q")]
+
+
+def test_logging_callback_implements_the_audit_hook():
+    assert unchained.LoggingCallback().on_tool_audit({"tool": "t", "decision": "allowed"}) is None
+
+
+# --- backwards compatibility ----------------------------------------------
+def test_bare_tool_decorator_is_unchanged():
+    @tool
+    def legacy(a: int, b: int = 1) -> int:
+        """Add."""
+        return a + b
+
+    assert isinstance(legacy, Tool)
+    assert legacy(2, 3) == 5  # still directly callable
+    assert legacy.run({"a": 2}) == 3  # run() is not policed
+    assert legacy.schema["function"]["name"] == "legacy"
+    # Metadata defaults leave the tool exactly as permissive as before.
+    assert legacy.permissions == frozenset()
+    assert legacy.requires_approval is False
+    assert legacy.side_effects is False
+    assert legacy.allowed is None
+
+
+def test_tool_called_as_a_plain_function_still_works():
+    def plain(a: str) -> str:
+        """Plain."""
+        return a
+
+    assert Tool(plain).run({"a": "x"}) == "x"
+
+
+def test_agent_without_a_policy_gets_the_permissive_default(policy_tools, ran):
+    # No policy= argument: everything the agent was given still runs, exactly
+    # as it did before this layer existed.
+    agent = Agent(FakeLLM([]), tools=policy_tools)
+    assert isinstance(agent.policy, unchained.ToolPolicy)
+    assert agent.approve is None
+    assert agent._execute(_call("search", query="q")) == "results for q"
+    assert agent._execute(_call("write_row", table="t", value="v")) == "written"
+    assert ran == [("search", "q"), ("write_row", "t")]
+
+
+def test_default_policy_still_honours_tool_metadata(ran):
+    # Requirement: metadata must not be decorative. Even with no explicit
+    # policy, a tool marked requires_approval is gated.
+    @tool(requires_approval=True)
+    def dangerous(x: int) -> str:
+        """Marked, but no policy configured."""
+        ran.append(("dangerous", x))
+        return "ran"
+
+    agent = Agent(FakeLLM([]), tools=[dangerous])
+    assert "requires approval" in agent._execute(_call("dangerous", x=1))
+    assert ran == []
+
+
+def test_existing_tool_error_handling_is_unchanged():
+    @tool
+    def boom(x: int) -> int:
+        """Always explodes."""
+        raise ValueError("nope")
+
+    agent = Agent(FakeLLM([]), tools=[boom])
+    assert "Error executing 'boom'" in agent._execute(_call("boom", x=1))

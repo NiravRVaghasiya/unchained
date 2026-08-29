@@ -34,6 +34,35 @@ hold even when the model is confused, jailbroken, or adversarial.
 - **An agent can only call the tools it was given.** `Agent` dispatches through
   its own `tools` dict; a call naming anything else returns an error string to
   the model. There is no dynamic lookup and no name-based import.
+- **Every model-requested tool call passes a policy first.** `Agent._execute`
+  is the single path from model output to a tool function, and its sequence is
+  fixed: locate the tool, validate the arguments, `ToolPolicy.authorize()`,
+  approval if required, execute, audit. `Agent.run()`, `Agent.stream()` and
+  `Agent.arun()` all funnel through it. A tool marked `requires_approval` is
+  gated even when no policy is configured, so the metadata is never
+  decorative. See "Tool authorization" in the README.
+- **Refusals fail closed, including when the machinery itself breaks.** A
+  policy that raises an unexpected exception denies the call rather than
+  falling through to execution; an approval callback that raises is a refusal,
+  not a pass; and a tool needing approval with no approver configured is
+  refused. The default answer whenever the system cannot get a clear yes is
+  no.
+- **Approval is application-controlled.** The `approve=` callback is supplied
+  to `Agent()` by your code. Model output cannot set it, reach it, or change
+  its answer, and it is serialised with a lock so concurrent tool calls in one
+  turn cannot re-enter your prompt. Tool metadata (`permissions`,
+  `requires_approval`, `side_effects`) is fixed at decoration time and is
+  never sent to the model.
+- **Argument shape is validated before the call.** `Tool.validate_arguments`
+  rejects non-mappings, non-string argument names, unknown parameter names,
+  and missing required parameters, so malformed model output cannot reach the
+  function. Note the limit: this is structural, not type validation (see
+  below).
+- **Authorization decisions are audited.** Each decision is emitted to
+  `Callback.on_tool_audit` before the tool runs, so the record survives a tool
+  that hangs or crashes, and refusals are written to the module logger even
+  when no callback is attached. Audit events carry arguments verbatim — redact
+  them in your sink if your tools take secrets.
 - **Routing fails closed.** `Router.route()` dispatches only on an exact agent
   name or an unambiguous whole-word mention of exactly one agent. Anything
   else — an empty reply, a refusal, a hallucinated name, or a reply naming two
@@ -51,11 +80,22 @@ hold even when the model is confused, jailbroken, or adversarial.
 
 Known non-boundaries, by design:
 
-- **Tool arguments are not validated against the tool's JSON schema.** The
-  schema is advisory — it is what the model is shown. Arguments arrive as a
-  dict and are passed as keyword arguments; a mismatch raises inside the tool
-  and is returned to the model as an error string. Validate untrusted
-  arguments inside the tool itself (a Pydantic model parameter is one way).
+- **Argument *types* are not enforced or coerced.** Validation is structural
+  (names and required parameters), not semantic: a parameter annotated `int`
+  will still receive `"3"` if the model sends a string, because silently
+  repairing that would hide real model errors. Annotate the parameter with a
+  Pydantic model when you need full validation, or check inside the tool.
+- **`Tool.run()` and calling a tool directly are not policed.** The policy
+  layer governs *model* intent. Application code holding a `Tool` object is
+  already trusted and can call it however it likes; don't hand a raw `Tool` to
+  something you wouldn't hand the underlying function.
+- **A tool that declares no `permissions` requires none.** `PermissionPolicy`
+  narrows the agent's tool list, it does not replace it: an unlabelled tool
+  passes. Declare permissions on every tool you intend to gate — the audit log
+  records the permissions of each call, which makes the gaps visible.
+- **The policy layer is not a sandbox.** It decides *whether* a function runs,
+  not what that function can then do. A tool that shells out or writes files
+  still needs OS-level confinement (see `examples/coder.py`).
 - **Tool error text is fed back to the model and stored in memory.** If a tool
   raises an exception whose message contains a secret, that secret enters the
   transcript. Catch and sanitise inside tools that handle credentials.
