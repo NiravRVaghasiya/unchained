@@ -143,6 +143,37 @@ def set_thermostat(mode: Literal["heat", "cool", "off"], degrees: int) -> str:
     ...
 ```
 
+**That schema is what the model is shown — and arguments are validated
+independently of it before your function runs.** The schema is advice the
+model may ignore; what actually arrives is checked against the Python
+signature (using Pydantic, already a dependency) and normalised to the types
+you annotated. Inside `set_thermostat`, `degrees` is an `int` even if the
+model sent `"21"`.
+
+A call of `{"mode": "warm", "degrees": "hot"}` never reaches the function.
+The model gets an observation naming each field and the rule it broke, so it
+can correct itself on the next turn:
+
+```
+Error: tool 'set_thermostat' got invalid arguments - mode: Input should be
+'heat', 'cool' or 'off'; degrees: Input should be a valid integer, unable to
+parse string as an integer
+```
+
+Rejected: missing required arguments, wrong types, malformed nested
+structures, and unknown argument names (unless the tool takes `**kwargs`).
+Nested Pydantic models are validated all the way down, and errors point at the
+exact path — `person.address.zip`.
+
+Validation errors never repeat the offending *value*, only its location and
+the rule. That text goes to the model, into memory, and into the audit log, so
+a tool taking a token or a customer record cannot leak it by failing
+validation.
+
+Two notes on normalisation: an `Enum`-annotated parameter receives the enum
+member (`Color.red`, not `"red"`), and a parameter with no annotation accepts
+anything, since the plain Python function would too.
+
 Tools can be `async def` too — `tool.run(...)` drives them to completion, or
 await `Agent.arun(...)` to run a whole turn (including async tools) off the
 event loop:
@@ -558,6 +589,7 @@ Unchained is designed to be extended, not forked:
 | Extension | How |
 |---|---|
 | New tool | `@tool` on any function (sync or async) |
+| Stricter argument rules | annotate the parameter with a Pydantic model |
 | New LLM provider | add a `_provider()` method to `LLM` |
 | OpenAI-compatible provider | reuse `provider="openai"` with a different `base_url` |
 | True async HTTP | subclass `LLM` and override `chat()`/`_request()` with an async client |

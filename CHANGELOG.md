@@ -7,6 +7,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Runtime argument validation before every tool execution.** Type
+  annotations previously only generated the JSON schema shown to the model;
+  what actually arrived reached the function after structural checks only. A
+  model sending `{"degrees": "hot"}` for an `int` parameter got a `TypeError`
+  from inside the tool, if it failed at all.
+
+  Arguments are now validated against a Pydantic model built from the Python
+  **signature** — deliberately not from `Tool.schema`, since enforcing the
+  same document the model is free to ignore would guarantee nothing. Every
+  annotation the schema builder understands is enforced: `str`, `int`,
+  `float`, `bool`, lists and dicts including item types, `Optional`,
+  `Literal`, `Enum`, and Pydantic models nested to any depth. Rejected:
+  missing required arguments, wrong types, malformed nested structures, and
+  unknown argument names (unless the tool declares `**kwargs`).
+  - Validation runs in `Tool.run()`, so no model-facing path can skip it.
+    `Agent` validates first, so a `ToolPolicy` now sees normalised,
+    correctly-typed arguments.
+  - Failures come back to the model as an observation naming the field and
+    the rule (`person.address.zip: Input should be a valid integer`), so it
+    can correct itself; the tool does not run.
+  - Errors never repeat the offending **value**. Pydantic's own message
+    embeds `input_value=...`, which would reach the model, conversation
+    memory and the audit log; only the field path and rule are reported, and
+    the exception is raised outside the `except` block so neither
+    `__cause__` nor `__context__` retains the original.
+  - No new dependency: Pydantic was already required.
+
+### Changed
+- **Arguments are now normalised**, reversing an earlier deliberate choice not
+  to coerce. A function receives what its annotations promise: `"42"` arrives
+  as `42` for an `int`, and a nested dict arrives as the declared model.
+  - **An `Enum`-annotated parameter now receives the enum member** (`Color.red`)
+    rather than the raw value (`"red"`). Tools annotated with an `Enum` that
+    assumed a string need `.value`.
+  - A parameter with **no annotation** accepts anything, matching the plain
+    Python function. The schema still advertises it as a string.
+- `Tool.run(dict)` validates; `Tool.__call__` (`my_tool(1, 2)`) still calls
+  straight through, unvalidated — it is your code calling your function.
+- Tools with parameters named `model_name`, `json` or `schema` no longer emit
+  Pydantic shadowing warnings at decoration time.
 - **`Session`: agent configuration is now separate from conversation state.**
   An `Agent` holds the LLM, tools, prompt, RAG, callbacks and policy - things
   that are safe to share. A `Session` holds one conversation's memory, usage

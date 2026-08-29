@@ -53,11 +53,22 @@ hold even when the model is confused, jailbroken, or adversarial.
   turn cannot re-enter your prompt. Tool metadata (`permissions`,
   `requires_approval`, `side_effects`) is fixed at decoration time and is
   never sent to the model.
-- **Argument shape is validated before the call.** `Tool.validate_arguments`
-  rejects non-mappings, non-string argument names, unknown parameter names,
-  and missing required parameters, so malformed model output cannot reach the
-  function. Note the limit: this is structural, not type validation (see
-  below).
+- **Arguments are validated and normalised before the call.**
+  `Tool.validate_arguments` checks what actually arrived against a model built
+  from the Python signature — *not* from the JSON schema shown to the model,
+  which is advice the model is free to ignore. Missing required arguments,
+  wrong types, malformed nested structures and unknown argument names are all
+  rejected, and the function is not called. Every model-facing path validates:
+  `Agent` validates before consulting the policy (so a policy sees normalised,
+  correctly-typed arguments), and `Tool.run()` validates again for anyone
+  calling it directly.
+- **Validation errors do not echo the offending value.** Pydantic's own
+  message embeds `input_value=...`, and this text is returned to the model,
+  stored in conversation memory and written to the audit log. Unchained
+  reports only the field path and the rule that failed, and raises outside the
+  `except` block so neither `__cause__` nor `__context__` retains the original
+  error — a tool taking a password or a customer record cannot leak it by
+  failing validation.
 - **Conversations are isolated by construction.** An `Agent` holds no
   conversation state; each `Session` owns its own memory and usage counters.
   One user's history cannot leak into another's through a shared agent, and
@@ -87,11 +98,16 @@ hold even when the model is confused, jailbroken, or adversarial.
 
 Known non-boundaries, by design:
 
-- **Argument *types* are not enforced or coerced.** Validation is structural
-  (names and required parameters), not semantic: a parameter annotated `int`
-  will still receive `"3"` if the model sends a string, because silently
-  repairing that would hide real model errors. Annotate the parameter with a
-  Pydantic model when you need full validation, or check inside the tool.
+- **Validation is only as strict as your annotations.** A parameter with no
+  annotation accepts anything (the plain function would too), a tool declaring
+  `**kwargs` accepts unknown argument names by design, and a type Pydantic has
+  no validator for is checked with `isinstance` only. `str` also accepts any
+  string — annotate with a Pydantic model, or check inside the tool, when a
+  value needs to be a path under a root, a positive number, or an id the
+  caller owns. Type-correct is not the same as safe.
+- **`Tool.__call__` is not validated.** `my_tool(1, 2)` is your own code
+  calling your own function, and Python's argument handling applies.
+  `Tool.run(dict)` — the model-shaped path — always validates.
 - **`Tool.run()` and calling a tool directly are not policed.** The policy
   layer governs *model* intent. Application code holding a `Tool` object is
   already trusted and can call it however it likes; don't hand a raw `Tool` to

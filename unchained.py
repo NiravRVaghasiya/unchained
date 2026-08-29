@@ -28,6 +28,7 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -58,6 +59,18 @@ except ImportError:  # pragma: no cover
     BaseModel = object  # type: ignore[assignment,misc]
     ValidationError = Exception  # type: ignore[assignment,misc]
     _HAS_PYDANTIC = False
+
+# Runtime argument validation needs Pydantic v2's create_model/ConfigDict.
+# v1 has create_model but no ConfigDict, so this import fails there and tools
+# fall back to structural checks - see Tool.validate_arguments.
+try:
+    from pydantic import ConfigDict, create_model
+
+    _HAS_PYDANTIC_V2 = True
+except ImportError:  # pragma: no cover
+    ConfigDict = None  # type: ignore[assignment,misc]
+    create_model = None  # type: ignore[assignment]
+    _HAS_PYDANTIC_V2 = False
 
 logger = logging.getLogger("unchained")
 logger.addHandler(logging.NullHandler())
@@ -169,6 +182,17 @@ class Tool:
 
     None of this is sent to the model. Metadata describes the tool to your
     policy; it is not a hint the model can read, argue with, or override.
+
+    Three separate jobs, deliberately not conflated:
+
+    * :attr:`schema` - **generation**. The JSON Schema shown to the model.
+      Advice: it describes what to send, and the model is free to ignore it.
+    * :meth:`validate_arguments` - **enforcement**. Checks and normalises
+      what actually arrived, built from the Python signature rather than
+      from ``schema``, because enforcing the same document the model was
+      free to ignore would guarantee nothing.
+    * :meth:`run` - **execution**. Calls the function, with validated
+      arguments only.
     """
 
     def __init__(
@@ -194,24 +218,89 @@ class Tool:
             param.kind is inspect.Parameter.VAR_KEYWORD
             for param in inspect.signature(func).parameters.values()
         )
-        self.schema = self._build_schema(func)
+        self.schema = self._build_schema(func)  # what the model is shown
+        self._validator = self._build_validator(func)  # what is enforced
+
+    def _build_validator(self, func: Callable[..., Any]) -> Optional[Any]:
+        """Build a Pydantic model from the signature, for runtime validation.
+
+        Built from the *signature*, never from :attr:`schema`: the schema is
+        advice given to the model, so enforcing it would mean trusting the
+        same document the model is free to ignore.
+
+        Returns None - leaving :meth:`validate_arguments` on its structural
+        fallback - when Pydantic v2 is absent, or when a signature carries an
+        annotation no model can be built from. Degrading is deliberate: a
+        tool that used to import must not start raising at decoration time
+        because its annotations are unusual.
+        """
+        if not _HAS_PYDANTIC_V2:  # pragma: no cover - v2 is the pinned floor
+            return None
+        try:
+            hints = get_type_hints(func)
+        except Exception:  # pragma: no cover - unresolvable forward refs
+            hints = {}
+        fields: Dict[str, Any] = {}
+        for name, param in inspect.signature(func).parameters.items():
+            if name in ("self", "cls") or param.kind in (
+                param.VAR_POSITIONAL,
+                param.VAR_KEYWORD,
+            ):
+                continue
+            # An unannotated parameter stays permissive (Any). The schema
+            # advertises it as a string, but guessing here would reject
+            # arguments that the plain Python function accepts happily.
+            annotation = hints.get(name, Any)
+            default = ... if param.default is inspect.Parameter.empty else param.default
+            fields[name] = (annotation, default)
+        config = ConfigDict(
+            # A tool without **kwargs cannot receive unknown names; one with
+            # **kwargs accepts them by definition.
+            extra="allow" if self.accepts_kwargs else "forbid",
+            # Don't reject a signature just because Pydantic has no validator
+            # for one of its types - fall back to an isinstance check.
+            arbitrary_types_allowed=True,
+            # A tool parameter may legitimately be called model_name.
+            protected_namespaces=(),
+        )
+        try:
+            with warnings.catch_warnings():
+                # A parameter named json/copy/schema shadows a BaseModel
+                # attribute. It works; the warning is not the author's problem.
+                warnings.simplefilter("ignore")
+                return create_model(f"{self.name}_arguments", __config__=config, **fields)
+        except Exception as exc:  # pragma: no cover - exotic annotations only
+            logger.debug(
+                "tool %r: no Pydantic validator (%s); using structural checks", self.name, exc
+            )
+            return None
 
     def validate_arguments(self, arguments: Any) -> Dict[str, Any]:
-        """Check model-supplied arguments against this tool's signature.
+        """Validate and normalise model-supplied arguments. **The gate.**
 
-        Structural only: it rejects a non-mapping, non-string argument names,
-        unknown parameter names, and missing required parameters - the shapes
-        that would otherwise raise ``TypeError`` from inside the call, where
-        the failure reads as a tool bug rather than a bad request. Tools
-        declaring ``**kwargs`` accept unknown names by definition, so the
-        unknown-name check is skipped for them.
+        Nothing reaches the wrapped function without passing here first.
+        Every annotation the schema builder understands is enforced -
+        ``str``/``int``/``float``/``bool``, lists and dicts (including their
+        item types), ``Optional``, ``Literal``, ``Enum`` and Pydantic models
+        nested to any depth - by validating against a model built from the
+        signature. Rejected: missing required arguments, wrong types,
+        malformed nested structures, and unknown names (unless the tool
+        declares ``**kwargs``).
 
-        It deliberately does not coerce or deep-check types: guessing whether
-        ``"3"`` means ``3`` is the kind of silent repair that hides real
-        model errors. Annotate a parameter with a Pydantic model when you
-        want full validation.
+        Arguments are also *normalised*, so the function receives what its
+        annotations promise: ``"42"`` arrives as ``42`` for an ``int``
+        parameter, and a nested dict arrives as the declared Pydantic model.
+        An ``Enum``-annotated parameter therefore receives the enum member,
+        not the raw value.
 
-        Returns the validated arguments. Raises ToolArgumentValidationError.
+        Returns the normalised arguments, ready to splat into the function.
+        Raises :class:`ToolArgumentValidationError`, whose message names the
+        offending field and the rule it broke but never repeats the value
+        (see :meth:`_describe_errors`).
+
+        Validating twice is harmless: normalised arguments pass again
+        unchanged, which is what lets :class:`Agent` validate once for the
+        policy and :meth:`run` validate again for anyone calling it directly.
         """
         if arguments is None:
             arguments = {}
@@ -219,24 +308,80 @@ class Tool:
             raise ToolArgumentValidationError(
                 f"tool '{self.name}' expects an object of arguments, got {type(arguments).__name__}"
             )
-        properties = self.schema["function"]["parameters"]["properties"]
-        required = self.schema["function"]["parameters"]["required"]
         unnamed = sorted(repr(key) for key in arguments if not isinstance(key, str))
         if unnamed:
             raise ToolArgumentValidationError(
                 f"tool '{self.name}' got non-string argument name(s): {', '.join(unnamed)}"
             )
+        if self._validator is None:  # pragma: no cover - no Pydantic v2
+            return self._validate_structure(arguments)
+        # Pydantic's own message embeds the offending input, and this
+        # exception's text is handed to the model, written to memory and
+        # recorded in the audit log. Only a redacted summary is kept, and it
+        # is raised *after* the except block has finished so that neither
+        # __cause__ nor __context__ holds the original - a raise inside the
+        # block would leave the raw value reachable through __context__ for
+        # anything that walks the chain, even though tracebacks hide it.
+        problem: Optional[str] = None
+        try:
+            validated = self._validator.model_validate(arguments)
+        except ValidationError as exc:
+            problem = self._describe_errors(exc)
+        if problem is not None:
+            raise ToolArgumentValidationError(
+                f"tool '{self.name}' got invalid arguments - {problem}"
+            )
+        # Return only what was actually sent, normalised: absent optional
+        # parameters are left to the function's own defaults rather than
+        # filled in here.
+        extra = getattr(validated, "__pydantic_extra__", None) or {}
+        return {key: extra[key] if key in extra else getattr(validated, key) for key in arguments}
+
+    @staticmethod
+    def _describe_errors(exc: Any) -> str:
+        """Summarise a ValidationError without echoing the offending values.
+
+        ``str(ValidationError)`` includes ``input_value=...``. That text goes
+        back to the model, into conversation memory, and into the audit log,
+        so a tool taking a password, token or customer record would leak it
+        on any validation failure. Only the field path and the rule that
+        failed are reported - enough for the model to correct itself, and
+        nothing more.
+        """
+        details = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", ())) or "(arguments)"
+            details.append(f"{location}: {error.get('msg', 'is invalid')}")
+        return "; ".join(details) or "arguments are invalid"
+
+    def _validate_structure(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Names-and-required fallback for when Pydantic v2 is unavailable.
+
+        Derived from the signature, like the real validator - not from
+        :attr:`schema`. No types are checked on this path.
+        """
+        parameters = inspect.signature(self.func).parameters
+        known = {
+            name
+            for name, param in parameters.items()
+            if name not in ("self", "cls")
+            and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+        }
         if not self.accepts_kwargs:
-            unknown = sorted(set(arguments) - set(properties))
+            unknown = sorted(set(arguments) - known)
             if unknown:
                 raise ToolArgumentValidationError(
                     f"tool '{self.name}' got unexpected argument(s): {', '.join(unknown)}. "
-                    f"It accepts: {', '.join(sorted(properties)) or '(none)'}"
+                    f"It accepts: {', '.join(sorted(known)) or '(none)'}"
                 )
-        missing = [name for name in required if name not in arguments]
+        missing = [
+            name
+            for name in known
+            if parameters[name].default is inspect.Parameter.empty and name not in arguments
+        ]
         if missing:
             raise ToolArgumentValidationError(
-                f"tool '{self.name}' is missing required argument(s): {', '.join(missing)}"
+                f"tool '{self.name}' is missing required argument(s): {', '.join(sorted(missing))}"
             )
         return arguments
 
@@ -294,7 +439,16 @@ class Tool:
         return {**base, "enum": values}
 
     def run(self, arguments: Dict[str, Any]) -> Any:
-        """Call the wrapped function with a dict of keyword arguments.
+        """Validate a dict of arguments, then call the wrapped function.
+
+        This is the model-shaped entry point - a dict of arguments, as a tool
+        call arrives - so it validates first, unconditionally. Nothing gets
+        into the function through here without passing
+        :meth:`validate_arguments`.
+
+        :meth:`__call__` is the Python-shaped entry point (``my_tool(1, 2)``)
+        and does *not* validate: it is your own code calling your own
+        function, and Python's own argument handling applies.
 
         Async note: if the wrapped function is ``async def``, its coroutine is
         driven to completion with ``asyncio.run``. That only works when no
@@ -303,7 +457,7 @@ class Tool:
         (``await my_tool.func(**args)``), or drive the agent with
         ``Agent.arun``, which offloads the whole turn to a worker thread.
         """
-        result = self.func(**(arguments or {}))
+        result = self.func(**self.validate_arguments(arguments))
         if inspect.iscoroutine(result):
             try:
                 return asyncio.run(result)
@@ -317,6 +471,7 @@ class Tool:
         return result
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the underlying function directly, unvalidated. See :meth:`run`."""
         return self.func(*args, **kwargs)
 
     def __repr__(self) -> str:  # pragma: no cover

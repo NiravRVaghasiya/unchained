@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import pytest
 import requests
@@ -1841,12 +1841,14 @@ def test_a_broken_policy_fails_closed(policy_tools, ran):
 # --- argument validation ---------------------------------------------------
 def test_invalid_arguments_are_rejected_before_execution(policy_tools, ran):
     agent = Agent(FakeLLM([]), tools=policy_tools)
-    assert "unexpected argument" in agent._execute(
-        agent.default_session, _call("search", query="q", sneaky=1)
-    )
-    assert "missing required argument" in agent._execute(
-        agent.default_session, {"name": "search", "arguments": {}}
-    )
+    # The observation names the offending field and the rule it broke, so the
+    # model has enough to correct itself on the next turn.
+    unexpected = agent._execute(agent.default_session, _call("search", query="q", sneaky=1))
+    assert "sneaky" in unexpected and "not permitted" in unexpected
+
+    missing = agent._execute(agent.default_session, {"name": "search", "arguments": {}})
+    assert "query" in missing and "required" in missing.lower()
+
     assert "expects an object" in agent._execute(
         agent.default_session, {"name": "search", "arguments": "not-a-dict"}
     )
@@ -1893,14 +1895,19 @@ def test_validate_arguments_allows_unknown_names_for_kwargs_tools():
         flexible.validate_arguments({"anything": 1})  # 'a' is still required
 
 
-def test_argument_validation_does_not_coerce_types():
-    # Deliberate: silently turning "3" into 3 would hide real model errors.
+def test_argument_validation_normalises_types():
+    # Models routinely send "42" for an int. Validation coerces it, so the
+    # function receives what its annotation promises rather than a str.
     @tool
     def counted(n: int) -> str:
         """Takes an int."""
         return str(n)
 
-    assert counted.validate_arguments({"n": "3"}) == {"n": "3"}
+    assert counted.validate_arguments({"n": "42"}) == {"n": 42}
+    assert isinstance(counted.validate_arguments({"n": "42"})["n"], int)
+    # Coercion is not a licence to accept nonsense.
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        counted.validate_arguments({"n": "not-a-number"})
 
 
 # --- exceptions ------------------------------------------------------------
@@ -2527,3 +2534,423 @@ def test_sessions_get_distinct_ids_by_default():
     ids = {agent.session().id for _ in range(20)}
     assert len(ids) == 20
     assert agent.default_session.id == "default"
+
+
+# ---------------------------------------------------------------------------
+# Tier 8: runtime argument validation
+#
+# The gate: nothing reaches a tool function without passing
+# Tool.validate_arguments. Every test that expects a rejection also asserts the
+# function did not run - "was refused" must mean "did not execute", not merely
+# "said no".
+# ---------------------------------------------------------------------------
+class _Color(enum.Enum):
+    red = "red"
+    green = "green"
+
+
+class _Address(BaseModel):
+    street: str
+    zip: int
+
+
+class _Person(BaseModel):
+    name: str
+    address: _Address
+
+
+@pytest.fixture
+def calls_seen():
+    return []
+
+
+@pytest.fixture
+def every_type(calls_seen):
+    @tool
+    def everything(
+        s: str,
+        i: int,
+        f: float,
+        b: bool,
+        items: List[int],
+        mapping: Dict[str, int],
+        mode: Literal["fast", "slow"],
+        color: _Color,
+        person: _Person,
+        note: Optional[str] = None,
+    ) -> str:
+        """Exercise every supported annotation."""
+        calls_seen.append(
+            {
+                "s": s,
+                "i": i,
+                "f": f,
+                "b": b,
+                "items": items,
+                "mapping": mapping,
+                "mode": mode,
+                "color": color,
+                "person": person,
+                "note": note,
+            }
+        )
+        return "ok"
+
+    return everything
+
+
+VALID_ARGS = {
+    "s": "hello",
+    "i": "42",
+    "f": "1.5",
+    "b": "true",
+    "items": ["1", 2],
+    "mapping": {"k": "3"},
+    "mode": "slow",
+    "color": "green",
+    "person": {"name": "ada", "address": {"street": "main", "zip": "12345"}},
+}
+
+
+# --- valid calls, and the normalisation they get ---------------------------
+def test_valid_call_normalises_every_supported_annotation(every_type, calls_seen):
+    assert every_type.run(dict(VALID_ARGS)) == "ok"
+    got = calls_seen[0]
+
+    assert got["i"] == 42 and isinstance(got["i"], int)
+    assert got["f"] == 1.5 and isinstance(got["f"], float)
+    assert got["b"] is True
+    assert got["items"] == [1, 2] and all(isinstance(x, int) for x in got["items"])
+    assert got["mapping"] == {"k": 3}
+    assert got["mode"] == "slow"
+    assert got["color"] is _Color.green  # Enum params receive the member
+    assert isinstance(got["person"], _Person)
+    assert isinstance(got["person"].address, _Address)
+    assert got["person"].address.zip == 12345  # nested coercion, str -> int
+    assert got["note"] is None  # omitted optional falls back to the default
+
+
+def test_optional_argument_may_be_supplied_or_omitted(every_type, calls_seen):
+    every_type.run({**VALID_ARGS, "note": "hi"})
+    assert calls_seen[-1]["note"] == "hi"
+    every_type.run(dict(VALID_ARGS))
+    assert calls_seen[-1]["note"] is None
+
+
+def test_validation_is_idempotent(every_type):
+    # Agent validates once for the policy, then run() validates again. The
+    # second pass must be a no-op on already-normalised arguments.
+    once = every_type.validate_arguments(dict(VALID_ARGS))
+    twice = every_type.validate_arguments(dict(once))
+    assert once == twice
+    assert twice["color"] is _Color.green
+    assert isinstance(twice["person"], _Person)
+
+
+def test_validation_does_not_inject_absent_optional_arguments(every_type):
+    validated = every_type.validate_arguments(dict(VALID_ARGS))
+    assert "note" not in validated  # left to the function's own default
+
+
+# --- rejections ------------------------------------------------------------
+@pytest.mark.parametrize(
+    "label,bad",
+    [
+        ("missing required", {k: v for k, v in VALID_ARGS.items() if k != "i"}),
+        ("wrong scalar type", {**VALID_ARGS, "i": "not-a-number"}),
+        ("wrong bool", {**VALID_ARGS, "b": "maybe"}),
+        ("bad list item", {**VALID_ARGS, "items": ["a"]}),
+        ("list is not a list", {**VALID_ARGS, "items": "nope"}),
+        ("bad dict value", {**VALID_ARGS, "mapping": {"k": "nope"}}),
+        ("bad literal", {**VALID_ARGS, "mode": "medium"}),
+        ("bad enum", {**VALID_ARGS, "color": "purple"}),
+        (
+            "nested missing field",
+            {**VALID_ARGS, "person": {"name": "a", "address": {"street": "s"}}},
+        ),
+        (
+            "nested wrong type",
+            {**VALID_ARGS, "person": {"name": "a", "address": {"street": "s", "zip": "x"}}},
+        ),
+        ("nested not an object", {**VALID_ARGS, "person": "ada"}),
+        ("unexpected argument", {**VALID_ARGS, "sneaky": 1}),
+    ],
+)
+def test_invalid_arguments_are_rejected_and_the_function_never_runs(
+    every_type, calls_seen, label, bad
+):
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        every_type.run(dict(bad))
+    assert calls_seen == [], f"{label}: the function executed with invalid arguments"
+
+
+def test_error_messages_locate_the_offending_field(every_type):
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        every_type.run(
+            {**VALID_ARGS, "person": {"name": "a", "address": {"street": "s", "zip": "x"}}}
+        )
+    # A path the model can act on, not just "invalid arguments".
+    assert "person.address.zip" in str(excinfo.value)
+
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        every_type.run({**VALID_ARGS, "items": ["a"]})
+    assert "items.0" in str(excinfo.value)
+
+
+def test_literal_and_enum_errors_name_the_allowed_values(every_type):
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        every_type.run({**VALID_ARGS, "mode": "medium"})
+    assert "'fast'" in str(excinfo.value) and "'slow'" in str(excinfo.value)
+
+
+def test_non_dict_and_non_string_keys_are_rejected(every_type, calls_seen):
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        every_type.run(["not", "a", "dict"])
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        every_type.run({**VALID_ARGS, 7: "x"})
+    assert calls_seen == []
+
+
+# --- secrets must not leak (requirement: errors go to the model and the log)
+def test_validation_errors_never_echo_the_offending_value():
+    # pydantic's own str(ValidationError) includes input_value=..., and this
+    # text reaches the model, conversation memory and the audit log.
+    @tool
+    def authenticate(api_key: int) -> str:
+        """Mistyped on purpose so a string key fails validation."""
+        return "ok"
+
+    secret = "sk-live-DEADBEEF-do-not-log"
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        authenticate.run({"api_key": secret})
+
+    assert secret not in str(excinfo.value)
+    assert "DEADBEEF" not in str(excinfo.value)
+    # Nor reachable through the exception chain in a logged traceback.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None or secret not in str(excinfo.value.__context__)
+    # Still useful: it names the field and the rule.
+    assert "api_key" in str(excinfo.value)
+
+
+def test_nested_validation_errors_do_not_leak_nested_values():
+    @tool
+    def store(person: _Person) -> str:
+        """Store a person."""
+        return "ok"
+
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        store.run({"person": {"name": "ada", "address": {"street": "s", "zip": "555-90-1234"}}})
+    assert "555-90-1234" not in str(excinfo.value)
+    assert "person.address.zip" in str(excinfo.value)
+
+
+def test_validation_errors_do_not_expose_internal_implementation():
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        return str(n)
+
+    with pytest.raises(unchained.ToolArgumentValidationError) as excinfo:
+        counted.run({"n": "x"})
+    message = str(excinfo.value)
+    assert "pydantic" not in message.lower()
+    assert "Traceback" not in message
+    assert "unchained.py" not in message
+    assert "errors.pydantic.dev" not in message  # the docs URL is dropped too
+
+
+# --- validation is built from the signature, not the advertised schema -----
+def test_validation_does_not_trust_the_schema_shown_to_the_model():
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        return str(n)
+
+    # Corrupt the advertised schema: enforcement must be unaffected, because
+    # it is derived from the signature, not from this document.
+    counted.schema["function"]["parameters"]["properties"] = {"anything": {"type": "string"}}
+    counted.schema["function"]["parameters"]["required"] = []
+
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        counted.run({"anything": "free-for-all"})
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        counted.run({})
+    assert counted.run({"n": "5"}) == "5"
+
+
+# --- the gate is on every model-facing path --------------------------------
+def test_tool_run_validates_even_when_called_directly(calls_seen):
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        calls_seen.append(n)
+        return "ok"
+
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        counted.run({"n": "abc"})
+    assert calls_seen == []
+
+
+def test_direct_python_call_is_not_validated():
+    # __call__ is your own code calling your own function; Python's own
+    # argument handling applies. Only run(dict) is the model-shaped path.
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        return f"{n!r}"
+
+    assert counted("3") == "'3'"  # passed straight through, unvalidated
+
+
+def test_agent_rejects_invalid_arguments_and_lets_the_model_recover(calls_seen):
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        calls_seen.append(n)
+        return f"got {n}"
+
+    script = [
+        {"content": "", "tool_calls": [{"name": "counted", "arguments": {"n": "abc"}, "id": "c1"}]},
+        {"content": "", "tool_calls": [{"name": "counted", "arguments": {"n": "7"}, "id": "c2"}]},
+        {"content": "The answer is 7."},
+    ]
+    agent = Agent(MockLLM(script=script), tools=[counted])
+    assert agent.run("count") == "The answer is 7."
+
+    observations = [m["content"] for m in agent.memory.get() if m["role"] == "tool"]
+    assert "n:" in observations[0] and "integer" in observations[0]
+    assert observations[1] == "got 7"
+    assert calls_seen == [7]  # the invalid call never reached the function
+
+
+def test_policy_sees_normalised_arguments():
+    # The policy runs after validation, so an `allowed` hook or a custom
+    # policy can rely on the declared types instead of defending against
+    # whatever the model happened to send.
+    seen = {}
+
+    class Recording(unchained.ToolPolicy):
+        def authorize(self, tool_obj, arguments, context):
+            seen.update(arguments)
+
+    @tool
+    def counted(n: int) -> str:
+        """Takes an int."""
+        return "ok"
+
+    agent = Agent(FakeLLM([]), tools=[counted], policy=Recording())
+    agent._execute(agent.default_session, {"name": "counted", "arguments": {"n": "9"}, "id": "c"})
+    assert seen == {"n": 9} and isinstance(seen["n"], int)
+
+
+# --- backwards compatibility ----------------------------------------------
+def test_unannotated_parameters_stay_permissive(calls_seen):
+    # The schema advertises unannotated params as strings, but the plain
+    # function accepts anything - so validation must not tighten that.
+    @tool
+    def legacy(a, b=2):
+        """No annotations at all."""
+        calls_seen.append((a, b))
+        return "ok"
+
+    assert legacy.run({"a": 7}) == "ok"
+    assert legacy.run({"a": ["anything"], "b": None}) == "ok"
+    assert calls_seen == [(7, 2), (["anything"], None)]
+
+
+def test_kwargs_tools_still_accept_and_receive_extras(calls_seen):
+    @tool
+    def flexible(a: str, **rest: Any) -> str:
+        """Accepts extras by design."""
+        calls_seen.append((a, rest))
+        return "ok"
+
+    assert flexible.run({"a": "x", "extra": 1, "more": "two"}) == "ok"
+    assert calls_seen == [("x", {"extra": 1, "more": "two"})]
+    # A required parameter is still required.
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        flexible.run({"extra": 1})
+
+
+def test_parameter_names_that_shadow_pydantic_attributes_are_allowed(calls_seen, recwarn):
+    # A tool may reasonably take `model_name`, `json` or `schema`. Building
+    # the validator must neither fail nor warn the author about it.
+    @tool
+    def awkward(model_name: str, json: int = 0, schema: str = "s") -> str:
+        """Awkward but legal parameter names."""
+        calls_seen.append((model_name, json, schema))
+        return "ok"
+
+    assert awkward.run({"model_name": "gpt", "json": "5"}) == "ok"
+    assert calls_seen == [("gpt", 5, "s")]
+    assert not [w for w in recwarn if "shadows" in str(w.message)]
+
+
+def test_a_tool_with_an_exotic_annotation_still_builds_and_runs(calls_seen):
+    # Arbitrary types are accepted (isinstance-checked) rather than rejected
+    # at decoration time, so defining a tool never gets harder than before.
+    class Widget:
+        pass
+
+    @tool
+    def uses_widget(w: Widget) -> str:
+        """Takes a custom class."""
+        calls_seen.append(w)
+        return "ok"
+
+    widget = Widget()
+    assert uses_widget.run({"w": widget}) == "ok"
+    assert calls_seen == [widget]
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        uses_widget.run({"w": "not a widget"})
+
+
+def test_structural_fallback_still_checks_names_and_required_arguments():
+    # The path taken when Pydantic v2 is unavailable. Derived from the
+    # signature, like the real validator - never from the advertised schema.
+    @tool
+    def sample(a: str, b: int = 2) -> str:
+        """Sample."""
+        return a
+
+    sample._validator = None  # simulate "no Pydantic v2"
+    assert sample.validate_arguments({"a": "x"}) == {"a": "x"}
+    assert sample.validate_arguments({"a": "x", "b": "3"}) == {"a": "x", "b": "3"}  # no coercion
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments({"b": 1})  # missing required
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        sample.validate_arguments({"a": "x", "nope": 1})  # unknown name
+
+
+def test_async_tools_are_validated_too(calls_seen):
+    @tool
+    async def fetch(n: int) -> str:
+        """Async tool."""
+        calls_seen.append(n)
+        return f"got {n}"
+
+    assert fetch.run({"n": "3"}) == "got 3"
+    assert calls_seen == [3]
+    with pytest.raises(unchained.ToolArgumentValidationError):
+        fetch.run({"n": "abc"})
+    assert calls_seen == [3]  # unchanged: the coroutine was never created
+
+
+def test_schema_generation_is_unchanged_by_validation(every_type):
+    # Validation is a separate concern from the document shown to the model.
+    parameters = every_type.schema["function"]["parameters"]
+    assert parameters["properties"]["i"] == {"type": "integer"}
+    assert parameters["properties"]["items"] == {"type": "array", "items": {"type": "integer"}}
+    assert parameters["properties"]["mode"] == {"type": "string", "enum": ["fast", "slow"]}
+    assert set(parameters["required"]) == {
+        "s",
+        "i",
+        "f",
+        "b",
+        "items",
+        "mapping",
+        "mode",
+        "color",
+        "person",
+    }
