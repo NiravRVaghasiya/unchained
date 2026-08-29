@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Untrusted text is now structurally separated from instructions.**
+  Retrieved documents and tool results were inserted into the conversation
+  verbatim, with nothing marking them as data. Both are now fenced with a
+  random per-agent marker, and any occurrence of that marker is stripped from
+  the text, so content cannot close its own block and continue at instruction
+  level.
+- **The conversation summary reached the system prompt unfenced.** Summaries
+  are written by the model from earlier turns - which include tool results
+  and retrieved documents - and spliced into the *system* message, the
+  highest-trust slot there is. That was a path from a tool result straight
+  into the instructions. It is fenced now.
+- **Retrieved documents are no longer spliced into the user's turn.** They
+  are stored beside it and rendered at send time, so memory records what the
+  user actually said, a document can no longer forge the `Question:` boundary
+  the old wrapper used, and a conversation reloaded from disk never carries a
+  dead agent's markers.
+- **The retrieval framing is descriptive rather than imperative.** It said
+  "Use the following context to answer", which tells the model to act on
+  whatever the corpus contains.
+- The system prompt now states the data boundary when a run can contain
+  untrusted content. This is **one layer and the weakest**: prompt injection
+  is not solved by a system prompt, and SECURITY.md says so. The boundary
+  that holds is in Python - `permissions` are a frozenset fixed at
+  decoration, and `ToolPolicy` never sees retrieved or returned text.
+- SECURITY.md gains a trust ladder for the five sources of text, what is
+  enforced structurally, and what is explicitly not defended against.
+
 ### Fixed
 - **RAG silently mis-scored mismatched embeddings.** A vector of the wrong
   width was zipped against a longer one and compared on the overlap, so a

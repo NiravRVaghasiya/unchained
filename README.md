@@ -421,6 +421,40 @@ tool succeeded, and a shortened result is still useful.
 > [`examples/coder.py`](examples/coder.py) and
 > [Tool authorization](#-tool-authorization--a-policy-layer-not-a-prompt).
 
+### 🧱 Trust boundaries — retrieved and returned text is data
+
+A retrieved document and a tool result are **not** instructions. Both are
+fenced with a random per-agent marker before they reach a provider, and any
+occurrence of that marker is stripped from the text, so the content cannot
+close its own block:
+
+```
+<<document-9f2a1c4b7e8d0a35>>
+[score=0.87]
+...retrieved text...
+<</document-9f2a1c4b7e8d0a35>>
+
+what is my balance?
+```
+
+The conversation summary is fenced too — it is written by the model from
+earlier turns and spliced into the *system* message, so unfenced it is a path
+from a tool result into your instructions.
+
+Retrieved documents are stored beside the user's turn rather than spliced
+into it, so `session.memory` records what the user actually said.
+
+> **This does not solve prompt injection, and no system prompt does.** A
+> persuasive document may still talk a model into something you did not want.
+> Fencing means the model is *told* where the boundary is and the data cannot
+> *move* it. The boundary that holds is in Python: `permissions` are a
+> frozenset fixed at decoration, `ToolPolicy` sees the tool, the arguments and
+> a context built from your code — never from retrieved or returned text — and
+> approval is your callback. Assume the model will eventually request the
+> wrong tool, and make the policy refuse it.
+>
+> See [SECURITY.md](SECURITY.md) for the full trust ladder and its limits.
+
 ### 👥 Sessions — one agent, many conversations
 
 An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the

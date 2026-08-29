@@ -26,6 +26,86 @@ remediation progress.
 - Treat all model output as untrusted when feeding it into tools, shells, or
   file operations.
 
+## Trust boundaries
+
+Unchained distinguishes five sources of text, and they are not equal:
+
+| Level | Source | Trusted for instructions? |
+|---|---|---|
+| 1 | **System prompt** — your `system_prompt` | yes; it is your code |
+| 2 | **Application config** — tools, policy, budgets, agent descriptions | yes; it is your code |
+| 3 | **User input** — the person you are serving | as a *request*, never as configuration |
+| 4 | **Retrieved documents** and **tool results** | **no — data only** |
+| 5 | **Model output** — including the memory summary | **no — data only** |
+
+Levels 4 and 5 are the ones that bite. A document in your corpus may have
+been written by anyone who can add to it; a tool result may come from a
+system that is itself relaying attacker-controlled text; and a summary is
+generated *from* those things.
+
+**Structurally**, untrusted text is fenced before it reaches a provider:
+
+```
+<<document-9f2a1c4b7e8d0a35>>
+[score=0.87]
+...retrieved text...
+<</document-9f2a1c4b7e8d0a35>>
+```
+
+The marker carries a random per-agent value, and any occurrence of it is
+stripped from the text being fenced — so a document cannot close its own
+block and continue at instruction level. Tool results and the memory summary
+are fenced the same way. The summary matters especially: it is spliced into
+the **system** message, so unfenced it is a path from a tool result straight
+into your instructions.
+
+Documents are stored *beside* the user's turn rather than spliced into it, so
+memory records what the user actually said, and fencing happens per-send with
+the current agent's marker — a conversation reloaded from disk never carries
+a dead agent's markers.
+
+The system prompt also states the boundary. **That is the weakest layer, and
+it is not a solution.**
+
+### What this does not do
+
+**Prompt injection is not solved here, and no system prompt solves it.** A
+sufficiently persuasive document may still talk a model into saying something
+you did not want. What the fencing buys is that the model is *told* where the
+boundary is, and that the boundary is one the data cannot move.
+
+Two limits worth stating:
+
+- The marker is per agent, not per run, so it appears in every prompt for
+  that agent's life. An attacker who can both observe a response echoing the
+  marker *and then* plant new content could forge a block. Rotating per run
+  would close this and make the system prompt uncacheable.
+- Fencing constrains *structure*, not persuasion. A document that simply
+  argues convincingly is unaffected by any delimiter.
+
+**So the boundary that actually holds is in Python.** A forged fence does not
+widen what any tool may do:
+
+- Tool `permissions` are a `frozenset` fixed at decoration time. Nothing at
+  runtime reads content to decide them.
+- `ToolPolicy` receives the tool, the validated arguments, and a context
+  built from the agent, the session and the call — never from retrieved or
+  returned text. Session `metadata` comes from your `agent.session(...)` call.
+- Approval is an application callback, unreachable from model output.
+- Every model-requested call takes one path, `Agent._execute`, which
+  authorizes before it executes.
+
+Assume the model *will* eventually be talked into requesting the wrong tool,
+and make sure the policy refuses it. That is the design.
+
+### A tool is code; its output is data
+
+Installing a tool is trusting code — it runs in-process with everything your
+process can reach. Nothing here sandboxes a hostile tool, and a malicious
+tool could reach into the framework directly. The boundary described above is
+about *content*: what a tool **returns**, and what a retriever **finds**, is
+never trusted. Choose your tools the way you choose dependencies.
+
 ## Boundaries enforced in code
 
 Unchained enforces these in Python, not by asking the model to behave. They
