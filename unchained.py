@@ -97,6 +97,7 @@ __all__ = [
     "ToolApprovalRequired",
     "ToolArgumentValidationError",
     "ToolTimeoutError",
+    "ToolOutputTruncated",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
@@ -138,6 +139,50 @@ class ToolApprovalRequired(RuntimeError):
 
 class ToolArgumentValidationError(RuntimeError):
     """Raised when model-supplied arguments do not fit the tool's signature."""
+
+
+class ToolOutputTruncated:
+    """Records that a tool result was shortened before the model saw it.
+
+    Deliberately **not** an exception: the tool succeeded, and the shortened
+    result is still useful. It carries what was cut, so an application can log
+    or alert on it, and renders as the note appended to the text the model
+    reads - which is what stops the shortening from being silent.
+    """
+
+    def __init__(self, tool: str, original_size: int, limit: int, was_json: bool = False):
+        self.tool = tool
+        self.original_size = original_size
+        self.limit = limit
+        self.was_json = was_json
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """A plain, JSON-serialisable record - safe for logs and memory extras."""
+        return {
+            "tool": self.tool,
+            "truncated": True,
+            "original_size": self.original_size,
+            "limit": self.limit,
+            "was_json": self.was_json,
+        }
+
+    def __str__(self) -> str:
+        note = (
+            f"\n\n[output truncated: {self.limit:,} of {self.original_size:,} characters "
+            f"shown for tool '{self.tool}']"
+        )
+        if self.was_json:
+            # Say so explicitly. A model handed a JSON fragment will otherwise
+            # try to parse it, and a cut structure is not recoverable.
+            note += (
+                " The full result was valid JSON; this fragment is cut mid-structure "
+                "and will not parse."
+            )
+        return note
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ToolOutputTruncated {self.tool} {self.limit}/{self.original_size}>"
 
 
 class ToolTimeoutError(RuntimeError):
@@ -230,6 +275,9 @@ class Tool:
       giving up on it. Overrides ``Agent(tool_timeout=...)``. Enforced by the
       agent, like the policy - :meth:`run` does not apply it, because a
       direct call is your own code calling your own function.
+    * ``max_output_size`` - characters of result the agent will pass on to
+      the model. Overrides ``Agent(max_tool_output_size=...)``. Also enforced
+      by the agent, for the same reason.
 
     None of this is sent to the model. Metadata describes the tool to your
     policy; it is not a hint the model can read, argue with, or override.
@@ -255,6 +303,7 @@ class Tool:
         side_effects: bool = False,
         allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
         timeout: Optional[float] = None,
+        max_output_size: Optional[int] = None,
     ):
         self.func = func
         self.name = func.__name__
@@ -267,6 +316,7 @@ class Tool:
         self.side_effects = side_effects
         self.allowed = allowed
         self.timeout = timeout
+        self.max_output_size = max_output_size
         self.accepts_kwargs = any(
             param.kind is inspect.Parameter.VAR_KEYWORD
             for param in inspect.signature(func).parameters.values()
@@ -543,6 +593,7 @@ def tool(
     side_effects: bool = ...,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = ...,
     timeout: Optional[float] = ...,
+    max_output_size: Optional[int] = ...,
 ) -> Callable[[Callable[..., Any]], Tool]: ...
 
 
@@ -554,6 +605,7 @@ def tool(
     side_effects: bool = False,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
     timeout: Optional[float] = None,
+    max_output_size: Optional[int] = None,
 ) -> Any:
     """Decorator: turn any function into a Tool with an auto-generated schema.
 
@@ -568,9 +620,9 @@ def tool(
         def delete_record(record_id: str) -> str:
             "Destructive: gated by policy, and confirmed per call."
 
-        @tool(timeout=10)
+        @tool(timeout=10, max_output_size=8_000)
         def fetch_data(url: str) -> str:
-            "The agent waits 10s, then gives up on it."
+            "Waited on for 10s, and trimmed to 8k characters."
     """
 
     def wrap(target: Callable[..., Any]) -> Tool:
@@ -581,6 +633,7 @@ def tool(
             side_effects=side_effects,
             allowed=allowed,
             timeout=timeout,
+            max_output_size=max_output_size,
         )
 
     return wrap(func) if func is not None else wrap
@@ -1705,6 +1758,7 @@ class Agent:
         approve: Optional[Callable[[Dict[str, Any]], bool]] = None,
         memory_factory: Optional[Callable[[], Memory]] = None,
         tool_timeout: Optional[float] = None,
+        max_tool_output_size: Optional[int] = None,
     ):
         """``memory`` and ``memory_factory`` differ, and the difference matters.
 
@@ -1749,6 +1803,9 @@ class Agent:
         # Seconds to wait for any tool that does not set its own timeout.
         # None means wait forever, which is the old behaviour.
         self.tool_timeout = tool_timeout
+        # Characters of tool output to pass on, for tools that do not set
+        # their own. None means unbounded, which is the old behaviour.
+        self.max_tool_output_size = max_tool_output_size
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
         # dialog must not be re-entered from several workers at once. This
         # stays on the Agent on purpose: it guards the application's single
@@ -2089,12 +2146,78 @@ class Agent:
             return f"Error: tool '{name}' was not authorized (policy error)."
         self._audit(session, name, arguments, decision, "", tool_obj)
         try:
-            return str(self._invoke(tool_obj, arguments))
+            output = str(self._invoke(tool_obj, arguments))
         except ToolTimeoutError as exc:
             logger.warning("%s", exc)
             return f"Error: {exc}"
         except Exception as exc:  # a tool must never crash the loop
-            return f"Error executing '{name}': {exc}"
+            # Bounded too: an exception message can be as large as a result.
+            output = f"Error executing '{name}': {exc}"
+        return self._bound_output(tool_obj, output)
+
+    def _output_limit_for(self, tool_obj: Tool) -> Optional[int]:
+        """Characters of output to keep: the tool's own setting, else the agent's."""
+        if tool_obj.max_output_size is not None:
+            return tool_obj.max_output_size
+        return self.max_tool_output_size
+
+    def _bound_output(self, tool_obj: Tool, text: str) -> str:
+        """Shorten a tool result to its budget, before it reaches the context.
+
+        This runs inside :meth:`_execute`, so the bound is applied before the
+        observation is added to memory, sent to a provider, or shown to a
+        callback - there is no path where the full text reaches the model.
+
+        The budget counts **characters, not bytes**. Python strings are
+        sequences of code points, so slicing can never split one and produce
+        invalid text; a multi-character emoji sequence can be split, which is
+        cosmetic. Characters also compose with ``Memory(max_tokens=...)``,
+        which estimates tokens the same way.
+
+        Nothing is shortened silently. An oversized result keeps its first
+        ``limit`` characters and gains a :class:`ToolOutputTruncated` note
+        saying how much was dropped - and, when the full result was valid
+        JSON, saying that the fragment is cut mid-structure and will not
+        parse, since a model handed a JSON fragment will otherwise try. The
+        note is appended on top of the budget rather than counted inside it,
+        so ``max_output_size`` bounds the tool's own text.
+
+        This is a **context and cost boundary, not a security control**. It
+        limits what a tool sends onward; it does not stop a tool reading or
+        computing anything, and a secret inside the retained prefix is
+        retained. Do not use it to contain a hostile tool.
+        """
+        limit = self._output_limit_for(tool_obj)
+        if limit is None or len(text) <= limit:
+            return text
+        indicator = ToolOutputTruncated(
+            tool=tool_obj.name,
+            original_size=len(text),
+            limit=limit,
+            was_json=self._looks_like_json(text),
+        )
+        logger.warning(
+            "tool %s: output truncated to %d of %d characters",
+            tool_obj.name,
+            limit,
+            indicator.original_size,
+        )
+        return text[:limit] + str(indicator)
+
+    @staticmethod
+    def _looks_like_json(text: str) -> bool:
+        """Whether the untruncated text parsed as JSON.
+
+        Only asked on the truncation path, and only for text that opens like
+        JSON, so a large result is not parsed for nothing.
+        """
+        if text[:512].lstrip()[:1] not in ("{", "["):
+            return False
+        try:
+            json.loads(text)
+        except (ValueError, RecursionError):
+            return False
+        return True
 
     def _timeout_for(self, tool_obj: Tool) -> Optional[float]:
         """Seconds to wait for this tool: its own setting, else the agent's."""

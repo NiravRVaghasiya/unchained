@@ -7,6 +7,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Tool output limits.** A tool could return megabytes straight into the
+  transcript - overflowing the context window, costing money on every
+  subsequent turn, and growing memory. `@tool(max_output_size=8_000)` bounds
+  one tool and `Agent(max_tool_output_size=20_000)` all of them, with the
+  tool's own setting taking precedence. `None` still means unbounded, so
+  existing agents are unchanged.
+  - Applied inside `Agent._execute`, before the result reaches memory, a
+    provider or a callback - there is no path where the full text gets
+    through. An oversized exception message is bounded the same way.
+  - **Nothing is truncated silently**: an oversized result carries a note
+    stating how much was dropped.
+  - **JSON is never silently corrupted**: if the full result was valid JSON,
+    the note says so and warns that the fragment will not parse, because a
+    model handed JSON will otherwise try. Structured output that fits is
+    passed through byte-for-byte.
+  - The budget counts **characters, not bytes**, so a slice can never split a
+    code point and produce invalid text, and it lines up with
+    `Memory(max_tokens=...)`, which estimates tokens the same way.
+  - New `ToolOutputTruncated`, carrying `.metadata` as a plain JSON-safe dict.
+    It is not an exception - the tool succeeded and a shortened result is
+    still useful.
+  - This is a context and cost boundary, **not a security sandbox**: it limits
+    what a tool sends onward, not what it can read or do. Documented in the
+    README and SECURITY.md.
 - **Tool execution timeouts.** LLM calls had a timeout; an arbitrary Python
   tool could block the agent forever. `@tool(timeout=10)` sets a budget for
   one tool and `Agent(tool_timeout=30)` a default for all of them, with the

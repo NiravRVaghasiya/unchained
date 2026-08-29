@@ -3798,3 +3798,280 @@ def test_timeout_is_carried_by_the_decorator_and_defaults_to_none():
 
     assert timed.timeout == 2.5
     assert untimed.timeout is None
+
+
+# ---------------------------------------------------------------------------
+# Tier 12: tool output governance
+#
+# The boundary: no tool result reaches memory, a provider or a callback larger
+# than its budget. Nothing is shortened silently - an oversized result always
+# carries a note saying so, and says explicitly when the fragment is cut JSON.
+# ---------------------------------------------------------------------------
+_TRUNCATION_NOTE = "[output truncated:"
+
+
+def _body(observation):
+    """The retained text, without the truncation note."""
+    return observation.split(_TRUNCATION_NOTE)[0].rstrip("\n")
+
+
+@pytest.fixture
+def output_tools():
+    @tool(max_output_size=100)
+    def sized(n: int = 10) -> str:
+        """Returns n characters."""
+        return "x" * n
+
+    @tool(max_output_size=80)
+    def records(n: int = 2) -> str:
+        """Returns a JSON array of n records."""
+        return json.dumps([{"id": i, "name": f"user{i}"} for i in range(n)])
+
+    @tool(max_output_size=40)
+    def unicode_text(n: int = 5) -> str:
+        """Returns emoji, combining marks and CJK."""
+        return "👨‍👩‍👧‍👦漢字naïve" * n
+
+    @tool
+    def unbounded(n: int = 10) -> str:
+        """Has no budget of its own."""
+        return "y" * n
+
+    @tool(max_output_size=50)
+    def explodes() -> str:
+        """Raises with an enormous message."""
+        raise ValueError("E" * 10_000)
+
+    return {
+        "sized": sized,
+        "records": records,
+        "unicode_text": unicode_text,
+        "unbounded": unbounded,
+        "explodes": explodes,
+    }
+
+
+@pytest.fixture
+def output_agent(output_tools):
+    return Agent(FakeLLM([]), tools=list(output_tools.values()))
+
+
+def _observe(agent, name, **arguments):
+    return agent._execute(
+        agent.default_session, {"name": name, "arguments": arguments, "id": f"c-{name}"}
+    )
+
+
+# --- normal output ---------------------------------------------------------
+def test_output_within_budget_passes_through_untouched(output_agent):
+    assert _observe(output_agent, "sized", n=10) == "x" * 10
+    assert _TRUNCATION_NOTE not in _observe(output_agent, "sized", n=100)  # exactly at budget
+
+
+def test_output_exactly_at_the_budget_is_not_truncated(output_agent):
+    observation = _observe(output_agent, "sized", n=100)
+    assert observation == "x" * 100
+
+
+# --- huge output -----------------------------------------------------------
+def test_huge_output_is_cut_to_the_budget(output_agent):
+    observation = _observe(output_agent, "sized", n=500_000)
+    assert _body(observation) == "x" * 100
+    assert _TRUNCATION_NOTE in observation
+    assert len(observation) < 400  # the note is small and bounded
+
+
+def test_the_note_reports_what_was_dropped(output_agent):
+    observation = _observe(output_agent, "sized", n=250_000)
+    assert "100 of 250,000 characters" in observation
+    assert "'sized'" in observation
+
+
+def test_nothing_is_truncated_silently(output_agent):
+    # Every shortened result carries the note; that is what makes it visible
+    # to the model rather than a quiet loss of data.
+    for size in (101, 1_000, 100_000):
+        assert _TRUNCATION_NOTE in _observe(output_agent, "sized", n=size)
+
+
+# --- structured output -----------------------------------------------------
+def test_structured_output_that_fits_is_preserved_exactly(output_agent):
+    observation = _observe(output_agent, "records", n=1)
+    assert json.loads(observation) == [{"id": 0, "name": "user0"}]
+
+
+def test_truncated_json_is_flagged_as_unparseable(output_agent):
+    # Never silently corrupt JSON: the fragment cannot parse, and the note
+    # says so, because a model handed JSON will otherwise try.
+    observation = _observe(output_agent, "records", n=50)
+    assert "was valid JSON" in observation
+    assert "will not parse" in observation
+    with pytest.raises(ValueError):
+        json.loads(_body(observation))
+
+
+def test_non_json_output_is_not_labelled_as_json(output_agent):
+    observation = _observe(output_agent, "sized", n=5_000)
+    assert _TRUNCATION_NOTE in observation
+    assert "was valid JSON" not in observation
+
+
+def test_text_that_merely_starts_like_json_is_not_labelled_as_json():
+    @tool(max_output_size=20)
+    def almost() -> str:
+        """Opens with a brace but is not JSON."""
+        return "{this is not json at all, just prose in braces} " * 20
+
+    agent = Agent(FakeLLM([]), tools=[almost])
+    observation = _observe(agent, "almost")
+    assert _TRUNCATION_NOTE in observation
+    assert "was valid JSON" not in observation
+
+
+# --- Unicode ---------------------------------------------------------------
+def test_unicode_truncation_never_produces_invalid_text(output_agent):
+    observation = _observe(output_agent, "unicode_text", n=40)
+    body = _body(observation)
+    # Budget counts characters (code points), so a slice is always valid text.
+    assert len(body) == 40
+    assert body.encode("utf-8").decode("utf-8") == body
+    assert body == ("👨‍👩‍👧‍👦漢字naïve" * 40)[:40]
+
+
+def test_unicode_output_within_budget_is_untouched(output_agent):
+    observation = _observe(output_agent, "unicode_text", n=1)
+    assert observation == "👨‍👩‍👧‍👦漢字naïve"
+    assert _TRUNCATION_NOTE not in observation
+
+
+def test_budget_counts_characters_not_bytes(output_agent):
+    # 40 CJK characters are 120 UTF-8 bytes; a byte budget would cut at 13.
+    observation = _observe(output_agent, "unicode_text", n=40)
+    body = _body(observation)
+    assert len(body) == 40
+    assert len(body.encode("utf-8")) > 40
+
+
+# --- resolution ------------------------------------------------------------
+def test_agent_default_applies_to_a_tool_without_its_own(output_tools):
+    agent = Agent(FakeLLM([]), tools=list(output_tools.values()), max_tool_output_size=25)
+    observation = _observe(agent, "unbounded", n=5_000)
+    assert _body(observation) == "y" * 25
+
+
+def test_tool_budget_overrides_the_agent_default(output_tools):
+    agent = Agent(FakeLLM([]), tools=list(output_tools.values()), max_tool_output_size=25)
+    assert agent._output_limit_for(output_tools["sized"]) == 100  # tool wins
+    assert agent._output_limit_for(output_tools["unbounded"]) == 25  # agent default
+
+
+def test_no_budget_anywhere_leaves_output_unbounded(output_tools):
+    agent = Agent(FakeLLM([]), tools=list(output_tools.values()))
+    assert agent.max_tool_output_size is None
+    assert agent._output_limit_for(output_tools["unbounded"]) is None
+    observation = _observe(agent, "unbounded", n=50_000)
+    assert len(observation) == 50_000
+    assert _TRUNCATION_NOTE not in observation
+
+
+def test_a_zero_budget_is_honoured_rather_than_treated_as_absent(output_tools):
+    agent = Agent(FakeLLM([]), tools=list(output_tools.values()), max_tool_output_size=0)
+    observation = _observe(agent, "unbounded", n=100)
+    assert _body(observation) == ""
+    assert _TRUNCATION_NOTE in observation
+
+
+# --- multiple tools --------------------------------------------------------
+def test_multiple_tools_in_one_turn_keep_their_own_budgets(output_agent):
+    calls = [
+        {"name": "sized", "arguments": {"n": 5_000}, "id": "c0"},
+        {"name": "unicode_text", "arguments": {"n": 40}, "id": "c1"},
+        {"name": "records", "arguments": {"n": 1}, "id": "c2"},
+        {"name": "unbounded", "arguments": {"n": 3_000}, "id": "c3"},
+    ]
+    session = output_agent.default_session
+    output_agent._execute_calls(session, calls)
+    observations = [m["content"] for m in session.memory.get() if m["role"] == "tool"]
+
+    assert len(_body(observations[0])) == 100  # its own budget
+    assert len(_body(observations[1])) == 40  # its own budget
+    assert json.loads(observations[2]) == [{"id": 0, "name": "user0"}]  # fitted, untouched
+    assert len(observations[3]) == 3_000  # no budget, untouched
+    assert observations[0].startswith("x") and observations[3].startswith("y")  # order kept
+
+
+# --- the boundary is applied before the context ----------------------------
+def test_truncation_happens_before_the_result_enters_memory(output_agent):
+    session = output_agent.default_session
+    output_agent._execute_calls(
+        session, [{"name": "sized", "arguments": {"n": 200_000}, "id": "c0"}]
+    )
+    stored = [m["content"] for m in session.memory.get() if m["role"] == "tool"][0]
+    assert len(stored) < 400  # the 200k characters never reached the transcript
+
+
+def test_callbacks_see_the_truncated_result_too(output_agent):
+    seen = []
+
+    class Recorder(unchained.Callback):
+        def on_tool_call(self, name, arguments, result):
+            seen.append(result)
+
+    output_agent.callbacks.append(Recorder())
+    output_agent._execute_calls(
+        output_agent.default_session,
+        [{"name": "sized", "arguments": {"n": 100_000}, "id": "c0"}],
+    )
+    assert len(seen[0]) < 400
+
+
+def test_a_huge_exception_message_is_bounded_as_well(output_agent):
+    # An exception message can be as large as a result, and reaches the model
+    # by the same path.
+    observation = _observe(output_agent, "explodes")
+    assert _TRUNCATION_NOTE in observation
+    assert len(observation) < 400
+
+
+# --- the indicator ---------------------------------------------------------
+def test_tool_output_truncated_carries_serialisable_metadata():
+    indicator = unchained.ToolOutputTruncated(
+        tool="fetch", original_size=1_250_000, limit=4_000, was_json=True
+    )
+    assert indicator.metadata == {
+        "tool": "fetch",
+        "truncated": True,
+        "original_size": 1_250_000,
+        "limit": 4_000,
+        "was_json": True,
+    }
+    json.dumps(indicator.metadata)  # safe for logs and SQLiteMemory extras
+    assert "4,000 of 1,250,000" in str(indicator)
+    assert "will not parse" in str(indicator)
+
+
+def test_tool_output_truncated_is_exported_and_is_not_an_exception():
+    # The tool succeeded; the shortened result is still useful. Raising would
+    # discard a perfectly good partial answer.
+    assert "ToolOutputTruncated" in unchained.__all__
+    assert not issubclass(unchained.ToolOutputTruncated, BaseException)
+
+
+def test_budget_is_carried_by_the_decorator_and_defaults_to_none():
+    @tool(max_output_size=1234)
+    def bounded() -> str:
+        """Bounded."""
+        return "ok"
+
+    @tool
+    def plain() -> str:
+        """Plain."""
+        return "ok"
+
+    assert bounded.max_output_size == 1234
+    assert plain.max_output_size is None
+
+
+def test_tool_run_does_not_apply_the_budget(output_tools):
+    # Like the policy and the timeout, this is an agent-level control.
+    assert len(output_tools["sized"].run({"n": 5_000})) == 5_000

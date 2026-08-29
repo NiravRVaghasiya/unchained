@@ -239,6 +239,62 @@ thread, and Unchained does not pretend otherwise:
 Concurrent calls each get their own budget, so one hanging tool does not delay
 its siblings or the turn.
 
+### 📏 Tool output limits — bounding what reaches the context
+
+A tool can return megabytes. That overflows the context window, costs money
+every turn it stays in the transcript, and grows memory. Give a tool a budget,
+or set a default:
+
+```python
+@tool(max_output_size=8_000)
+def read_log(path: str) -> str:
+    """At most 8,000 characters reach the model."""
+
+
+agent = Agent(llm, tools=[read_log], max_tool_output_size=20_000)
+```
+
+A tool's own `max_output_size` wins over the agent's default; `None` (the
+default) means unbounded, exactly as before. The budget is applied inside
+`Agent._execute`, **before** the result enters memory, reaches a provider, or
+is shown to a callback — there is no path where the full text gets through.
+
+**Nothing is truncated silently.** An oversized result keeps its first `n`
+characters and gains a note:
+
+```
+[output truncated: 8,000 of 1,250,000 characters shown for tool 'read_log']
+```
+
+**JSON is never silently corrupted.** If the full result was valid JSON, the
+note says so and warns that the fragment will not parse — because a model
+handed JSON will otherwise try:
+
+```
+... The full result was valid JSON; this fragment is cut mid-structure and
+will not parse.
+```
+
+Structured output that *fits* is passed through byte-for-byte, so a JSON tool
+under its budget still returns parseable JSON.
+
+The budget counts **characters, not bytes**. Python strings are sequences of
+code points, so a slice can never split one and produce invalid text — 40 CJK
+characters cost 40, not the 120 bytes they occupy. A multi-character emoji
+sequence can be split, which is cosmetic. Characters also line up with
+`Memory(max_tokens=...)`, which estimates tokens the same way.
+
+`ToolOutputTruncated` carries the details (`.metadata` is a plain, JSON-safe
+dict) if you want to log or alert on truncation. It is not an exception — the
+tool succeeded, and a shortened result is still useful.
+
+> **This is a context and cost boundary, not a security sandbox.** It limits
+> what a tool *sends onward*; it does not stop a tool reading, computing or
+> transmitting anything, and a secret inside the retained prefix is retained.
+> To contain a hostile tool you need process isolation and a policy — see
+> [`examples/coder.py`](examples/coder.py) and
+> [Tool authorization](#-tool-authorization--a-policy-layer-not-a-prompt).
+
 ### 👥 Sessions — one agent, many conversations
 
 An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the

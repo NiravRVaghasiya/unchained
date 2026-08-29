@@ -169,6 +169,15 @@ Known non-boundaries, by design:
 - **A tool timeout does not abort network I/O.** HTTP tools must still set
   their own timeout (`requests.get(url, timeout=20)`); otherwise the request
   outlives the timeout and holds a connection.
+- **Tool output limits are a context and cost boundary, not a sandbox.**
+  `@tool(max_output_size=...)` and `Agent(max_tool_output_size=...)` bound
+  what a tool *sends onward* into the transcript. They do not stop a tool
+  reading a file, querying a database, or transmitting data itself, and a
+  secret that falls inside the retained prefix is still retained and still
+  reaches the model. They reduce accidental bulk propagation of sensitive
+  data; they are not a defence against a tool that means harm. For that you
+  need a `ToolPolicy` to decide whether the tool runs at all, and OS-level
+  isolation for what it does when it does.
 - **Tool error text is fed back to the model and stored in memory.** If a tool
   raises an exception whose message contains a secret, that secret enters the
   transcript. Catch and sanitise inside tools that handle credentials.
