@@ -3540,3 +3540,261 @@ def test_run_all_and_synthesize_are_unaffected_by_routing_failures():
     router = Router(FakeLLM([]), agents=agents, synthesizer=synth)
     assert router.run_all("q") == {"cost": "A", "fit": "B"}
     assert router.synthesize("q") == "FINAL"
+
+
+# ---------------------------------------------------------------------------
+# Tier 11: tool execution timeouts
+#
+# The blocking tools here are gated on a threading.Event rather than a sleep,
+# so the tests are deterministic rather than timing-sensitive. Every fixture
+# releases its gate on teardown: a tool left blocked would keep a non-daemon
+# executor thread alive and stall interpreter exit, which is precisely the
+# limitation these tests document.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def gate():
+    """An event that blocking tools wait on, always released afterwards."""
+    event = threading.Event()
+    try:
+        yield event
+    finally:
+        event.set()
+
+
+@pytest.fixture
+def blocking_tools(gate):
+    """A tool that blocks until the gate opens, in bounded and unbounded form."""
+    started = threading.Event()
+    completed = []
+
+    @tool(timeout=0.2)
+    def bounded(tag: str = "x") -> str:
+        """Blocks until released; the agent waits 0.2s."""
+        started.set()
+        gate.wait(timeout=10)
+        completed.append(tag)
+        return f"bounded finished {tag}"
+
+    @tool
+    def unbounded(tag: str = "x") -> str:
+        """Blocks until released; has no timeout of its own."""
+        started.set()
+        gate.wait(timeout=10)
+        completed.append(tag)
+        return f"unbounded finished {tag}"
+
+    @tool(timeout=5)
+    def quick(tag: str = "x") -> str:
+        """Returns immediately, well inside its timeout."""
+        completed.append(tag)
+        return f"quick finished {tag}"
+
+    return {
+        "bounded": bounded,
+        "unbounded": unbounded,
+        "quick": quick,
+        "started": started,
+        "completed": completed,
+    }
+
+
+def _tool_call(name, **arguments):
+    return {"name": name, "arguments": arguments, "id": f"call-{name}"}
+
+
+# --- the timeout bounds the agent's wait -----------------------------------
+def test_a_tool_that_overruns_its_timeout_is_reported_not_awaited(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
+    started = time.perf_counter()
+    observation = agent._execute(agent.default_session, _tool_call("bounded"))
+    elapsed = time.perf_counter() - started
+
+    assert "did not finish within 0.2s" in observation
+    assert elapsed < 3, f"the agent waited {elapsed:.1f}s instead of giving up"
+    assert blocking_tools["started"].is_set()  # it really did start
+
+
+def test_a_tool_inside_its_timeout_returns_normally(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
+    assert agent._execute(agent.default_session, _tool_call("quick")) == "quick finished x"
+
+
+def test_timeout_errors_reach_the_model_as_an_observation(blocking_tools):
+    # Requirement: a timeout is a tool error the model can react to, not an
+    # exception that ends the run.
+    script = [
+        {"content": "", "tool_calls": [{"name": "bounded", "arguments": {}, "id": "c1"}]},
+        {"content": "That timed out, so here is a plain answer."},
+    ]
+    agent = Agent(MockLLM(script=script), tools=[blocking_tools["bounded"]])
+    started = time.perf_counter()
+    answer = agent.run("go")
+    elapsed = time.perf_counter() - started
+
+    assert answer == "That timed out, so here is a plain answer."
+    assert elapsed < 3
+    observations = [m["content"] for m in agent.memory.get() if m["role"] == "tool"]
+    assert "did not finish" in observations[0]
+
+
+# --- resolution: tool level overrides agent level --------------------------
+def test_agent_level_default_applies_to_a_tool_without_its_own(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["unbounded"]], tool_timeout=0.2)
+    started = time.perf_counter()
+    observation = agent._execute(agent.default_session, _tool_call("unbounded"))
+
+    assert "did not finish within 0.2s" in observation
+    assert time.perf_counter() - started < 3
+
+
+def test_tool_level_timeout_overrides_the_agent_default(blocking_tools):
+    agent = Agent(
+        FakeLLM([]),
+        tools=[blocking_tools["bounded"], blocking_tools["unbounded"]],
+        tool_timeout=99,
+    )
+    assert agent._timeout_for(blocking_tools["bounded"]) == 0.2  # tool wins
+    assert agent._timeout_for(blocking_tools["unbounded"]) == 99  # agent default
+
+
+def test_timeout_resolution_without_any_configuration(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["unbounded"]])
+    assert agent.tool_timeout is None
+    assert agent._timeout_for(blocking_tools["unbounded"]) is None
+    assert agent._timeout_for(blocking_tools["bounded"]) == 0.2
+
+
+def test_a_zero_timeout_is_honoured_rather_than_treated_as_absent(blocking_tools):
+    # 0 is falsy but meaningful; only None means "no limit".
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["unbounded"]], tool_timeout=0)
+    assert agent._timeout_for(blocking_tools["unbounded"]) == 0
+    assert "did not finish" in agent._execute(agent.default_session, _tool_call("unbounded"))
+
+
+# --- concurrency -----------------------------------------------------------
+def test_concurrent_tool_calls_each_respect_their_own_timeout(blocking_tools):
+    # The trap: `with ThreadPoolExecutor(...)` calls shutdown(wait=True) on
+    # exit, so a naive implementation still waits for every hung tool. The
+    # whole batch must finish in about one timeout, not four.
+    agent = Agent(
+        FakeLLM([]),
+        tools=[blocking_tools["bounded"], blocking_tools["quick"]],
+        max_tool_workers=8,
+    )
+    calls = [dict(_tool_call("bounded"), id=f"c{i}") for i in range(4)]
+    calls.append(dict(_tool_call("quick"), id="c4"))
+
+    started = time.perf_counter()
+    agent._execute_calls(agent.default_session, calls)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 3, f"the batch took {elapsed:.1f}s; timeouts did not run concurrently"
+    observations = [m["content"] for m in agent.default_session.memory.get() if m["role"] == "tool"]
+    assert sum("did not finish" in o for o in observations) == 4
+    assert observations[-1] == "quick finished x"  # order preserved
+
+
+def test_one_timing_out_tool_does_not_delay_its_siblings(blocking_tools):
+    agent = Agent(
+        FakeLLM([]), tools=[blocking_tools["bounded"], blocking_tools["quick"]], max_tool_workers=4
+    )
+    calls = [
+        dict(_tool_call("quick"), id="a"),
+        dict(_tool_call("bounded"), id="b"),
+        dict(_tool_call("quick"), id="c"),
+    ]
+    agent._execute_calls(agent.default_session, calls)
+    observations = [m["content"] for m in agent.default_session.memory.get() if m["role"] == "tool"]
+    assert observations[0] == "quick finished x"
+    assert "did not finish" in observations[1]
+    assert observations[2] == "quick finished x"
+
+
+# --- resource behaviour ----------------------------------------------------
+def test_completed_timed_calls_do_not_leak_threads(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
+    baseline = threading.active_count()
+    for _ in range(25):
+        agent._execute(agent.default_session, _tool_call("quick"))
+    deadline = time.perf_counter() + 3
+    while threading.active_count() > baseline and time.perf_counter() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= baseline
+
+
+def test_a_tool_with_no_timeout_runs_inline_without_a_worker(blocking_tools):
+    # Backwards compatibility: no timeout configured means no executor, no
+    # thread, exactly the previous behaviour.
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
+    plain = blocking_tools["quick"]
+    plain.timeout = None
+    baseline = threading.active_count()
+    assert agent._execute(agent.default_session, _tool_call("quick")) == "quick finished x"
+    assert threading.active_count() == baseline
+
+
+# --- the honest limitation -------------------------------------------------
+def test_an_abandoned_tool_keeps_running_and_may_still_complete(blocking_tools, gate):
+    # Python cannot cancel a running thread. This is documented behaviour, not
+    # a defect: on timeout the agent stops waiting, the tool does not stop.
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
+    observation = agent._execute(agent.default_session, _tool_call("bounded", tag="abandoned"))
+    assert "did not finish" in observation
+    assert blocking_tools["completed"] == []  # still blocked at this point
+
+    gate.set()  # let the abandoned call proceed
+    deadline = time.perf_counter() + 3
+    while not blocking_tools["completed"] and time.perf_counter() < deadline:
+        time.sleep(0.05)
+    assert blocking_tools["completed"] == ["abandoned"]  # it finished after all
+
+
+def test_the_timeout_message_says_the_side_effect_is_unknown(blocking_tools):
+    agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
+    observation = agent._execute(agent.default_session, _tool_call("bounded"))
+    assert "may still be running" in observation
+    assert "unknown" in observation
+
+
+# --- boundaries ------------------------------------------------------------
+def test_the_timeout_does_not_cover_the_approval_wait(blocking_tools):
+    # Approval blocks on a human. Timing that out would refuse tools simply
+    # because someone took a moment, so the clock starts after approval.
+    @tool(requires_approval=True, timeout=5)
+    def confirmable(x: int = 1) -> str:
+        """Fast once approved."""
+        return "ran"
+
+    def slow_approver(request):
+        time.sleep(0.4)  # longer than a tight timeout would allow
+        return True
+
+    agent = Agent(FakeLLM([]), tools=[confirmable], approve=slow_approver, tool_timeout=0.2)
+    assert agent._execute(agent.default_session, _tool_call("confirmable")) == "ran"
+
+
+def test_tool_run_does_not_enforce_the_timeout(blocking_tools, gate):
+    # Like the policy, the timeout is an agent-level control. A direct call is
+    # your own code calling your own function.
+    gate.set()  # so this returns promptly
+    assert blocking_tools["bounded"].run({"tag": "direct"}) == "bounded finished direct"
+
+
+def test_tool_timeout_error_is_exported_and_catchable():
+    assert "ToolTimeoutError" in unchained.__all__
+    assert issubclass(unchained.ToolTimeoutError, RuntimeError)
+
+
+def test_timeout_is_carried_by_the_decorator_and_defaults_to_none():
+    @tool(timeout=2.5)
+    def timed() -> str:
+        """Timed."""
+        return "ok"
+
+    @tool
+    def untimed() -> str:
+        """Untimed."""
+        return "ok"
+
+    assert timed.timeout == 2.5
+    assert untimed.timeout is None

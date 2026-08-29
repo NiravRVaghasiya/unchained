@@ -32,6 +32,7 @@ import uuid
 import warnings
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 from functools import partial
 from typing import (
     Any,
@@ -95,6 +96,7 @@ __all__ = [
     "ToolAuthorizationError",
     "ToolApprovalRequired",
     "ToolArgumentValidationError",
+    "ToolTimeoutError",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
@@ -136,6 +138,16 @@ class ToolApprovalRequired(RuntimeError):
 
 class ToolArgumentValidationError(RuntimeError):
     """Raised when model-supplied arguments do not fit the tool's signature."""
+
+
+class ToolTimeoutError(RuntimeError):
+    """Raised when a tool call outlives its timeout.
+
+    The timeout bounds how long the **agent** waits, which is not the same as
+    stopping the tool. Python cannot cancel a thread that is already running:
+    the call keeps going in the background until it finishes on its own. See
+    :meth:`Agent._invoke` for what that means in practice.
+    """
 
 
 class _RetryableStatus(Exception):
@@ -214,6 +226,10 @@ class Tool:
     * ``side_effects`` - True if calling it changes something.
     * ``allowed``      - ``fn(arguments, context) -> bool`` for a per-call
       check that depends on the arguments (a path prefix, a row limit, ...).
+    * ``timeout``      - seconds the agent will wait for this tool before
+      giving up on it. Overrides ``Agent(tool_timeout=...)``. Enforced by the
+      agent, like the policy - :meth:`run` does not apply it, because a
+      direct call is your own code calling your own function.
 
     None of this is sent to the model. Metadata describes the tool to your
     policy; it is not a hint the model can read, argue with, or override.
@@ -238,6 +254,7 @@ class Tool:
         requires_approval: bool = False,
         side_effects: bool = False,
         allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+        timeout: Optional[float] = None,
     ):
         self.func = func
         self.name = func.__name__
@@ -249,6 +266,7 @@ class Tool:
         self.requires_approval = requires_approval
         self.side_effects = side_effects
         self.allowed = allowed
+        self.timeout = timeout
         self.accepts_kwargs = any(
             param.kind is inspect.Parameter.VAR_KEYWORD
             for param in inspect.signature(func).parameters.values()
@@ -524,6 +542,7 @@ def tool(
     requires_approval: bool = ...,
     side_effects: bool = ...,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = ...,
+    timeout: Optional[float] = ...,
 ) -> Callable[[Callable[..., Any]], Tool]: ...
 
 
@@ -534,6 +553,7 @@ def tool(
     requires_approval: bool = False,
     side_effects: bool = False,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+    timeout: Optional[float] = None,
 ) -> Any:
     """Decorator: turn any function into a Tool with an auto-generated schema.
 
@@ -547,6 +567,10 @@ def tool(
         @tool(permissions={"db:write"}, side_effects=True, requires_approval=True)
         def delete_record(record_id: str) -> str:
             "Destructive: gated by policy, and confirmed per call."
+
+        @tool(timeout=10)
+        def fetch_data(url: str) -> str:
+            "The agent waits 10s, then gives up on it."
     """
 
     def wrap(target: Callable[..., Any]) -> Tool:
@@ -556,6 +580,7 @@ def tool(
             requires_approval=requires_approval,
             side_effects=side_effects,
             allowed=allowed,
+            timeout=timeout,
         )
 
     return wrap(func) if func is not None else wrap
@@ -1679,6 +1704,7 @@ class Agent:
         policy: Optional[ToolPolicy] = None,
         approve: Optional[Callable[[Dict[str, Any]], bool]] = None,
         memory_factory: Optional[Callable[[], Memory]] = None,
+        tool_timeout: Optional[float] = None,
     ):
         """``memory`` and ``memory_factory`` differ, and the difference matters.
 
@@ -1720,6 +1746,9 @@ class Agent:
         # comes from the caller of Agent(), and nothing the model emits can
         # set, reach or influence it.
         self.approve = approve
+        # Seconds to wait for any tool that does not set its own timeout.
+        # None means wait forever, which is the old behaviour.
+        self.tool_timeout = tool_timeout
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
         # dialog must not be re-entered from several workers at once. This
         # stays on the Agent on purpose: it guards the application's single
@@ -2060,9 +2089,65 @@ class Agent:
             return f"Error: tool '{name}' was not authorized (policy error)."
         self._audit(session, name, arguments, decision, "", tool_obj)
         try:
-            return str(tool_obj.run(arguments))
+            return str(self._invoke(tool_obj, arguments))
+        except ToolTimeoutError as exc:
+            logger.warning("%s", exc)
+            return f"Error: {exc}"
         except Exception as exc:  # a tool must never crash the loop
             return f"Error executing '{name}': {exc}"
+
+    def _timeout_for(self, tool_obj: Tool) -> Optional[float]:
+        """Seconds to wait for this tool: its own setting, else the agent's."""
+        return tool_obj.timeout if tool_obj.timeout is not None else self.tool_timeout
+
+    def _invoke(self, tool_obj: Tool, arguments: Dict[str, Any]) -> Any:
+        """Run one tool, bounded by its timeout if it has one.
+
+        **The timeout bounds the wait, not the work.** Python cannot cancel a
+        running thread, so when a call overruns, the agent stops waiting and
+        reports a :class:`ToolTimeoutError` while the tool keeps running in
+        the background until it returns on its own. Consequences worth
+        knowing before relying on this:
+
+        * A tool with side effects may still complete after the timeout. On
+          timeout you do not know whether the effect happened - treat it as
+          unknown, not as failed.
+        * The orphaned thread is not reclaimed until the call ends, and
+          because executor threads are non-daemon it can delay interpreter
+          exit. A tool that hangs forever holds a thread forever.
+        * Hard cancellation of arbitrary Python needs process isolation - run
+          the work in a subprocess and kill it, as ``examples/coder.py``
+          does. A thread timeout is a liveness guard for the agent loop, not
+          a containment boundary.
+        * A timeout does not abort a socket read either, so HTTP tools still
+          need their own network timeout. ``requests.get(...)`` without
+          ``timeout=`` can block for a very long time; the tool timeout will
+          free the agent but leave the request running.
+
+        Without a timeout the call runs inline, exactly as before - no thread,
+        no executor, and an unbounded tool blocks the agent.
+        """
+        timeout = self._timeout_for(tool_obj)
+        if timeout is None:
+            return tool_obj.run(arguments)
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{tool_obj.name}")
+        try:
+            future = pool.submit(tool_obj.run, arguments)
+            try:
+                return future.result(timeout=timeout)
+            except _FutureTimeout:
+                raise ToolTimeoutError(
+                    f"tool '{tool_obj.name}' did not finish within {timeout}s and was "
+                    "abandoned; it may still be running, so treat any side effect as "
+                    "unknown rather than as not having happened"
+                ) from None
+        finally:
+            # wait=False is the whole point: the default shutdown(wait=True)
+            # would block on the very call we just gave up on, re-creating
+            # the hang this exists to prevent. A finished call's worker exits
+            # promptly and nothing leaks; an overrunning one keeps its thread
+            # because Python has no way to take it back.
+            pool.shutdown(wait=False)
 
     def _request_approval(
         self,

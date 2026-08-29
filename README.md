@@ -195,6 +195,50 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+### ⏱️ Tool timeouts — bounding the wait, not the work
+
+An LLM call has a timeout; a Python tool can block forever. Give a tool a
+budget, or set a default for all of them:
+
+```python
+@tool(timeout=10)
+def fetch_data(url: str) -> str:
+    """The agent waits 10s, then gives up on it."""
+
+
+agent = Agent(llm, tools=[fetch_data], tool_timeout=30)  # default for tools
+```
+
+A tool's own `timeout` wins over the agent's default. `None` (the default)
+means wait forever, exactly as before. On overrun the agent stops waiting and
+the model receives an ordinary tool error, so the loop continues:
+
+```
+Error: tool 'fetch_data' did not finish within 10s and was abandoned; it may
+still be running, so treat any side effect as unknown rather than as not
+having happened
+```
+
+**Be clear about what this does not do.** Python cannot cancel a running
+thread, and Unchained does not pretend otherwise:
+
+- The tool keeps running after the timeout. It may still complete — and if it
+  has side effects, **you do not know whether they happened.** Treat the
+  outcome as unknown, not as failed.
+- The abandoned thread is not reclaimed until the call ends. Because executor
+  threads are not daemons, a tool that hangs forever can delay interpreter
+  exit.
+- **Hard cancellation needs process isolation.** Run the work in a subprocess
+  and kill it — see [`examples/coder.py`](examples/coder.py). A thread timeout
+  is a liveness guard for the agent loop, not a containment boundary.
+- **A timeout does not abort a socket read.** HTTP tools still need their own
+  network timeout: `requests.get(url, timeout=20)`. Without one the request
+  can block for a very long time; the tool timeout frees the agent but leaves
+  the request running and holding a connection.
+
+Concurrent calls each get their own budget, so one hanging tool does not delay
+its siblings or the turn.
+
 ### 👥 Sessions — one agent, many conversations
 
 An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the

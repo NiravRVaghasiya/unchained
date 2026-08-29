@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Tool execution timeouts.** LLM calls had a timeout; an arbitrary Python
+  tool could block the agent forever. `@tool(timeout=10)` sets a budget for
+  one tool and `Agent(tool_timeout=30)` a default for all of them, with the
+  tool's own setting taking precedence. `None` still means wait forever, so
+  existing agents are unchanged, and a tool with no timeout runs inline as
+  before — no executor, no thread.
+  - On overrun the model receives an ordinary tool error and the loop
+    continues; the run does not hang and does not raise.
+  - Concurrent calls each get their own budget. The executor is shut down
+    with `wait=False`, because the default `wait=True` would block on the
+    very call just abandoned — re-creating the hang the timeout exists to
+    prevent.
+  - New `ToolTimeoutError`.
+  - **The timeout bounds the agent's wait, not the tool's work.** Python
+    cannot cancel a running thread: the abandoned call keeps running, keeps
+    its thread, and may still complete, so a side effect after a timeout must
+    be treated as unknown rather than as not having happened. Hard
+    cancellation needs process isolation (`examples/coder.py`), and HTTP
+    tools still need their own network timeout. Documented in the README and
+    SECURITY.md rather than papered over.
+  - Approval waits are deliberately outside the budget: a human pausing to
+    confirm must not be read as a hanging tool.
+
 ### Security
 - **Routing decisions are now validated against the agent registry.**
   `Router.route()` asks for JSON constrained to the registered agent names

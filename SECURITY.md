@@ -158,6 +158,17 @@ Known non-boundaries, by design:
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).
+- **Tool timeouts bound the agent's wait, not the tool's work.** Python cannot
+  cancel a running thread. `@tool(timeout=...)` and `Agent(tool_timeout=...)`
+  stop the agent hanging, but the abandoned call keeps running, keeps its
+  thread, and may still complete. **After a timeout on a side-effecting tool,
+  treat the effect as unknown rather than as not having happened.** Hard
+  cancellation of arbitrary Python requires process isolation — run the work
+  in a subprocess and kill it. A timeout is a liveness guard, not a
+  containment boundary, and not a defence against a hostile tool.
+- **A tool timeout does not abort network I/O.** HTTP tools must still set
+  their own timeout (`requests.get(url, timeout=20)`); otherwise the request
+  outlives the timeout and holds a connection.
 - **Tool error text is fed back to the model and stored in memory.** If a tool
   raises an exception whose message contains a secret, that secret enters the
   transcript. Catch and sanitise inside tools that handle credentials.
