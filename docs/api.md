@@ -15,3 +15,4 @@ Auto-generated from the docstrings in `unchained.py`.
         - Router
         - Callback
         - LoggingCallback
+        - RoutingError

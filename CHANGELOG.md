@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Memory compression no longer produces an unsendable window.** When the
+  sliding window overflowed, the boundary could fall between an assistant
+  message carrying `tool_calls` and the `tool` messages answering them,
+  leaving the window starting with an orphaned tool result. Providers reject
+  that outright (OpenAI: HTTP 400, "messages with role 'tool' must be a
+  response to a preceding message with 'tool_calls'"; Anthropic rejects the
+  equivalent `tool_result` block), so any sufficiently long tool-using
+  conversation eventually failed. The boundary now moves back to the start of
+  the tool group.
+- **`RAG.add_many()` no longer loses documents silently.** Passing `metadatas`
+  of a different length to `texts` used to `zip()` down to the shorter list:
+  in TF-IDF mode documents simply vanished, and with an `embed_fn` it left
+  more embeddings than documents, so `search()` raised `IndexError` later,
+  far from the cause. It now raises `ValueError` at the call site.
+- **No placeholder credential is sent when no API key is configured.**
+  `provider="openai"` with no key sent the literal header
+  `Authorization: Bearer None`; Anthropic sent `x-api-key: `. Both headers are
+  now omitted entirely, which is also what local OpenAI-compatible servers
+  (vLLM, LM Studio, llama.cpp) expect. Affects both `chat()` and `stream()`.
+
+### Changed
+- **BREAKING - `Router.route()` now fails closed.** It previously fell back to
+  `agents[0]` whenever the model's reply didn't match an agent, and matched by
+  substring in both directions - so an empty reply matched *every* agent (and
+  returned the longest-named one), and an agent named `fit` matched a reply
+  mentioning "profit". A query could therefore be dispatched to an agent
+  nobody chose, which matters because agents differ in the tools, and so the
+  privileges, they carry. Matching is now exact-name-first, then whole-word,
+  and must resolve to exactly one agent; an empty, evasive, hallucinated or
+  ambiguous reply raises the new `RoutingError`.
+
+  To restore a default destination, name it explicitly:
+
+  ```python
+  Router(llm, agents=[...], fallback=triage_agent)
+  ```
+- **BREAKING - `RAG.add_many()` raises `ValueError`** on a `texts`/`metadatas`
+  length mismatch instead of silently truncating (see Fixed, above).
+- **Tool fan-out is bounded.** `Agent` sized its thread pool to the number of
+  tool calls in a turn, but that count is chosen by the model, so one response
+  could spawn a thread per call (250 calls produced ~176 live threads). The
+  pool is now capped by the new `Agent(max_tool_workers=8)`. Excess calls
+  queue and still run, in the same order; only their concurrency is bounded.
+- `Memory` may now keep slightly more than `max_messages` (or `max_tokens`)
+  rather than split a tool group - a window one group over budget is still
+  sendable, whereas one starting with an orphaned tool result is not.
+
+### Added
+- `RoutingError`, exported from the package, raised by `Router.route()` when
+  no single agent can be identified.
+- `Router(fallback=...)` to nominate an agent for unroutable queries.
+- `Agent(max_tool_workers=8)` to tune the tool-call concurrency cap.
+
 ## [0.4.0] - 2026-08-10
 
 ### Added

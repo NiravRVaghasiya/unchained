@@ -159,7 +159,10 @@ price = await Agent(llm, tools=[fetch_price]).arun("What's AAPL trading at?")
 
 When a model requests more than one tool call in the same turn, Unchained runs
 them concurrently on a thread pool (most tools are I/O-bound), then feeds the
-results back in the original order.
+results back in the original order. How many calls arrive in a turn is decided
+by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather than
+sized to the request. Extra calls queue and still run; only concurrency is
+bounded.
 
 ### 🧠 Memory — sliding window with compression
 
@@ -233,6 +236,27 @@ router = Router(llm, agents=[cost_agent, fit_agent, trend_agent], synthesizer=sy
 router.route("How much will this cost?").run(...)  # pick the best single agent
 router.run_all("Compare these options")  # every agent, in parallel
 router.synthesize("Recommend a stack for my team")  # run all, then fuse
+```
+
+**Routing fails closed.** Agents differ in the tools — and so the privileges —
+they carry, so picking the wrong one is an authorization mistake, not just a
+quality one. `route()` accepts an exact agent name, or a whole-word mention of
+exactly one agent. An empty, evasive, hallucinated or ambiguous reply raises
+`RoutingError` rather than quietly dispatching to an agent nobody chose:
+
+```python
+from unchained import RoutingError
+
+try:
+    agent = router.route(query)
+except RoutingError:
+    ...  # ask the user, or refuse
+```
+
+Prefer a default destination? Name it, and the choice stays visible in the code:
+
+```python
+router = Router(llm, agents=[...], fallback=triage_agent)
 ```
 
 ## The agent loop

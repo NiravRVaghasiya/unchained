@@ -11,6 +11,7 @@ import enum
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -1262,3 +1263,286 @@ def test_pydantic_schema_helper_handles_v1_and_non_pydantic():
 
     assert unchained._pydantic_schema(FakeV1Model) == {"v1": True}
     assert unchained._pydantic_schema(NotAModel) == {}
+
+
+# ---------------------------------------------------------------------------
+# Tier 5: hardening regressions
+#
+# Each test below pins a defect that was reachable in the released behaviour.
+# The comment on each names what used to happen.
+# ---------------------------------------------------------------------------
+def _tool_conversation(memory):
+    """Build a window whose compression boundary falls inside a tool group."""
+    memory.messages = [
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"name": "f", "arguments": {}, "id": "c3"},
+                {"name": "g", "arguments": {}, "id": "c4"},
+            ],
+        },
+    ]
+    memory.add("tool", "r3", tool_call_id="c3", name="f")
+    memory.add("tool", "r4", tool_call_id="c4", name="g")
+    memory.add("assistant", "a2")
+    memory.add("user", "q3")  # 7th message -> triggers compression
+    return memory
+
+
+def _assert_tool_results_are_paired(window):
+    """Every tool message must follow an assistant turn that offered its id."""
+    offered = set()
+    for message in window:
+        for call in message.get("tool_calls") or []:
+            offered.add(call["id"])
+        if message["role"] == "tool":
+            assert message["tool_call_id"] in offered
+
+
+def test_memory_compression_never_orphans_a_tool_result():
+    # Previously the boundary cut between an assistant's tool_calls and the
+    # tool results answering them, so the window began with an unpaired tool
+    # message. OpenAI rejects that with HTTP 400; Anthropic rejects the
+    # equivalent tool_result block.
+    memory = _tool_conversation(Memory(max_messages=6))
+    window = memory.get()
+
+    assert window[0]["role"] != "tool", "window must not start with an orphaned tool result"
+    _assert_tool_results_are_paired(window)
+
+
+def test_memory_compression_keeps_a_sendable_window_for_openai():
+    # End-to-end shape check: the compressed window survives conversion.
+    memory = _tool_conversation(Memory(max_messages=6))
+    converted = LLM(provider="openai", api_key="k")._to_openai_messages(memory.get())
+    _assert_tool_results_are_paired(converted)
+
+
+def test_memory_tool_group_rule_does_not_disturb_plain_conversations():
+    # The boundary only moves when it lands on a tool message; ordinary
+    # windows keep exactly the previous sizing.
+    memory = Memory(max_messages=4)
+    for i in range(5):
+        memory.add("user", f"message number {i}")
+    assert len(memory.get()) == 2  # unchanged: recent half
+    assert [m["role"] for m in memory.get()] == ["user", "user"]
+
+
+def test_memory_tool_group_start_walks_back_to_the_assistant():
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [{"name": "f", "id": "c1"}]},
+        {"role": "tool", "content": "r", "tool_call_id": "c1"},
+        {"role": "tool", "content": "r", "tool_call_id": "c2"},
+    ]
+    assert Memory._tool_group_start(messages, 3) == 1  # inside a group -> back to assistant
+    assert Memory._tool_group_start(messages, 2) == 1
+    assert Memory._tool_group_start(messages, 1) == 1  # already valid -> unchanged
+    assert Memory._tool_group_start(messages, 0) == 0
+    # A window that is nothing but tool results clamps at 0 rather than going negative.
+    assert Memory._tool_group_start([{"role": "tool"}, {"role": "tool"}], 1) == 0
+
+
+def test_memory_token_budget_still_shrinks_below_the_message_cap():
+    # Guards the _compress rewrite against index-arithmetic regressions.
+    memory = Memory(max_messages=20, max_tokens=500)
+    memory.add("user", "x" * 4000)
+    memory.add("user", "y" * 4000)
+    assert len(memory.get()) <= 1
+    assert memory.summary
+
+
+# ---------------------------------------------------------------------------
+# Router fails closed
+# ---------------------------------------------------------------------------
+def test_router_raises_rather_than_guessing_an_agent():
+    # Previously an unmatched reply silently returned agents[0], and an empty
+    # reply returned the longest-named agent (because "" is a substring of
+    # every name) - routing a query to an agent nobody chose.
+    router = Router(
+        FakeLLM([]),
+        agents=[_named_agent("billing", "b"), _named_agent("admin_delete", "a")],
+    )
+    for unroutable in ("", "   ", "i cannot determine which agent", "banana", "finance"):
+        with pytest.raises(unchained.RoutingError):
+            router._match(unroutable)
+
+
+def test_router_refuses_an_ambiguous_reply_naming_two_agents():
+    router = Router(
+        FakeLLM([]),
+        agents=[_named_agent("billing", "b"), _named_agent("admin_delete", "a")],
+    )
+    with pytest.raises(unchained.RoutingError):
+        router._match("either billing or admin_delete would work")
+
+
+def test_router_does_not_match_a_name_inside_a_longer_word():
+    # "fit" must not match a reply that merely mentions "profit".
+    router = Router(FakeLLM([]), agents=[_named_agent("fit", "f"), _named_agent("cost", "c")])
+    assert router._match("look at the cost side").name == "cost"
+    with pytest.raises(unchained.RoutingError):
+        router._match("this is about profit margins")
+
+
+def test_router_still_matches_exact_and_embedded_names():
+    # Backwards compatibility: the cases that resolved before still resolve.
+    router = Router(FakeLLM([]), agents=[_named_agent("cost", "c"), _named_agent("fit", "f")])
+    assert router._match("cost").name == "cost"
+    assert router._match("  Cost  ").name == "cost"
+    assert router._match("the best choice is the cost agent").name == "cost"
+
+
+def test_router_fallback_agent_receives_unroutable_queries():
+    triage = _named_agent("triage", "triaged")
+    router = Router(
+        FakeLLM([{"content": "no idea"}]),
+        agents=[_named_agent("cost", "c"), _named_agent("fit", "f")],
+        fallback=triage,
+    )
+    assert router._match("no idea").name == "triage"
+    assert router.run("something unroutable") == "triaged"
+
+
+def test_router_run_propagates_routing_error():
+    router = Router(FakeLLM([{"content": "no idea"}]), agents=[_named_agent("cost", "c")])
+    with pytest.raises(unchained.RoutingError):
+        router.run("something unroutable")
+
+
+def test_routing_error_is_exported():
+    assert "RoutingError" in unchained.__all__
+    assert issubclass(unchained.RoutingError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# RAG rejects mismatched metadata
+# ---------------------------------------------------------------------------
+def test_rag_add_many_rejects_metadata_length_mismatch():
+    # Previously zip() truncated to the shorter list, so documents vanished
+    # silently in TF-IDF mode.
+    rag = RAG()
+    with pytest.raises(ValueError):
+        rag.add_many(["one", "two", "three"], [{"m": 1}, {"m": 2}])
+    assert len(rag) == 0  # nothing was half-indexed
+
+
+def test_rag_add_many_mismatch_cannot_corrupt_the_embedding_index():
+    # Previously this left 3 embeddings against 1 document, and search()
+    # raised IndexError later, far from the cause.
+    rag = RAG(embed_fn=lambda texts: [[1.0, 0.0] for _ in texts])
+    with pytest.raises(ValueError):
+        rag.add_many(["one", "two", "three"], [{"m": 1}])
+    assert len(rag.docs) == len(rag._embeddings)
+
+
+def test_rag_add_many_accepts_matching_lengths_and_omitted_metadata():
+    rag = RAG()
+    rag.add_many(["one", "two"], [{"m": 1}, {"m": 2}])
+    rag.add_many(["three", "four"])  # metadatas omitted entirely
+    assert len(rag) == 4
+    assert rag.metadata[0] == {"m": 1}
+    assert rag.metadata[3] == {}
+
+
+# ---------------------------------------------------------------------------
+# No placeholder credential on the wire
+# ---------------------------------------------------------------------------
+def test_openai_omits_the_auth_header_when_no_key_is_configured(monkeypatch):
+    # Previously sent the literal header "Authorization: Bearer None".
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    headers = LLM(provider="openai")._openai_headers()
+    assert "Authorization" not in headers
+    assert "None" not in json.dumps(headers)
+
+
+def test_openai_sends_the_auth_header_when_a_key_is_configured():
+    headers = LLM(provider="openai", api_key="sk-test")._openai_headers()
+    assert headers["Authorization"] == "Bearer sk-test"
+
+
+def test_anthropic_omits_the_api_key_header_when_unset(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    headers = LLM(provider="anthropic")._anthropic_headers()
+    assert "x-api-key" not in headers
+    assert headers["anthropic-version"] == "2023-06-01"
+
+
+def test_anthropic_sends_the_api_key_header_when_set():
+    headers = LLM(provider="anthropic", api_key="sk-ant")._anthropic_headers()
+    assert headers["x-api-key"] == "sk-ant"
+
+
+def test_streaming_paths_use_the_same_header_policy(monkeypatch):
+    # The stream() variants built their own header dicts and had the same bug.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    seen = {}
+
+    def _capture(path, **kwargs):
+        seen.update(kwargs.get("headers") or {})
+        return _FakeResponse(lines=["data: [DONE]"])
+
+    llm = LLM(provider="openai")
+    monkeypatch.setattr(llm, "_request", _capture)
+    list(llm.stream([{"role": "user", "content": "hi"}]))
+    assert "Authorization" not in seen
+
+
+# ---------------------------------------------------------------------------
+# Tool fan-out is bounded
+# ---------------------------------------------------------------------------
+def test_tool_fan_out_is_capped_regardless_of_how_many_calls_the_model_asks_for():
+    # How many tool calls arrive in a turn is chosen by the model, i.e. it is
+    # untrusted input. Previously max_workers=len(calls), so a single
+    # response sized the thread pool (250 calls -> ~176 live threads).
+    peak = {"n": 0}
+    running = {"n": 0}
+    lock = threading.Lock()
+
+    @tool
+    def slow(x: int) -> str:
+        """Occupy a worker for a moment."""
+        with lock:
+            running["n"] += 1
+            peak["n"] = max(peak["n"], running["n"])
+        time.sleep(0.01)
+        with lock:
+            running["n"] -= 1
+        return f"ok{x}"
+
+    agent = Agent(FakeLLM([]), tools=[slow], max_tool_workers=4)
+    calls = [{"name": "slow", "arguments": {"x": i}, "id": f"c{i}"} for i in range(60)]
+    agent._execute_calls(calls)
+
+    assert peak["n"] <= 4, f"pool grew to {peak['n']} concurrent workers"
+    # Every call still ran, and the results kept their original order.
+    observations = [m for m in agent.memory.get() if m["role"] == "tool"]
+    assert [m["content"] for m in observations] == [f"ok{i}" for i in range(60)]
+
+
+def test_max_tool_workers_defaults_to_a_bound_and_is_never_below_one():
+    assert Agent(FakeLLM([])).max_tool_workers == 8
+    assert Agent(FakeLLM([]), max_tool_workers=0).max_tool_workers == 1
+    assert Agent(FakeLLM([]), max_tool_workers=-5).max_tool_workers == 1
+
+
+def test_single_tool_call_still_skips_the_pool_entirely():
+    @tool
+    def echo(x: int) -> str:
+        """Echo the argument."""
+        return f"ok{x}"
+
+    agent = Agent(FakeLLM([]), tools=[echo])
+    before = threading.active_count()
+    agent._execute_calls([{"name": "echo", "arguments": {"x": 1}, "id": "c0"}])
+    assert threading.active_count() == before
+
+
+def test_routing_error_message_truncates_a_runaway_model_reply():
+    router = Router(FakeLLM([]), agents=[_named_agent("cost", "c")])
+    with pytest.raises(unchained.RoutingError) as excinfo:
+        router._match("x" * 5000)
+    assert len(str(excinfo.value)) < 400

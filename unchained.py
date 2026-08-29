@@ -70,10 +70,23 @@ __all__ = [
     "Router",
     "Callback",
     "LoggingCallback",
+    "RoutingError",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+class RoutingError(RuntimeError):
+    """Raised when :meth:`Router.route` cannot identify exactly one agent.
+
+    Routing is an authorization decision as much as a dispatch one: agents
+    differ in the tools - and therefore the privileges - they carry. Guessing
+    when the model's answer is empty, evasive or ambiguous would silently
+    hand a query to an agent nobody chose, so ``Router`` fails closed instead.
+    Pass ``Router(..., fallback=agent)`` to nominate an explicit destination
+    for unroutable queries.
+    """
 
 
 class _RetryableStatus(Exception):
@@ -368,8 +381,30 @@ class LLM:
         )
 
     # -- OpenAI --
+    def _openai_headers(self) -> Dict[str, str]:
+        """Headers for an OpenAI-compatible endpoint.
+
+        The ``Authorization`` header is omitted entirely when no key is
+        configured, rather than sent as the literal string ``Bearer None``.
+        Sending a placeholder credential is never useful - hosted providers
+        reject it with a confusing 401 - and local OpenAI-compatible servers
+        (vLLM, LM Studio, llama.cpp, Ollama's compat endpoint) accept an
+        unauthenticated request but not a malformed one.
+        """
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _anthropic_headers(self) -> Dict[str, str]:
+        """Headers for the Anthropic Messages API. See :meth:`_openai_headers`."""
+        headers = {"anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+        return headers
+
     def _openai(self, messages, tools, response_format):
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = self._openai_headers()
         payload = {
             "model": self.model,
             "messages": self._to_openai_messages(messages),
@@ -397,11 +432,7 @@ class LLM:
 
     # -- Anthropic --
     def _anthropic(self, messages, tools, response_format):
-        headers = {
-            "x-api-key": self.api_key or "",
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
+        headers = self._anthropic_headers()
         system = "\n\n".join(
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
@@ -576,7 +607,7 @@ class LLM:
         yield from dispatch[self.provider](messages)
 
     def _stream_openai(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = self._openai_headers()
         payload = {
             "model": self.model,
             "messages": self._to_openai_messages(messages),
@@ -598,11 +629,7 @@ class LLM:
                 yield delta
 
     def _stream_anthropic(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        headers = {
-            "x-api-key": self.api_key or "",
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
+        headers = self._anthropic_headers()
         system = "\n\n".join(
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
@@ -807,6 +834,13 @@ class Memory:
     messages alone would exceed it - message count alone can't promise a
     token budget, since a handful of long messages can still blow the context
     window even under a small ``max_messages``.
+
+    One exception to both bounds: the window is never cut between an
+    assistant message carrying ``tool_calls`` and the ``tool`` messages that
+    answer them, because providers reject an unpaired tool result. When the
+    boundary would land inside such a group it moves back to the start of the
+    group, so the window can exceed ``max_messages`` (or ``max_tokens``) by
+    that one group. See :meth:`_tool_group_start`.
     """
 
     def __init__(
@@ -841,15 +875,41 @@ class Memory:
     def _window_tokens(messages: List[Dict[str, Any]]) -> int:
         return sum(_estimate_tokens(m.get("content", "")) for m in messages)
 
+    @staticmethod
+    def _tool_group_start(messages: List[Dict[str, Any]], index: int) -> int:
+        """Move a window boundary back so it never splits a tool group.
+
+        A ``tool`` message is only meaningful directly after the assistant
+        message whose ``tool_calls`` requested it, and every provider rejects
+        an unpaired one (OpenAI answers HTTP 400 "messages with role 'tool'
+        must be a response to a preceding message with 'tool_calls'";
+        Anthropic rejects the equivalent ``tool_result`` block). So if the
+        boundary lands on a tool result, walk back to the assistant turn that
+        asked for it.
+
+        The kept window can therefore exceed ``max_messages`` by one tool
+        group. That is deliberate: a window one group over budget is still
+        sendable, whereas a window that starts with an orphaned tool result
+        is rejected outright.
+        """
+        while index > 0 and messages[index].get("role") == "tool":
+            index -= 1
+        return index
+
     def _compress(self) -> None:
         keep = max(1, self.max_messages // 2)
-        overflow, kept = self.messages[:-keep], self.messages[-keep:]
+        split = max(0, len(self.messages) - keep)
         # A message-count window can still bust a token budget (e.g. 20 huge
         # messages), so keep shrinking from the front until it fits - but
         # always leave at least the single most recent message.
         if self.max_tokens is not None:
-            while len(kept) > 1 and self._window_tokens(kept) > self.max_tokens:
-                overflow.append(kept.pop(0))
+            while (
+                split < len(self.messages) - 1
+                and self._window_tokens(self.messages[split:]) > self.max_tokens
+            ):
+                split += 1
+        split = self._tool_group_start(self.messages, split)
+        overflow, kept = self.messages[:split], self.messages[split:]
         self.messages = kept
         if not overflow:
             return
@@ -909,6 +969,19 @@ class RAG:
         self.add_many([text], [metadata or {}])
 
     def add_many(self, texts: List[str], metadatas: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Index several documents at once.
+
+        ``metadatas``, when given, must line up one-to-one with ``texts``.
+        A mismatch raises: zipping the two used to truncate to the shorter
+        list, which silently dropped documents in TF-IDF mode and, with an
+        ``embed_fn``, left more embeddings than documents - an index that
+        raised ``IndexError`` later, from ``search()``, far from the cause.
+        """
+        if metadatas is not None and len(metadatas) != len(texts):
+            raise ValueError(
+                f"add_many() got {len(texts)} texts but {len(metadatas)} metadatas; "
+                "they must be the same length."
+            )
         metadatas = metadatas or [{} for _ in texts]
         for text, meta in zip(texts, metadatas):
             self.docs.append(text)
@@ -1040,6 +1113,7 @@ class Agent:
         max_iterations: int = 6,
         callbacks: Optional[List[Callback]] = None,
         structured_retries: int = 1,
+        max_tool_workers: int = 8,
     ):
         self.llm = llm
         self.name = name
@@ -1051,6 +1125,11 @@ class Agent:
         self.max_iterations = max_iterations
         self.callbacks = list(callbacks or [])
         self.structured_retries = structured_retries
+        # How many of one turn's tool calls may run at once. The number of
+        # calls in a turn is chosen by the model, so it is untrusted input;
+        # without a cap a single response sizes the thread pool. See
+        # _execute_calls.
+        self.max_tool_workers = max(1, max_tool_workers)
         self.usage: Dict[str, int] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -1182,11 +1261,19 @@ class Agent:
         thread pool - most tools are I/O-bound (HTTP, disk, subprocess), so
         this cuts wall-clock latency for that turn without changing the
         observed order of results.
+
+        The pool is capped at ``max_tool_workers``. How many calls arrive in
+        a turn is decided by the model, not by the application, so sizing the
+        pool to the request let one response spawn a thread per call - a
+        resource limit that must be enforced here, in Python, and not by
+        asking the model to request fewer tools. Excess calls queue and still
+        run; only their concurrency is bounded, and results keep their order.
         """
         if len(calls) == 1:
             observations = [self._execute(calls[0])]
         else:
-            with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+            workers = min(len(calls), self.max_tool_workers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 observations = list(pool.map(self._execute, calls))
         for call, observation in zip(calls, observations):
             self._emit("on_tool_call", call["name"], call.get("arguments", {}), observation)
@@ -1259,12 +1346,31 @@ class Agent:
 
 # --- 7. Router (multi-agent orchestration) ---------------------------------
 class Router:
-    """Coordinate several agents: route to one, run all, or run all and fuse."""
+    """Coordinate several agents: route to one, run all, or run all and fuse.
 
-    def __init__(self, llm: LLM, agents: List[Agent], synthesizer: Optional[Agent] = None):
+    :meth:`route` fails closed - if the model's choice is empty, evasive,
+    hallucinated or ambiguous it raises :class:`RoutingError` rather than
+    guessing. Pass ``fallback=`` to nominate an agent for those queries.
+    """
+
+    _WORD_RE = re.compile(r"[a-z0-9_]+")
+
+    def __init__(
+        self,
+        llm: LLM,
+        agents: List[Agent],
+        synthesizer: Optional[Agent] = None,
+        fallback: Optional[Agent] = None,
+    ):
+        """``fallback`` receives queries that :meth:`route` cannot resolve.
+
+        Leave it ``None`` (the default) to fail closed with
+        :class:`RoutingError` instead of dispatching to an unchosen agent.
+        """
         if not agents:
             raise ValueError("Router needs at least one agent.")
         self.llm, self.agents, self.synthesizer = llm, agents, synthesizer
+        self.fallback = fallback
 
     def _descriptions(self) -> str:
         return "\n".join(f"- {a.name}: {a.description}" for a in self.agents)
@@ -1285,18 +1391,40 @@ class Router:
         return self._match(self.llm.chat(prompt)["content"].strip().lower())
 
     def _match(self, choice: str) -> Agent:
-        best, best_score = self.agents[0], -1
-        for agent in self.agents:
-            name = agent.name.lower()
-            if name == choice:
-                return agent
-            if name in choice or choice in name:
-                score = len(name)
-            else:
-                score = sum(1 for w in name.split() if w and w in choice)
-            if score > best_score:
-                best, best_score = agent, score
-        return best
+        """Resolve a router reply to exactly one agent, or fail closed.
+
+        An exact name wins outright. Otherwise every word of an agent's name
+        must appear as a whole word in the reply, and exactly one agent may
+        qualify. Everything else - an empty reply, a refusal, a hallucinated
+        name, or a reply naming two agents - is unroutable and raises
+        :class:`RoutingError` unless a ``fallback`` agent was configured.
+
+        Whole-word matching replaces the previous substring scoring, which
+        was unsafe in both directions: ``""`` was "in" every agent name (so a
+        blank reply matched the longest-named agent), and a name like ``fit``
+        matched an unrelated reply mentioning "profit".
+        """
+        choice = choice.strip().lower()
+        matched: List[Agent] = []
+        if choice:
+            words = set(self._WORD_RE.findall(choice))
+            for agent in self.agents:
+                name = agent.name.strip().lower()
+                if name and name == choice:
+                    return agent
+                name_words = set(self._WORD_RE.findall(name))
+                if name_words and name_words <= words:
+                    matched.append(agent)
+        if len(matched) == 1:
+            return matched[0]
+        if self.fallback is not None:
+            return self.fallback
+        reply = choice if len(choice) <= 120 else choice[:117] + "..."
+        raise RoutingError(
+            f"could not route to a single agent: the model replied {reply!r}, which "
+            f"matches {len(matched)} of {[a.name for a in self.agents]}. Pass "
+            "Router(..., fallback=agent) to handle unroutable queries explicitly."
+        )
 
     def run(self, query: str) -> Any:
         return self.route(query).run(query)

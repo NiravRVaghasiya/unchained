@@ -234,8 +234,15 @@ router.route(query)              router.run_all(query)
      │                                │
      ├── Build agent descriptions     ├── For each agent:
      ├── Ask LLM: "which agent?"      │   └── agent.run(query)
-     ├── Fuzzy-match agent name       │
-     └── Delegate to chosen agent     └── Return {name: result}
+     ├── Match exactly one name       │
+     └── Delegate, or RoutingError    └── Return {name: result}
+
+Routing fails closed. The reply must be an agent's exact name, or mention
+exactly one agent by whole word; an empty, evasive, hallucinated or ambiguous
+reply raises `RoutingError` rather than falling back to an arbitrary agent.
+Agents differ in the tools - and so the privileges - they hold, so this is an
+authorization decision, and it is enforced in Python rather than by trusting
+the router prompt. `Router(..., fallback=agent)` names a default explicitly.
 
 PickMyStack uses run_all() → Synthesizer pattern:
   ┌──────────┐  ┌──────────┐  ┌──────────┐
