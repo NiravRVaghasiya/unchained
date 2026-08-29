@@ -7,6 +7,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Routing decisions are now validated against the agent registry.**
+  `Router.route()` asks for JSON constrained to the registered agent names
+  and resolves the answer by looking it up in that registry, so no reply can
+  name an agent the router does not hold. A decision is valid only if it
+  identifies exactly one registered agent.
+- **Agent names are validated when the `Router` is built.** A blank name, or
+  two names that collide once case and surrounding whitespace are normalised,
+  now raises `ValueError`. Both were previously silent: a blank-named agent
+  could never be routed to, and one of two identically-named agents always
+  won, so "resolve to exactly one agent" was not achievable.
+- **Agent descriptions can no longer forge entries in the router's agent
+  list.** Descriptions are interpolated into the routing prompt; one
+  containing newlines could present extra `- name:` lines. Whitespace is now
+  collapsed and the text capped.
+- **Text matching no longer ignores word order.** A multi-word agent name
+  matched any reply containing its words anywhere, so an `admin delete` agent
+  was selected by "do not use admin, use the delete path". Matching now
+  requires the name to appear as a contiguous run of words.
+- `Agent._loads_object()` now always returns a dict. A reply of `null` or
+  `[1, 2]` is valid JSON but not an object, and returning it handed a
+  non-mapping to `schema(**data)` in the structured-output repair loop, where
+  it raised `TypeError` instead of the expected `ValidationError`.
+
+### Added
+- `Router(strict=True)` accepts only a structured decision or a bare exact
+  name, refusing prose. Text matching cannot read sense - prose mentioning one
+  agent in order to reject it ("not cost") resolves to it - and `strict`
+  closes that gap for deployments that need it.
+
+### Security
 - **Tool-call responses are no longer cached by default.** A cached response
   carrying `tool_calls` is a stored decision to act: an identical later prompt
   replayed it without the model being consulted, and without a request going

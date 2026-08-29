@@ -157,6 +157,31 @@ _PY_TO_JSON = {
 }
 
 
+def _extract_json(content: str) -> tuple:
+    """Find the JSON value in a model reply. Returns ``(value, found)``.
+
+    Models fence their JSON, or wrap it in a sentence, so this strips code
+    fences and falls back to the first ``{...}`` span. ``found`` distinguishes
+    "the reply carried no JSON" from "the reply carried JSON that happens to
+    be null" - a distinction :meth:`Router._resolve` needs and a plain return
+    value cannot express.
+    """
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+    try:
+        return json.loads(text), True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0)), True
+        except json.JSONDecodeError:
+            pass
+    return None, False
+
+
 def _pydantic_schema(model: Type[Any]) -> Dict[str, Any]:
     """Return a JSON schema for a Pydantic model, across v1 and v2."""
     if hasattr(model, "model_json_schema"):
@@ -2149,19 +2174,15 @@ class Agent:
 
     @staticmethod
     def _loads_object(content: str) -> Dict[str, Any]:
-        content = (content or "").strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", content).strip()
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", content, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    pass
-        return {}
+        """Best-effort parse of a model reply into a JSON object.
+
+        Always a dict: a reply of ``null`` or ``[1, 2]`` is valid JSON but not
+        an object, and returning it would hand a non-mapping to
+        ``schema(**data)`` further down, where it fails as a TypeError rather
+        than as the ValidationError the repair loop expects.
+        """
+        value, found = _extract_json(content)
+        return value if found and isinstance(value, dict) else {}
 
 
 # --- 8. Session (one conversation's state) ---------------------------------
@@ -2251,18 +2272,38 @@ class Session:
 class Router:
     """Coordinate several agents: route to one, run all, or run all and fuse.
 
-    :meth:`route` fails closed - if the model's choice is empty, evasive,
-    hallucinated or ambiguous it raises :class:`RoutingError` rather than
-    guessing. Pass ``fallback=`` to nominate an agent for those queries.
+    :meth:`route` **fails closed**. A routing decision is only valid if it
+    names exactly one registered agent; an empty, evasive, hallucinated,
+    malformed or ambiguous reply raises :class:`RoutingError` rather than
+    dispatching to an agent nobody chose. Pass ``fallback=`` to nominate an
+    agent for those queries - explicitly, in your code.
+
+    The decision is asked for as JSON and then **checked against the agent
+    registry in Python**. The prompt is where the model is told what is
+    allowed; the registry lookup is what enforces it. Nothing the model
+    writes can name an agent this Router does not hold.
+
+    ``strict=True`` accepts only a structured reply or a bare exact name,
+    refusing prose entirely. The default also accepts a name appearing as a
+    contiguous run of words in a longer reply ("the best agent is cost"),
+    which small local models often produce - see :meth:`_resolve` for what
+    that does and does not catch.
 
     Every dispatch runs in a **fresh** :class:`Session` per agent, so a
     router can serve concurrent queries without two of them landing in the
     same agent's history. It never touches an agent's default session. Pass
     ``metadata=`` to hand the caller's identity to each session, and so to
     :class:`ToolPolicy`.
+
+    :meth:`run_all` and :meth:`synthesize` do not route - they run every
+    agent - so none of this applies to them.
     """
 
-    _WORD_RE = re.compile(r"[a-z0-9_]+")
+    _TOKEN_RE = re.compile(r"[a-z0-9_]+")
+    # An agent description is developer-supplied, but it is often built from
+    # data that is not. Cap it so a long one cannot crowd out the
+    # instruction, and see _descriptions for why newlines are collapsed.
+    _MAX_DESCRIPTION = 200
 
     def __init__(
         self,
@@ -2270,70 +2311,179 @@ class Router:
         agents: List[Agent],
         synthesizer: Optional[Agent] = None,
         fallback: Optional[Agent] = None,
+        strict: bool = False,
     ):
         """``fallback`` receives queries that :meth:`route` cannot resolve.
 
         Leave it ``None`` (the default) to fail closed with
         :class:`RoutingError` instead of dispatching to an unchosen agent.
+
+        Agent names are validated here rather than at routing time: a name
+        that is blank, or that collides with another once case and spacing
+        are normalised, makes "resolve to exactly one agent" impossible. Both
+        used to be silent - a blank-named agent was simply unreachable
+        forever, and one of two identically-named agents always won.
         """
         if not agents:
             raise ValueError("Router needs at least one agent.")
+        registry: Dict[str, Agent] = {}
+        for position, agent in enumerate(agents):
+            key = self._normalise(agent.name)
+            if not key:
+                raise ValueError(
+                    f"The agent at position {position} has a blank name "
+                    f"({agent.name!r}), so nothing could ever route to it."
+                )
+            if key in registry:
+                raise ValueError(
+                    f"Two agents share the routing name {key!r}. Names must be unique "
+                    "once case and surrounding whitespace are normalised, or a routing "
+                    "decision cannot identify one agent."
+                )
+            registry[key] = agent
         self.llm, self.agents, self.synthesizer = llm, agents, synthesizer
         self.fallback = fallback
+        self.strict = strict
+        self._registry = registry
+        self._decision_model = self._build_decision_model()
+
+    # -- the registry is the authority ------------------------------------
+    @staticmethod
+    def _normalise(text: Any) -> str:
+        """Casefold, strip, and collapse internal whitespace to one space."""
+        return " ".join(str(text or "").casefold().split())
+
+    def _tokens(self, text: Any) -> List[str]:
+        return self._TOKEN_RE.findall(self._normalise(text))
+
+    def _build_decision_model(self) -> Optional[Any]:
+        """A Pydantic model whose ``agent`` field is one of the known names.
+
+        This is what makes the *request* structured: the allowed values come
+        from the registry, so the model is shown a closed set rather than
+        asked to invent a name. It is not the enforcement - :meth:`_resolve`
+        looks the answer up in the registry regardless.
+        """
+        if not _HAS_PYDANTIC_V2:  # pragma: no cover - v2 is the pinned floor
+            return None
+        names = tuple(sorted(self._registry))
+        try:
+            return create_model("RouterDecision", agent=(Literal[names], ...))
+        except Exception:  # pragma: no cover - exotic agent names only
+            return None
 
     def _descriptions(self) -> str:
-        return "\n".join(f"- {a.name}: {a.description}" for a in self.agents)
+        """One line per agent, for the router prompt.
+
+        Whitespace inside a description is collapsed and the text is capped.
+        A description containing newlines could otherwise forge extra "- name:"
+        lines in this list, presenting agents that do not exist or attaching
+        instructions to one that does. Collapsing removes that shape; the
+        registry check removes its effect.
+        """
+        lines = []
+        for agent in self.agents:
+            description = " ".join(str(agent.description or "").split())
+            if len(description) > self._MAX_DESCRIPTION:
+                description = description[: self._MAX_DESCRIPTION - 3] + "..."
+            lines.append(f"- {self._normalise(agent.name)}: {description}")
+        return "\n".join(lines)
 
     def route(self, query: str) -> Agent:
-        """Ask the LLM which single agent fits best and return it."""
+        """Ask the LLM which single agent fits best and return it.
+
+        Raises :class:`RoutingError` if the answer does not identify exactly
+        one registered agent and no ``fallback`` was configured.
+        """
+        names = ", ".join(sorted(self._registry))
         prompt = [
             {
                 "role": "system",
-                "content": "You are a router. Pick the single best "
-                "agent for the user's query. Reply with ONLY the agent name.",
+                "content": (
+                    "You are a router. Choose the single best agent for the user's "
+                    'query. Reply with ONLY a JSON object: {"agent": "<name>"}. '
+                    f"The value must be exactly one of: {names}. "
+                    'If none of them fits, reply {"agent": null}.'
+                ),
             },
             {
                 "role": "user",
-                "content": f"Agents:\n{self._descriptions()}\n\nQuery: {query}\n\nBest agent:",
+                "content": f"Agents:\n{self._descriptions()}\n\nQuery: {query}",
             },
         ]
-        return self._match(self.llm.chat(prompt)["content"].strip().lower())
+        reply = self.llm.chat(prompt, response_format=self._decision_model)
+        return self._match(reply["content"])
 
     def _match(self, choice: str) -> Agent:
-        """Resolve a router reply to exactly one agent, or fail closed.
-
-        An exact name wins outright. Otherwise every word of an agent's name
-        must appear as a whole word in the reply, and exactly one agent may
-        qualify. Everything else - an empty reply, a refusal, a hallucinated
-        name, or a reply naming two agents - is unroutable and raises
-        :class:`RoutingError` unless a ``fallback`` agent was configured.
-
-        Whole-word matching replaces the previous substring scoring, which
-        was unsafe in both directions: ``""`` was "in" every agent name (so a
-        blank reply matched the longest-named agent), and a name like ``fit``
-        matched an unrelated reply mentioning "profit".
-        """
-        choice = choice.strip().lower()
-        matched: List[Agent] = []
-        if choice:
-            words = set(self._WORD_RE.findall(choice))
-            for agent in self.agents:
-                name = agent.name.strip().lower()
-                if name and name == choice:
-                    return agent
-                name_words = set(self._WORD_RE.findall(name))
-                if name_words and name_words <= words:
-                    matched.append(agent)
-        if len(matched) == 1:
-            return matched[0]
+        """Resolve a router reply to one agent, or fail closed."""
+        agent = self._resolve(choice)
+        if agent is not None:
+            return agent
         if self.fallback is not None:
             return self.fallback
-        reply = choice if len(choice) <= 120 else choice[:117] + "..."
+        shown = self._normalise(choice)
+        if len(shown) > 120:
+            shown = shown[:117] + "..."
         raise RoutingError(
-            f"could not route to a single agent: the model replied {reply!r}, which "
-            f"matches {len(matched)} of {[a.name for a in self.agents]}. Pass "
-            "Router(..., fallback=agent) to handle unroutable queries explicitly."
+            f"could not identify exactly one agent from the model's reply {shown!r}. "
+            f"Known agents: {sorted(self._registry)}. Pass Router(..., fallback=agent) "
+            "to handle unroutable queries explicitly."
         )
+
+    def _resolve(self, choice: str) -> Optional[Agent]:
+        """Return the one agent this reply names, or None. Never guesses.
+
+        A reply carrying JSON is judged **only** as a structured decision: it
+        must be an object with an ``agent`` field naming a registered agent.
+        It is never rescanned as prose, because salvaging one would invert its
+        meaning - ``{"rejected": "cost"}`` mentions exactly one agent, and
+        scanning it for names would route to the agent the model just ruled
+        out.
+
+        A reply carrying no JSON is matched as text, exactly:
+
+        1. **Bare name** - the whole reply, normalised, *is* a known name.
+        2. **Embedded name** - the name appears as a contiguous run of words
+           inside a longer reply, and exactly one agent's does. Skipped under
+           ``strict=True``.
+
+        Anything else returns None: an empty or whitespace reply, a refusal,
+        an unregistered name, unparseable JSON, or a reply naming two agents.
+        Ambiguity is not broken by preference or order - two matches is a
+        failure, not a contest.
+
+        Rule 2 is exact containment, not fuzzy matching: ``fit`` does not
+        match "profit", and a two-word name does not match a reply using both
+        words apart ("admin ... delete"). What it cannot see is *sense*: prose
+        mentioning one agent in order to reject it ("not cost") reads as
+        choosing it. The structured path has no such gap, so set
+        ``strict=True`` where that matters.
+        """
+        value, found = _extract_json(choice)
+        if found:
+            name = value.get("agent") if isinstance(value, dict) else None
+            return self._registry.get(self._normalise(name)) if isinstance(name, str) else None
+        agent = self._registry.get(self._normalise(choice))
+        if agent is not None:
+            return agent
+        if self.strict:
+            return None
+        words = self._tokens(choice)
+        if not words:
+            return None
+        matches = [
+            candidate
+            for key, candidate in self._registry.items()
+            if self._contains_run(words, self._TOKEN_RE.findall(key))
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _contains_run(words: List[str], name: List[str]) -> bool:
+        """True if ``name`` appears in ``words`` as consecutive whole words."""
+        if not name or len(name) > len(words):
+            return False
+        return any(words[i : i + len(name)] == name for i in range(len(words) - len(name) + 1))
 
     def run(self, query: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         """Route the query to one agent and run it in a fresh session."""

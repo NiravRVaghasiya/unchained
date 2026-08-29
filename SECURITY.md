@@ -95,13 +95,23 @@ hold even when the model is confused, jailbroken, or adversarial.
   that hangs or crashes, and refusals are written to the module logger even
   when no callback is attached. Audit events carry arguments verbatim — redact
   them in your sink if your tools take secrets.
-- **Routing fails closed.** `Router.route()` dispatches only on an exact agent
-  name or an unambiguous whole-word mention of exactly one agent. Anything
-  else — an empty reply, a refusal, a hallucinated name, or a reply naming two
-  agents — raises `RoutingError`. This matters because agents differ in the
-  tools, and therefore the privileges, they hold: a silent fallback would let
-  a confused router hand a query to a more privileged agent than the one
-  intended. Pass `Router(..., fallback=agent)` to choose a default explicitly.
+- **Routing fails closed, against a registry.** The routing decision is
+  requested as JSON constrained to the registered agent names, then resolved
+  by looking the answer up in that registry — so no reply, however crafted,
+  can name an agent the `Router` does not hold. A decision is valid only if
+  it identifies exactly one registered agent; an empty reply, a refusal, a
+  hallucinated name, malformed JSON, or a reply naming two agents all raise
+  `RoutingError`. This matters because agents differ in the tools, and
+  therefore the privileges, they hold: a silent fallback would let a confused
+  router hand a query to a more privileged agent than the one intended. Pass
+  `Router(..., fallback=agent)` to choose a default explicitly.
+- **Agent descriptions cannot forge the router's agent list.** Descriptions
+  are interpolated into the routing prompt, so one containing newlines could
+  present extra `- name:` entries — agents that do not exist, or instructions
+  attached to one that does. Whitespace is collapsed and the text is capped,
+  which removes that shape; the registry check removes its effect. Names are
+  also validated at construction: blank names and post-normalisation
+  duplicates are rejected rather than silently unreachable or ambiguous.
 - **Tool-call concurrency is bounded.** The number of tool calls in a turn is
   chosen by the model, so it is untrusted input. The executor is capped by
   `Agent(max_tool_workers=8)` rather than sized to the request, so one response
@@ -135,6 +145,16 @@ Known non-boundaries, by design:
   reconcile agent behaviour against provider-side logs, cached turns will not
   appear there. Use `cache="none"` where that matters, and `clear_cache()`
   when the underlying facts change.
+- **Routing is not an authorization boundary on its own.** A prompt
+  injection — in an agent description, or in the user's query — can still
+  persuade the model to choose a different *registered* agent. Python can
+  guarantee the choice is one of yours, not that it is the right one. What
+  bounds the damage is that the chosen agent's own `ToolPolicy` still governs
+  what it may do. Do not rely on routing to keep a privileged agent
+  unreachable; give it a policy that refuses.
+- **Text routing replies cannot read sense.** With the default (non-`strict`)
+  `Router`, prose that mentions exactly one agent in order to *reject* it
+  ("not cost") resolves to that agent. Use `strict=True` where that matters.
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).

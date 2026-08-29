@@ -286,16 +286,20 @@ separate objects, not from locking.
 router.route(query)              router.run_all(query)
      │                                │
      ├── Build agent descriptions     ├── For each agent:
-     ├── Ask LLM: "which agent?"      │   └── agent.run(query)
-     ├── Match exactly one name       │
+     ├── Ask LLM for JSON: {agent}    │   └── agent.run(query)
+     ├── Look it up in the registry   │
      └── Delegate, or RoutingError    └── Return {name: result}
 
-Routing fails closed. The reply must be an agent's exact name, or mention
-exactly one agent by whole word; an empty, evasive, hallucinated or ambiguous
-reply raises `RoutingError` rather than falling back to an arbitrary agent.
-Agents differ in the tools - and so the privileges - they hold, so this is an
-authorization decision, and it is enforced in Python rather than by trusting
-the router prompt. `Router(..., fallback=agent)` names a default explicitly.
+Routing fails closed. The decision is requested as JSON constrained to the
+registered names, then resolved by a lookup in that registry - the prompt is
+where the model is told what is allowed, the lookup is what enforces it. A
+decision is valid only if it identifies exactly one registered agent; empty,
+evasive, hallucinated, malformed and ambiguous replies all raise
+`RoutingError` rather than falling back to an arbitrary agent. Agents differ
+in the tools - and so the privileges - they hold, so this is an authorization
+decision, enforced in Python rather than by trusting the router prompt.
+`Router(..., fallback=agent)` names a default explicitly; `strict=True`
+refuses prose replies entirely.
 
 PickMyStack uses run_all() → Synthesizer pattern:
   ┌──────────┐  ┌──────────┐  ┌──────────┐

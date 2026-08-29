@@ -411,9 +411,17 @@ router.synthesize("Recommend a stack for my team")  # run all, then fuse
 
 **Routing fails closed.** Agents differ in the tools — and so the privileges —
 they carry, so picking the wrong one is an authorization mistake, not just a
-quality one. `route()` accepts an exact agent name, or a whole-word mention of
-exactly one agent. An empty, evasive, hallucinated or ambiguous reply raises
-`RoutingError` rather than quietly dispatching to an agent nobody chose:
+quality one.
+
+The decision is asked for as JSON, constrained to the registered agent names,
+and then **checked against the registry in Python**. The prompt is where the
+model is told what is allowed; the lookup is what enforces it — nothing the
+model writes can name an agent the router does not hold.
+
+A decision is valid only if it identifies exactly one registered agent.
+Everything else raises `RoutingError`: an empty reply, whitespace, a refusal,
+a hallucinated name, malformed JSON, or a reply naming two agents. Ambiguity
+is a failure, not a contest — it is never broken by order or preference.
 
 ```python
 from unchained import RoutingError
@@ -428,6 +436,23 @@ Prefer a default destination? Name it, and the choice stays visible in the code:
 
 ```python
 router = Router(llm, agents=[...], fallback=triage_agent)
+```
+
+Agent names are validated when the `Router` is built: a blank name, or two
+that collide once case and spacing are normalised, raises immediately. Both
+used to be silent — a blank-named agent was simply unreachable forever, and
+one of two identically-named agents always won.
+
+Text replies are still accepted for models that will not emit JSON: a bare
+name, or a name appearing as a *contiguous* run of words ("the best agent is
+cost"). That is exact containment, not fuzzy matching — `fit` does not match
+"profit", and a two-word name does not match a reply that uses both words
+apart. What text matching cannot see is *sense*: prose mentioning one agent
+in order to reject it ("not cost") reads as choosing it. Pass `strict=True`
+to refuse prose entirely and accept only structured or bare-name replies:
+
+```python
+router = Router(llm, agents=[...], strict=True)
 ```
 
 ## The agent loop
