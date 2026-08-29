@@ -32,6 +32,7 @@ import uuid
 import warnings
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 from functools import partial
 from typing import (
     Any,
@@ -95,6 +96,8 @@ __all__ = [
     "ToolAuthorizationError",
     "ToolApprovalRequired",
     "ToolArgumentValidationError",
+    "ToolTimeoutError",
+    "ToolOutputTruncated",
 ]
 
 # HTTP statuses worth retrying: rate limiting plus transient server errors.
@@ -138,6 +141,60 @@ class ToolArgumentValidationError(RuntimeError):
     """Raised when model-supplied arguments do not fit the tool's signature."""
 
 
+class ToolOutputTruncated:
+    """Records that a tool result was shortened before the model saw it.
+
+    Deliberately **not** an exception: the tool succeeded, and the shortened
+    result is still useful. It carries what was cut, so an application can log
+    or alert on it, and renders as the note appended to the text the model
+    reads - which is what stops the shortening from being silent.
+    """
+
+    def __init__(self, tool: str, original_size: int, limit: int, was_json: bool = False):
+        self.tool = tool
+        self.original_size = original_size
+        self.limit = limit
+        self.was_json = was_json
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """A plain, JSON-serialisable record - safe for logs and memory extras."""
+        return {
+            "tool": self.tool,
+            "truncated": True,
+            "original_size": self.original_size,
+            "limit": self.limit,
+            "was_json": self.was_json,
+        }
+
+    def __str__(self) -> str:
+        note = (
+            f"\n\n[output truncated: {self.limit:,} of {self.original_size:,} characters "
+            f"shown for tool '{self.tool}']"
+        )
+        if self.was_json:
+            # Say so explicitly. A model handed a JSON fragment will otherwise
+            # try to parse it, and a cut structure is not recoverable.
+            note += (
+                " The full result was valid JSON; this fragment is cut mid-structure "
+                "and will not parse."
+            )
+        return note
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ToolOutputTruncated {self.tool} {self.limit}/{self.original_size}>"
+
+
+class ToolTimeoutError(RuntimeError):
+    """Raised when a tool call outlives its timeout.
+
+    The timeout bounds how long the **agent** waits, which is not the same as
+    stopping the tool. Python cannot cancel a thread that is already running:
+    the call keeps going in the background until it finishes on its own. See
+    :meth:`Agent._invoke` for what that means in practice.
+    """
+
+
 class _RetryableStatus(Exception):
     """Internal signal that the server returned a retryable HTTP status."""
 
@@ -155,6 +212,31 @@ _PY_TO_JSON = {
     list: "array",
     dict: "object",
 }
+
+
+def _extract_json(content: str) -> tuple:
+    """Find the JSON value in a model reply. Returns ``(value, found)``.
+
+    Models fence their JSON, or wrap it in a sentence, so this strips code
+    fences and falls back to the first ``{...}`` span. ``found`` distinguishes
+    "the reply carried no JSON" from "the reply carried JSON that happens to
+    be null" - a distinction :meth:`Router._resolve` needs and a plain return
+    value cannot express.
+    """
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+    try:
+        return json.loads(text), True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0)), True
+        except json.JSONDecodeError:
+            pass
+    return None, False
 
 
 def _pydantic_schema(model: Type[Any]) -> Dict[str, Any]:
@@ -189,6 +271,13 @@ class Tool:
     * ``side_effects`` - True if calling it changes something.
     * ``allowed``      - ``fn(arguments, context) -> bool`` for a per-call
       check that depends on the arguments (a path prefix, a row limit, ...).
+    * ``timeout``      - seconds the agent will wait for this tool before
+      giving up on it. Overrides ``Agent(tool_timeout=...)``. Enforced by the
+      agent, like the policy - :meth:`run` does not apply it, because a
+      direct call is your own code calling your own function.
+    * ``max_output_size`` - characters of result the agent will pass on to
+      the model. Overrides ``Agent(max_tool_output_size=...)``. Also enforced
+      by the agent, for the same reason.
 
     None of this is sent to the model. Metadata describes the tool to your
     policy; it is not a hint the model can read, argue with, or override.
@@ -213,6 +302,8 @@ class Tool:
         requires_approval: bool = False,
         side_effects: bool = False,
         allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+        timeout: Optional[float] = None,
+        max_output_size: Optional[int] = None,
     ):
         self.func = func
         self.name = func.__name__
@@ -224,6 +315,8 @@ class Tool:
         self.requires_approval = requires_approval
         self.side_effects = side_effects
         self.allowed = allowed
+        self.timeout = timeout
+        self.max_output_size = max_output_size
         self.accepts_kwargs = any(
             param.kind is inspect.Parameter.VAR_KEYWORD
             for param in inspect.signature(func).parameters.values()
@@ -499,6 +592,8 @@ def tool(
     requires_approval: bool = ...,
     side_effects: bool = ...,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = ...,
+    timeout: Optional[float] = ...,
+    max_output_size: Optional[int] = ...,
 ) -> Callable[[Callable[..., Any]], Tool]: ...
 
 
@@ -509,6 +604,8 @@ def tool(
     requires_approval: bool = False,
     side_effects: bool = False,
     allowed: Optional[Callable[[Dict[str, Any], Dict[str, Any]], bool]] = None,
+    timeout: Optional[float] = None,
+    max_output_size: Optional[int] = None,
 ) -> Any:
     """Decorator: turn any function into a Tool with an auto-generated schema.
 
@@ -522,6 +619,10 @@ def tool(
         @tool(permissions={"db:write"}, side_effects=True, requires_approval=True)
         def delete_record(record_id: str) -> str:
             "Destructive: gated by policy, and confirmed per call."
+
+        @tool(timeout=10, max_output_size=8_000)
+        def fetch_data(url: str) -> str:
+            "Waited on for 10s, and trimmed to 8k characters."
     """
 
     def wrap(target: Callable[..., Any]) -> Tool:
@@ -531,6 +632,8 @@ def tool(
             requires_approval=requires_approval,
             side_effects=side_effects,
             allowed=allowed,
+            timeout=timeout,
+            max_output_size=max_output_size,
         )
 
     return wrap(func) if func is not None else wrap
@@ -1654,6 +1757,8 @@ class Agent:
         policy: Optional[ToolPolicy] = None,
         approve: Optional[Callable[[Dict[str, Any]], bool]] = None,
         memory_factory: Optional[Callable[[], Memory]] = None,
+        tool_timeout: Optional[float] = None,
+        max_tool_output_size: Optional[int] = None,
     ):
         """``memory`` and ``memory_factory`` differ, and the difference matters.
 
@@ -1695,6 +1800,12 @@ class Agent:
         # comes from the caller of Agent(), and nothing the model emits can
         # set, reach or influence it.
         self.approve = approve
+        # Seconds to wait for any tool that does not set its own timeout.
+        # None means wait forever, which is the old behaviour.
+        self.tool_timeout = tool_timeout
+        # Characters of tool output to pass on, for tools that do not set
+        # their own. None means unbounded, which is the old behaviour.
+        self.max_tool_output_size = max_tool_output_size
         # A turn's tool calls run concurrently, but a CLI prompt or a modal
         # dialog must not be re-entered from several workers at once. This
         # stays on the Agent on purpose: it guards the application's single
@@ -2035,9 +2146,131 @@ class Agent:
             return f"Error: tool '{name}' was not authorized (policy error)."
         self._audit(session, name, arguments, decision, "", tool_obj)
         try:
-            return str(tool_obj.run(arguments))
+            output = str(self._invoke(tool_obj, arguments))
+        except ToolTimeoutError as exc:
+            logger.warning("%s", exc)
+            return f"Error: {exc}"
         except Exception as exc:  # a tool must never crash the loop
-            return f"Error executing '{name}': {exc}"
+            # Bounded too: an exception message can be as large as a result.
+            output = f"Error executing '{name}': {exc}"
+        return self._bound_output(tool_obj, output)
+
+    def _output_limit_for(self, tool_obj: Tool) -> Optional[int]:
+        """Characters of output to keep: the tool's own setting, else the agent's."""
+        if tool_obj.max_output_size is not None:
+            return tool_obj.max_output_size
+        return self.max_tool_output_size
+
+    def _bound_output(self, tool_obj: Tool, text: str) -> str:
+        """Shorten a tool result to its budget, before it reaches the context.
+
+        This runs inside :meth:`_execute`, so the bound is applied before the
+        observation is added to memory, sent to a provider, or shown to a
+        callback - there is no path where the full text reaches the model.
+
+        The budget counts **characters, not bytes**. Python strings are
+        sequences of code points, so slicing can never split one and produce
+        invalid text; a multi-character emoji sequence can be split, which is
+        cosmetic. Characters also compose with ``Memory(max_tokens=...)``,
+        which estimates tokens the same way.
+
+        Nothing is shortened silently. An oversized result keeps its first
+        ``limit`` characters and gains a :class:`ToolOutputTruncated` note
+        saying how much was dropped - and, when the full result was valid
+        JSON, saying that the fragment is cut mid-structure and will not
+        parse, since a model handed a JSON fragment will otherwise try. The
+        note is appended on top of the budget rather than counted inside it,
+        so ``max_output_size`` bounds the tool's own text.
+
+        This is a **context and cost boundary, not a security control**. It
+        limits what a tool sends onward; it does not stop a tool reading or
+        computing anything, and a secret inside the retained prefix is
+        retained. Do not use it to contain a hostile tool.
+        """
+        limit = self._output_limit_for(tool_obj)
+        if limit is None or len(text) <= limit:
+            return text
+        indicator = ToolOutputTruncated(
+            tool=tool_obj.name,
+            original_size=len(text),
+            limit=limit,
+            was_json=self._looks_like_json(text),
+        )
+        logger.warning(
+            "tool %s: output truncated to %d of %d characters",
+            tool_obj.name,
+            limit,
+            indicator.original_size,
+        )
+        return text[:limit] + str(indicator)
+
+    @staticmethod
+    def _looks_like_json(text: str) -> bool:
+        """Whether the untruncated text parsed as JSON.
+
+        Only asked on the truncation path, and only for text that opens like
+        JSON, so a large result is not parsed for nothing.
+        """
+        if text[:512].lstrip()[:1] not in ("{", "["):
+            return False
+        try:
+            json.loads(text)
+        except (ValueError, RecursionError):
+            return False
+        return True
+
+    def _timeout_for(self, tool_obj: Tool) -> Optional[float]:
+        """Seconds to wait for this tool: its own setting, else the agent's."""
+        return tool_obj.timeout if tool_obj.timeout is not None else self.tool_timeout
+
+    def _invoke(self, tool_obj: Tool, arguments: Dict[str, Any]) -> Any:
+        """Run one tool, bounded by its timeout if it has one.
+
+        **The timeout bounds the wait, not the work.** Python cannot cancel a
+        running thread, so when a call overruns, the agent stops waiting and
+        reports a :class:`ToolTimeoutError` while the tool keeps running in
+        the background until it returns on its own. Consequences worth
+        knowing before relying on this:
+
+        * A tool with side effects may still complete after the timeout. On
+          timeout you do not know whether the effect happened - treat it as
+          unknown, not as failed.
+        * The orphaned thread is not reclaimed until the call ends, and
+          because executor threads are non-daemon it can delay interpreter
+          exit. A tool that hangs forever holds a thread forever.
+        * Hard cancellation of arbitrary Python needs process isolation - run
+          the work in a subprocess and kill it, as ``examples/coder.py``
+          does. A thread timeout is a liveness guard for the agent loop, not
+          a containment boundary.
+        * A timeout does not abort a socket read either, so HTTP tools still
+          need their own network timeout. ``requests.get(...)`` without
+          ``timeout=`` can block for a very long time; the tool timeout will
+          free the agent but leave the request running.
+
+        Without a timeout the call runs inline, exactly as before - no thread,
+        no executor, and an unbounded tool blocks the agent.
+        """
+        timeout = self._timeout_for(tool_obj)
+        if timeout is None:
+            return tool_obj.run(arguments)
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{tool_obj.name}")
+        try:
+            future = pool.submit(tool_obj.run, arguments)
+            try:
+                return future.result(timeout=timeout)
+            except _FutureTimeout:
+                raise ToolTimeoutError(
+                    f"tool '{tool_obj.name}' did not finish within {timeout}s and was "
+                    "abandoned; it may still be running, so treat any side effect as "
+                    "unknown rather than as not having happened"
+                ) from None
+        finally:
+            # wait=False is the whole point: the default shutdown(wait=True)
+            # would block on the very call we just gave up on, re-creating
+            # the hang this exists to prevent. A finished call's worker exits
+            # promptly and nothing leaks; an overrunning one keeps its thread
+            # because Python has no way to take it back.
+            pool.shutdown(wait=False)
 
     def _request_approval(
         self,
@@ -2149,19 +2382,15 @@ class Agent:
 
     @staticmethod
     def _loads_object(content: str) -> Dict[str, Any]:
-        content = (content or "").strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", content).strip()
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", content, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    pass
-        return {}
+        """Best-effort parse of a model reply into a JSON object.
+
+        Always a dict: a reply of ``null`` or ``[1, 2]`` is valid JSON but not
+        an object, and returning it would hand a non-mapping to
+        ``schema(**data)`` further down, where it fails as a TypeError rather
+        than as the ValidationError the repair loop expects.
+        """
+        value, found = _extract_json(content)
+        return value if found and isinstance(value, dict) else {}
 
 
 # --- 8. Session (one conversation's state) ---------------------------------
@@ -2251,18 +2480,38 @@ class Session:
 class Router:
     """Coordinate several agents: route to one, run all, or run all and fuse.
 
-    :meth:`route` fails closed - if the model's choice is empty, evasive,
-    hallucinated or ambiguous it raises :class:`RoutingError` rather than
-    guessing. Pass ``fallback=`` to nominate an agent for those queries.
+    :meth:`route` **fails closed**. A routing decision is only valid if it
+    names exactly one registered agent; an empty, evasive, hallucinated,
+    malformed or ambiguous reply raises :class:`RoutingError` rather than
+    dispatching to an agent nobody chose. Pass ``fallback=`` to nominate an
+    agent for those queries - explicitly, in your code.
+
+    The decision is asked for as JSON and then **checked against the agent
+    registry in Python**. The prompt is where the model is told what is
+    allowed; the registry lookup is what enforces it. Nothing the model
+    writes can name an agent this Router does not hold.
+
+    ``strict=True`` accepts only a structured reply or a bare exact name,
+    refusing prose entirely. The default also accepts a name appearing as a
+    contiguous run of words in a longer reply ("the best agent is cost"),
+    which small local models often produce - see :meth:`_resolve` for what
+    that does and does not catch.
 
     Every dispatch runs in a **fresh** :class:`Session` per agent, so a
     router can serve concurrent queries without two of them landing in the
     same agent's history. It never touches an agent's default session. Pass
     ``metadata=`` to hand the caller's identity to each session, and so to
     :class:`ToolPolicy`.
+
+    :meth:`run_all` and :meth:`synthesize` do not route - they run every
+    agent - so none of this applies to them.
     """
 
-    _WORD_RE = re.compile(r"[a-z0-9_]+")
+    _TOKEN_RE = re.compile(r"[a-z0-9_]+")
+    # An agent description is developer-supplied, but it is often built from
+    # data that is not. Cap it so a long one cannot crowd out the
+    # instruction, and see _descriptions for why newlines are collapsed.
+    _MAX_DESCRIPTION = 200
 
     def __init__(
         self,
@@ -2270,70 +2519,179 @@ class Router:
         agents: List[Agent],
         synthesizer: Optional[Agent] = None,
         fallback: Optional[Agent] = None,
+        strict: bool = False,
     ):
         """``fallback`` receives queries that :meth:`route` cannot resolve.
 
         Leave it ``None`` (the default) to fail closed with
         :class:`RoutingError` instead of dispatching to an unchosen agent.
+
+        Agent names are validated here rather than at routing time: a name
+        that is blank, or that collides with another once case and spacing
+        are normalised, makes "resolve to exactly one agent" impossible. Both
+        used to be silent - a blank-named agent was simply unreachable
+        forever, and one of two identically-named agents always won.
         """
         if not agents:
             raise ValueError("Router needs at least one agent.")
+        registry: Dict[str, Agent] = {}
+        for position, agent in enumerate(agents):
+            key = self._normalise(agent.name)
+            if not key:
+                raise ValueError(
+                    f"The agent at position {position} has a blank name "
+                    f"({agent.name!r}), so nothing could ever route to it."
+                )
+            if key in registry:
+                raise ValueError(
+                    f"Two agents share the routing name {key!r}. Names must be unique "
+                    "once case and surrounding whitespace are normalised, or a routing "
+                    "decision cannot identify one agent."
+                )
+            registry[key] = agent
         self.llm, self.agents, self.synthesizer = llm, agents, synthesizer
         self.fallback = fallback
+        self.strict = strict
+        self._registry = registry
+        self._decision_model = self._build_decision_model()
+
+    # -- the registry is the authority ------------------------------------
+    @staticmethod
+    def _normalise(text: Any) -> str:
+        """Casefold, strip, and collapse internal whitespace to one space."""
+        return " ".join(str(text or "").casefold().split())
+
+    def _tokens(self, text: Any) -> List[str]:
+        return self._TOKEN_RE.findall(self._normalise(text))
+
+    def _build_decision_model(self) -> Optional[Any]:
+        """A Pydantic model whose ``agent`` field is one of the known names.
+
+        This is what makes the *request* structured: the allowed values come
+        from the registry, so the model is shown a closed set rather than
+        asked to invent a name. It is not the enforcement - :meth:`_resolve`
+        looks the answer up in the registry regardless.
+        """
+        if not _HAS_PYDANTIC_V2:  # pragma: no cover - v2 is the pinned floor
+            return None
+        names = tuple(sorted(self._registry))
+        try:
+            return create_model("RouterDecision", agent=(Literal[names], ...))
+        except Exception:  # pragma: no cover - exotic agent names only
+            return None
 
     def _descriptions(self) -> str:
-        return "\n".join(f"- {a.name}: {a.description}" for a in self.agents)
+        """One line per agent, for the router prompt.
+
+        Whitespace inside a description is collapsed and the text is capped.
+        A description containing newlines could otherwise forge extra "- name:"
+        lines in this list, presenting agents that do not exist or attaching
+        instructions to one that does. Collapsing removes that shape; the
+        registry check removes its effect.
+        """
+        lines = []
+        for agent in self.agents:
+            description = " ".join(str(agent.description or "").split())
+            if len(description) > self._MAX_DESCRIPTION:
+                description = description[: self._MAX_DESCRIPTION - 3] + "..."
+            lines.append(f"- {self._normalise(agent.name)}: {description}")
+        return "\n".join(lines)
 
     def route(self, query: str) -> Agent:
-        """Ask the LLM which single agent fits best and return it."""
+        """Ask the LLM which single agent fits best and return it.
+
+        Raises :class:`RoutingError` if the answer does not identify exactly
+        one registered agent and no ``fallback`` was configured.
+        """
+        names = ", ".join(sorted(self._registry))
         prompt = [
             {
                 "role": "system",
-                "content": "You are a router. Pick the single best "
-                "agent for the user's query. Reply with ONLY the agent name.",
+                "content": (
+                    "You are a router. Choose the single best agent for the user's "
+                    'query. Reply with ONLY a JSON object: {"agent": "<name>"}. '
+                    f"The value must be exactly one of: {names}. "
+                    'If none of them fits, reply {"agent": null}.'
+                ),
             },
             {
                 "role": "user",
-                "content": f"Agents:\n{self._descriptions()}\n\nQuery: {query}\n\nBest agent:",
+                "content": f"Agents:\n{self._descriptions()}\n\nQuery: {query}",
             },
         ]
-        return self._match(self.llm.chat(prompt)["content"].strip().lower())
+        reply = self.llm.chat(prompt, response_format=self._decision_model)
+        return self._match(reply["content"])
 
     def _match(self, choice: str) -> Agent:
-        """Resolve a router reply to exactly one agent, or fail closed.
-
-        An exact name wins outright. Otherwise every word of an agent's name
-        must appear as a whole word in the reply, and exactly one agent may
-        qualify. Everything else - an empty reply, a refusal, a hallucinated
-        name, or a reply naming two agents - is unroutable and raises
-        :class:`RoutingError` unless a ``fallback`` agent was configured.
-
-        Whole-word matching replaces the previous substring scoring, which
-        was unsafe in both directions: ``""`` was "in" every agent name (so a
-        blank reply matched the longest-named agent), and a name like ``fit``
-        matched an unrelated reply mentioning "profit".
-        """
-        choice = choice.strip().lower()
-        matched: List[Agent] = []
-        if choice:
-            words = set(self._WORD_RE.findall(choice))
-            for agent in self.agents:
-                name = agent.name.strip().lower()
-                if name and name == choice:
-                    return agent
-                name_words = set(self._WORD_RE.findall(name))
-                if name_words and name_words <= words:
-                    matched.append(agent)
-        if len(matched) == 1:
-            return matched[0]
+        """Resolve a router reply to one agent, or fail closed."""
+        agent = self._resolve(choice)
+        if agent is not None:
+            return agent
         if self.fallback is not None:
             return self.fallback
-        reply = choice if len(choice) <= 120 else choice[:117] + "..."
+        shown = self._normalise(choice)
+        if len(shown) > 120:
+            shown = shown[:117] + "..."
         raise RoutingError(
-            f"could not route to a single agent: the model replied {reply!r}, which "
-            f"matches {len(matched)} of {[a.name for a in self.agents]}. Pass "
-            "Router(..., fallback=agent) to handle unroutable queries explicitly."
+            f"could not identify exactly one agent from the model's reply {shown!r}. "
+            f"Known agents: {sorted(self._registry)}. Pass Router(..., fallback=agent) "
+            "to handle unroutable queries explicitly."
         )
+
+    def _resolve(self, choice: str) -> Optional[Agent]:
+        """Return the one agent this reply names, or None. Never guesses.
+
+        A reply carrying JSON is judged **only** as a structured decision: it
+        must be an object with an ``agent`` field naming a registered agent.
+        It is never rescanned as prose, because salvaging one would invert its
+        meaning - ``{"rejected": "cost"}`` mentions exactly one agent, and
+        scanning it for names would route to the agent the model just ruled
+        out.
+
+        A reply carrying no JSON is matched as text, exactly:
+
+        1. **Bare name** - the whole reply, normalised, *is* a known name.
+        2. **Embedded name** - the name appears as a contiguous run of words
+           inside a longer reply, and exactly one agent's does. Skipped under
+           ``strict=True``.
+
+        Anything else returns None: an empty or whitespace reply, a refusal,
+        an unregistered name, unparseable JSON, or a reply naming two agents.
+        Ambiguity is not broken by preference or order - two matches is a
+        failure, not a contest.
+
+        Rule 2 is exact containment, not fuzzy matching: ``fit`` does not
+        match "profit", and a two-word name does not match a reply using both
+        words apart ("admin ... delete"). What it cannot see is *sense*: prose
+        mentioning one agent in order to reject it ("not cost") reads as
+        choosing it. The structured path has no such gap, so set
+        ``strict=True`` where that matters.
+        """
+        value, found = _extract_json(choice)
+        if found:
+            name = value.get("agent") if isinstance(value, dict) else None
+            return self._registry.get(self._normalise(name)) if isinstance(name, str) else None
+        agent = self._registry.get(self._normalise(choice))
+        if agent is not None:
+            return agent
+        if self.strict:
+            return None
+        words = self._tokens(choice)
+        if not words:
+            return None
+        matches = [
+            candidate
+            for key, candidate in self._registry.items()
+            if self._contains_run(words, self._TOKEN_RE.findall(key))
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _contains_run(words: List[str], name: List[str]) -> bool:
+        """True if ``name`` appears in ``words`` as consecutive whole words."""
+        if not name or len(name) > len(words):
+            return False
+        return any(words[i : i + len(name)] == name for i in range(len(words) - len(name) + 1))
 
     def run(self, query: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         """Route the query to one agent and run it in a fresh session."""

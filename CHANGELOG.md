@@ -6,6 +6,84 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Tool output limits.** A tool could return megabytes straight into the
+  transcript - overflowing the context window, costing money on every
+  subsequent turn, and growing memory. `@tool(max_output_size=8_000)` bounds
+  one tool and `Agent(max_tool_output_size=20_000)` all of them, with the
+  tool's own setting taking precedence. `None` still means unbounded, so
+  existing agents are unchanged.
+  - Applied inside `Agent._execute`, before the result reaches memory, a
+    provider or a callback - there is no path where the full text gets
+    through. An oversized exception message is bounded the same way.
+  - **Nothing is truncated silently**: an oversized result carries a note
+    stating how much was dropped.
+  - **JSON is never silently corrupted**: if the full result was valid JSON,
+    the note says so and warns that the fragment will not parse, because a
+    model handed JSON will otherwise try. Structured output that fits is
+    passed through byte-for-byte.
+  - The budget counts **characters, not bytes**, so a slice can never split a
+    code point and produce invalid text, and it lines up with
+    `Memory(max_tokens=...)`, which estimates tokens the same way.
+  - New `ToolOutputTruncated`, carrying `.metadata` as a plain JSON-safe dict.
+    It is not an exception - the tool succeeded and a shortened result is
+    still useful.
+  - This is a context and cost boundary, **not a security sandbox**: it limits
+    what a tool sends onward, not what it can read or do. Documented in the
+    README and SECURITY.md.
+- **Tool execution timeouts.** LLM calls had a timeout; an arbitrary Python
+  tool could block the agent forever. `@tool(timeout=10)` sets a budget for
+  one tool and `Agent(tool_timeout=30)` a default for all of them, with the
+  tool's own setting taking precedence. `None` still means wait forever, so
+  existing agents are unchanged, and a tool with no timeout runs inline as
+  before — no executor, no thread.
+  - On overrun the model receives an ordinary tool error and the loop
+    continues; the run does not hang and does not raise.
+  - Concurrent calls each get their own budget. The executor is shut down
+    with `wait=False`, because the default `wait=True` would block on the
+    very call just abandoned — re-creating the hang the timeout exists to
+    prevent.
+  - New `ToolTimeoutError`.
+  - **The timeout bounds the agent's wait, not the tool's work.** Python
+    cannot cancel a running thread: the abandoned call keeps running, keeps
+    its thread, and may still complete, so a side effect after a timeout must
+    be treated as unknown rather than as not having happened. Hard
+    cancellation needs process isolation (`examples/coder.py`), and HTTP
+    tools still need their own network timeout. Documented in the README and
+    SECURITY.md rather than papered over.
+  - Approval waits are deliberately outside the budget: a human pausing to
+    confirm must not be read as a hanging tool.
+
+### Security
+- **Routing decisions are now validated against the agent registry.**
+  `Router.route()` asks for JSON constrained to the registered agent names
+  and resolves the answer by looking it up in that registry, so no reply can
+  name an agent the router does not hold. A decision is valid only if it
+  identifies exactly one registered agent.
+- **Agent names are validated when the `Router` is built.** A blank name, or
+  two names that collide once case and surrounding whitespace are normalised,
+  now raises `ValueError`. Both were previously silent: a blank-named agent
+  could never be routed to, and one of two identically-named agents always
+  won, so "resolve to exactly one agent" was not achievable.
+- **Agent descriptions can no longer forge entries in the router's agent
+  list.** Descriptions are interpolated into the routing prompt; one
+  containing newlines could present extra `- name:` lines. Whitespace is now
+  collapsed and the text capped.
+- **Text matching no longer ignores word order.** A multi-word agent name
+  matched any reply containing its words anywhere, so an `admin delete` agent
+  was selected by "do not use admin, use the delete path". Matching now
+  requires the name to appear as a contiguous run of words.
+- `Agent._loads_object()` now always returns a dict. A reply of `null` or
+  `[1, 2]` is valid JSON but not an object, and returning it handed a
+  non-mapping to `schema(**data)` in the structured-output repair loop, where
+  it raised `TypeError` instead of the expected `ValidationError`.
+
+### Added
+- `Router(strict=True)` accepts only a structured decision or a bare exact
+  name, refusing prose. Text matching cannot read sense - prose mentioning one
+  agent in order to reject it ("not cost") resolves to it - and `strict`
+  closes that gap for deployments that need it.
+
 ### Security
 - **Tool-call responses are no longer cached by default.** A cached response
   carrying `tool_calls` is a stored decision to act: an identical later prompt

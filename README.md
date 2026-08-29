@@ -195,6 +195,106 @@ by the model, so the pool is capped — `Agent(max_tool_workers=8)` — rather t
 sized to the request. Extra calls queue and still run; only concurrency is
 bounded.
 
+### ⏱️ Tool timeouts — bounding the wait, not the work
+
+An LLM call has a timeout; a Python tool can block forever. Give a tool a
+budget, or set a default for all of them:
+
+```python
+@tool(timeout=10)
+def fetch_data(url: str) -> str:
+    """The agent waits 10s, then gives up on it."""
+
+
+agent = Agent(llm, tools=[fetch_data], tool_timeout=30)  # default for tools
+```
+
+A tool's own `timeout` wins over the agent's default. `None` (the default)
+means wait forever, exactly as before. On overrun the agent stops waiting and
+the model receives an ordinary tool error, so the loop continues:
+
+```
+Error: tool 'fetch_data' did not finish within 10s and was abandoned; it may
+still be running, so treat any side effect as unknown rather than as not
+having happened
+```
+
+**Be clear about what this does not do.** Python cannot cancel a running
+thread, and Unchained does not pretend otherwise:
+
+- The tool keeps running after the timeout. It may still complete — and if it
+  has side effects, **you do not know whether they happened.** Treat the
+  outcome as unknown, not as failed.
+- The abandoned thread is not reclaimed until the call ends. Because executor
+  threads are not daemons, a tool that hangs forever can delay interpreter
+  exit.
+- **Hard cancellation needs process isolation.** Run the work in a subprocess
+  and kill it — see [`examples/coder.py`](examples/coder.py). A thread timeout
+  is a liveness guard for the agent loop, not a containment boundary.
+- **A timeout does not abort a socket read.** HTTP tools still need their own
+  network timeout: `requests.get(url, timeout=20)`. Without one the request
+  can block for a very long time; the tool timeout frees the agent but leaves
+  the request running and holding a connection.
+
+Concurrent calls each get their own budget, so one hanging tool does not delay
+its siblings or the turn.
+
+### 📏 Tool output limits — bounding what reaches the context
+
+A tool can return megabytes. That overflows the context window, costs money
+every turn it stays in the transcript, and grows memory. Give a tool a budget,
+or set a default:
+
+```python
+@tool(max_output_size=8_000)
+def read_log(path: str) -> str:
+    """At most 8,000 characters reach the model."""
+
+
+agent = Agent(llm, tools=[read_log], max_tool_output_size=20_000)
+```
+
+A tool's own `max_output_size` wins over the agent's default; `None` (the
+default) means unbounded, exactly as before. The budget is applied inside
+`Agent._execute`, **before** the result enters memory, reaches a provider, or
+is shown to a callback — there is no path where the full text gets through.
+
+**Nothing is truncated silently.** An oversized result keeps its first `n`
+characters and gains a note:
+
+```
+[output truncated: 8,000 of 1,250,000 characters shown for tool 'read_log']
+```
+
+**JSON is never silently corrupted.** If the full result was valid JSON, the
+note says so and warns that the fragment will not parse — because a model
+handed JSON will otherwise try:
+
+```
+... The full result was valid JSON; this fragment is cut mid-structure and
+will not parse.
+```
+
+Structured output that *fits* is passed through byte-for-byte, so a JSON tool
+under its budget still returns parseable JSON.
+
+The budget counts **characters, not bytes**. Python strings are sequences of
+code points, so a slice can never split one and produce invalid text — 40 CJK
+characters cost 40, not the 120 bytes they occupy. A multi-character emoji
+sequence can be split, which is cosmetic. Characters also line up with
+`Memory(max_tokens=...)`, which estimates tokens the same way.
+
+`ToolOutputTruncated` carries the details (`.metadata` is a plain, JSON-safe
+dict) if you want to log or alert on truncation. It is not an exception — the
+tool succeeded, and a shortened result is still useful.
+
+> **This is a context and cost boundary, not a security sandbox.** It limits
+> what a tool *sends onward*; it does not stop a tool reading, computing or
+> transmitting anything, and a secret inside the retained prefix is retained.
+> To contain a hostile tool you need process isolation and a policy — see
+> [`examples/coder.py`](examples/coder.py) and
+> [Tool authorization](#-tool-authorization--a-policy-layer-not-a-prompt).
+
 ### 👥 Sessions — one agent, many conversations
 
 An `Agent` is configuration and behaviour: the LLM, the tools, the prompt, the
@@ -411,9 +511,17 @@ router.synthesize("Recommend a stack for my team")  # run all, then fuse
 
 **Routing fails closed.** Agents differ in the tools — and so the privileges —
 they carry, so picking the wrong one is an authorization mistake, not just a
-quality one. `route()` accepts an exact agent name, or a whole-word mention of
-exactly one agent. An empty, evasive, hallucinated or ambiguous reply raises
-`RoutingError` rather than quietly dispatching to an agent nobody chose:
+quality one.
+
+The decision is asked for as JSON, constrained to the registered agent names,
+and then **checked against the registry in Python**. The prompt is where the
+model is told what is allowed; the lookup is what enforces it — nothing the
+model writes can name an agent the router does not hold.
+
+A decision is valid only if it identifies exactly one registered agent.
+Everything else raises `RoutingError`: an empty reply, whitespace, a refusal,
+a hallucinated name, malformed JSON, or a reply naming two agents. Ambiguity
+is a failure, not a contest — it is never broken by order or preference.
 
 ```python
 from unchained import RoutingError
@@ -428,6 +536,23 @@ Prefer a default destination? Name it, and the choice stays visible in the code:
 
 ```python
 router = Router(llm, agents=[...], fallback=triage_agent)
+```
+
+Agent names are validated when the `Router` is built: a blank name, or two
+that collide once case and spacing are normalised, raises immediately. Both
+used to be silent — a blank-named agent was simply unreachable forever, and
+one of two identically-named agents always won.
+
+Text replies are still accepted for models that will not emit JSON: a bare
+name, or a name appearing as a *contiguous* run of words ("the best agent is
+cost"). That is exact containment, not fuzzy matching — `fit` does not match
+"profit", and a two-word name does not match a reply that uses both words
+apart. What text matching cannot see is *sense*: prose mentioning one agent
+in order to reject it ("not cost") reads as choosing it. Pass `strict=True`
+to refuse prose entirely and accept only structured or bare-name replies:
+
+```python
+router = Router(llm, agents=[...], strict=True)
 ```
 
 ## The agent loop
