@@ -897,6 +897,42 @@ you an answer the model already produced. In tests that hides bugs, so
 stream and the older hooks together. Existing subclasses are unaffected — the
 base `on_event` is a no-op.
 
+### One response shape, whoever answered
+
+Every provider is reduced to the same `LLMResponse`, so nothing downstream
+needs to know which one replied:
+
+```python
+response = llm.chat([{"role": "user", "content": "hi"}])
+
+response.content  # the assistant text
+response.tool_calls  # [{"name", "arguments", "id"}], arguments parsed
+response.usage  # prompt_tokens / completion_tokens / total_tokens
+response.finish_reason  # "stop" | "tool_calls" | "length" | "content_filter"
+response.provider  # "openai" | "anthropic" | "ollama"
+response.model  # what actually answered: "gpt-4o-mini-2024-07-18"
+response.request_id  # for quoting to a provider's support
+response.metadata  # provider-specific extras, opaque to the agent loop
+```
+
+**`finish_reason` is worth having.** Anthropic's `max_tokens`, OpenAI's
+`length` and Ollama's `done_reason` all become `"length"`, and
+`response.truncated` is True — which is otherwise invisible, so an agent
+would treat a half-finished answer as a complete one. A reason we don't
+recognise is passed through unchanged rather than forced into a bucket, and
+the provider's own wording is always kept in `metadata["raw_finish_reason"]`.
+
+Provider-specific detail is preserved rather than discarded, but confined to
+`metadata` — OpenAI's `system_fingerprint`, Ollama's timings, Anthropic's
+`stop_sequence`, and the `endpoint` that answered (useful when
+`provider="openai"` is pointed at Groq or vLLM). Nothing in the agent loop
+reads it; it's there for your logs.
+
+The response still behaves like the plain dict it replaced —
+`response["content"]`, `response.get("usage")` — so existing code and test
+doubles that return a bare dict keep working. It is frozen, so a handler
+can't rewrite a reply another handler is about to see.
+
 ### Token usage tracking
 
 Usage is normalised across providers and accumulated per agent:

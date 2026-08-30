@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`LLMResponse`: one normalised reply shape across providers.** `chat()`
+  returned a three-key dict - content, tool_calls, usage - and discarded
+  everything else the provider said. It now returns an `LLMResponse` carrying
+  `finish_reason`, `provider`, `model`, `request_id` and a `metadata` dict as
+  well.
+  - **`finish_reason` is normalised** onto OpenAI's vocabulary: Anthropic's
+    `end_turn`/`tool_use`/`max_tokens` and Ollama's `done_reason` all map
+    onto `stop`/`tool_calls`/`length`. An unrecognised reason is passed
+    through unchanged rather than forced into a bucket, and the provider's
+    own wording is kept in `metadata["raw_finish_reason"]`.
+  - `response.truncated` reports the `length` case, which nothing else in a
+    reply reveals - an agent used to treat a cut-off answer as a complete one.
+  - `model` is the model the provider reports, which is often more specific
+    than the one requested (`gpt-4o-mini-2024-07-18` for `gpt-4o-mini`).
+  - `request_id` comes from the response headers, falling back to the body's
+    own id, for quoting to a provider's support.
+  - `metadata` keeps provider-specific detail - OpenAI's
+    `system_fingerprint`, Ollama's timings, Anthropic's `stop_sequence`, and
+    the `endpoint` that answered, which distinguishes an OpenAI-compatible
+    host from OpenAI itself. Nothing in the agent loop reads it.
+  - Backwards compatible: `LLMResponse` supports the mapping access the old
+    dict had (`response["content"]`, `response.get("usage")`, `in`), so
+    existing code and test doubles returning a bare dict keep working. It is
+    frozen, so a reply cannot be rewritten after the fact.
+  - `MockLLM` produces the same model, so a stand-in cannot pass a test
+    against a shape no provider produces.
+  - The response cache stores the whole reply; rebuilding a few keys would
+    have silently dropped `finish_reason`, `request_id` and `metadata` from
+    cached answers.
+  - OpenAI parsing is defensive about missing `choices`: "OpenAI-compatible"
+    is a claim, not a guarantee, and a thin reply should not surface as a
+    `KeyError` from inside the framework.
+  - No provider SDKs; still `requests` + `pydantic`.
+
 ### Security
 - **Untrusted text is now structurally separated from instructions.**
   Retrieved documents and tool results were inserted into the conversation

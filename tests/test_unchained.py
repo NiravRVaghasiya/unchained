@@ -9,6 +9,7 @@ keys or network access are required.
 import asyncio
 import dataclasses
 import enum
+import inspect
 import json
 import sys
 import threading
@@ -3264,7 +3265,10 @@ def test_a_caller_mutating_a_response_cannot_corrupt_the_cache(monkeypatch):
     messages = [{"role": "user", "content": "q"}]
 
     first = llm.chat(messages)
-    first["content"] = "tampered"
+    # The response itself is frozen, so the top level cannot be rewritten.
+    with pytest.raises((TypeError, dataclasses.FrozenInstanceError)):
+        first["content"] = "tampered"
+    # Its mutable members are still copies, so nested tampering is contained.
     first["usage"]["prompt_tokens"] = 999
 
     second = llm.chat(messages)
@@ -5724,3 +5728,291 @@ def test_the_system_prompt_is_not_repeated_where_data_could_reach_it(hostile_age
     messages = agent._build_messages(session, None)
     later = " ".join(str(m.get("content", "")) for m in messages[1:])
     assert "You are a billing agent." not in later
+
+
+# ---------------------------------------------------------------------------
+# Tier 18: the normalised provider response
+#
+# Mocked bodies shaped like the real ones. The point of each test is that the
+# agent loop never has to know which provider answered - and that what used to
+# be discarded (finish reason, ids, the actual model) survives.
+# ---------------------------------------------------------------------------
+_OPENAI_BODY = {
+    "id": "chatcmpl-abc123",
+    "model": "gpt-4o-mini-2024-07-18",
+    "system_fingerprint": "fp_44709d6fcb",
+    "created": 1735000000,
+    "choices": [
+        {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "lookup", "arguments": '{"q": "x"}'}}
+                ],
+            },
+        }
+    ],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+}
+
+_ANTHROPIC_BODY = {
+    "id": "msg_01XYZ",
+    "model": "claude-3-5-sonnet-20241022",
+    "stop_reason": "max_tokens",
+    "stop_sequence": None,
+    "content": [{"type": "text", "text": "a partial answer"}],
+    "usage": {"input_tokens": 12, "output_tokens": 40},
+}
+
+_OLLAMA_BODY = {
+    "model": "llama3.1",
+    "created_at": "2026-01-01T00:00:00Z",
+    "done_reason": "stop",
+    "total_duration": 123456789,
+    "load_duration": 1000,
+    "eval_duration": 99999,
+    "message": {"content": "local answer"},
+    "prompt_eval_count": 7,
+    "eval_count": 3,
+}
+
+
+def _reply(monkeypatch, provider, body, headers=None, **kwargs):
+    _patch_post(monkeypatch, body, headers=headers)
+    llm = LLM(provider=provider, api_key="k", **kwargs)
+    return llm.chat([{"role": "user", "content": "hi"}])
+
+
+# --- one shape, whoever answered ------------------------------------------
+def test_openai_reply_is_normalised(monkeypatch):
+    response = _reply(monkeypatch, "openai", _OPENAI_BODY, {"x-request-id": "req_openai_1"})
+
+    assert response.content == ""
+    assert response.tool_calls == [{"name": "lookup", "arguments": {"q": "x"}, "id": "call_1"}]
+    assert response.usage == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert response.finish_reason == "tool_calls"
+    assert response.provider == "openai"
+    assert response.model == "gpt-4o-mini-2024-07-18"  # what answered, not what was asked
+    assert response.request_id == "req_openai_1"
+
+
+def test_anthropic_reply_is_normalised(monkeypatch):
+    response = _reply(monkeypatch, "anthropic", _ANTHROPIC_BODY, {"request-id": "req_anth_9"})
+
+    assert response.content == "a partial answer"
+    assert response.usage == {"prompt_tokens": 12, "completion_tokens": 40, "total_tokens": 52}
+    assert response.finish_reason == "length"
+    assert response.provider == "anthropic"
+    assert response.model == "claude-3-5-sonnet-20241022"
+    assert response.request_id == "req_anth_9"
+
+
+def test_ollama_reply_is_normalised(monkeypatch):
+    response = _reply(monkeypatch, "ollama", _OLLAMA_BODY)
+
+    assert response.content == "local answer"
+    assert response.usage == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    assert response.finish_reason == "stop"
+    assert response.provider == "ollama"
+    assert response.model == "llama3.1"
+    assert response.request_id is None  # Ollama offers none, and none is invented
+
+
+def test_every_provider_produces_the_same_field_set(monkeypatch):
+    shapes = []
+    for provider, body in (
+        ("openai", _OPENAI_BODY),
+        ("anthropic", _ANTHROPIC_BODY),
+        ("ollama", _OLLAMA_BODY),
+    ):
+        shapes.append(sorted(_reply(monkeypatch, provider, body).as_dict()))
+    assert shapes[0] == shapes[1] == shapes[2]
+    assert shapes[0] == [
+        "content",
+        "finish_reason",
+        "metadata",
+        "model",
+        "provider",
+        "request_id",
+        "tool_calls",
+        "usage",
+    ]
+
+
+# --- an OpenAI-compatible endpoint ----------------------------------------
+def test_an_openai_compatible_endpoint_is_handled_and_recorded(monkeypatch):
+    response = _reply(monkeypatch, "openai", _OPENAI_BODY, {}, base_url="https://api.groq.com")
+    assert response.provider == "openai"
+    assert response.metadata["endpoint"] == "https://api.groq.com"
+    # No request-id header from this endpoint, so the body's own id is used.
+    assert response.request_id == "chatcmpl-abc123"
+
+
+@pytest.mark.parametrize("body", [{}, {"choices": []}, {"choices": [{}]}])
+def test_a_thin_openai_compatible_reply_does_not_raise(monkeypatch, body):
+    # "OpenAI-compatible" is a claim, not a guarantee. A missing choice should
+    # not surface as a KeyError from inside the framework.
+    response = _reply(monkeypatch, "openai", body)
+    assert response.content == ""
+    assert response.tool_calls == []
+
+
+# --- finish_reason ---------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("end_turn", "stop"),
+        ("stop_sequence", "stop"),
+        ("tool_use", "tool_calls"),
+        ("max_tokens", "length"),
+    ],
+)
+def test_anthropic_stop_reasons_map_onto_the_common_vocabulary(monkeypatch, raw, expected):
+    response = _reply(monkeypatch, "anthropic", {**_ANTHROPIC_BODY, "stop_reason": raw})
+    assert response.finish_reason == expected
+    assert response.metadata["raw_finish_reason"] == raw  # nothing is lost
+
+
+def test_an_unrecognised_finish_reason_is_passed_through(monkeypatch):
+    # Forcing it into a known bucket would misreport it.
+    body = {
+        **_OPENAI_BODY,
+        "choices": [{"finish_reason": "guardrail", "message": {"content": "x"}}],
+    }
+    assert _reply(monkeypatch, "openai", body).finish_reason == "guardrail"
+
+
+def test_a_truncated_reply_is_visible(monkeypatch):
+    # The reason this matters: nothing else in the reply says the answer was
+    # cut off, so the agent would treat a half-answer as complete.
+    truncated = _reply(monkeypatch, "anthropic", _ANTHROPIC_BODY)
+    assert truncated.truncated is True
+
+    complete = _reply(monkeypatch, "anthropic", {**_ANTHROPIC_BODY, "stop_reason": "end_turn"})
+    assert complete.truncated is False
+
+
+def test_a_missing_finish_reason_is_inferred_only_from_evidence(monkeypatch):
+    # Tool calls in the reply are evidence. Their absence is not evidence of
+    # "stop", so None is reported rather than guessed.
+    with_tools = _reply(
+        monkeypatch,
+        "openai",
+        {**_OPENAI_BODY, "choices": [{"message": _OPENAI_BODY["choices"][0]["message"]}]},
+    )
+    assert with_tools.finish_reason == "tool_calls"
+
+    without = _reply(monkeypatch, "openai", {"choices": [{"message": {"content": "hi"}}]})
+    assert without.finish_reason is None
+
+
+# --- provider metadata is kept, and stays out of the way ------------------
+def test_provider_metadata_is_preserved(monkeypatch):
+    openai = _reply(monkeypatch, "openai", _OPENAI_BODY)
+    assert openai.metadata["system_fingerprint"] == "fp_44709d6fcb"
+    assert openai.metadata["response_id"] == "chatcmpl-abc123"
+    assert openai.metadata["created"] == 1735000000
+
+    ollama = _reply(monkeypatch, "ollama", _OLLAMA_BODY)
+    assert ollama.metadata["total_duration"] == 123456789
+    assert ollama.metadata["created_at"] == "2026-01-01T00:00:00Z"
+
+    anthropic = _reply(monkeypatch, "anthropic", {**_ANTHROPIC_BODY, "stop_sequence": "END"})
+    assert anthropic.metadata["stop_sequence"] == "END"
+
+
+def test_absent_metadata_fields_are_omitted_rather_than_stored_as_none(monkeypatch):
+    response = _reply(monkeypatch, "openai", {**_OPENAI_BODY, "system_fingerprint": None})
+    assert "system_fingerprint" not in response.metadata
+
+
+def test_the_agent_loop_reads_none_of_the_provider_metadata():
+    # The point of confining it: Agent uses content, tool_calls and usage.
+    source = inspect.getsource(unchained.Agent)
+    for provider_only in ("system_fingerprint", "stop_reason", "done_reason", "total_duration"):
+        assert provider_only not in source
+
+
+# --- the model behaves like the dict it replaced --------------------------
+def test_the_response_still_supports_the_previous_dict_access(monkeypatch):
+    response = _reply(monkeypatch, "openai", _OPENAI_BODY)
+    assert response["content"] == ""
+    assert response["tool_calls"][0]["name"] == "lookup"
+    assert response.get("usage")["total_tokens"] == 15
+    assert response.get("missing", "fallback") == "fallback"
+    assert "finish_reason" in response
+    assert "nonsense" not in response
+    with pytest.raises(KeyError):
+        response["nonsense"]
+
+
+def test_the_response_is_immutable(monkeypatch):
+    response = _reply(monkeypatch, "openai", _OPENAI_BODY)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        response.content = "tampered"
+
+
+def test_the_response_serialises_for_logging(monkeypatch):
+    response = _reply(monkeypatch, "openai", _OPENAI_BODY)
+    json.dumps(response.as_dict())
+
+
+def test_llm_response_is_exported():
+    assert "LLMResponse" in unchained.__all__
+    assert unchained.LLMResponse().content == ""
+
+
+# --- the rest of the framework still works --------------------------------
+def test_mockllm_produces_the_same_model():
+    # A stand-in returning a different shape would let a test pass against
+    # something no provider produces.
+    response = MockLLM(reply="mock answer").chat([{"role": "user", "content": "x"}])
+    assert isinstance(response, unchained.LLMResponse)
+    assert response.content == "mock answer"
+    assert response.provider == "mock"
+    assert response.finish_reason == "stop"
+
+
+def test_mockllm_scripted_tool_calls_report_the_right_finish_reason():
+    script = [{"content": "", "tool_calls": [{"name": "f", "arguments": {}, "id": "c"}]}]
+    response = MockLLM(script=script).chat([{"role": "user", "content": "x"}])
+    assert response.finish_reason == "tool_calls"
+
+
+def test_the_cache_preserves_the_whole_response(monkeypatch):
+    # Rebuilding three keys on the way in or out would silently drop
+    # finish_reason, request_id and metadata from a cached answer.
+    captured = _patch_post(monkeypatch, _OPENAI_BODY, headers={"x-request-id": "req_1"})
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    messages = [{"role": "user", "content": "same"}]
+
+    fresh = llm.chat(messages)
+    cached = llm.chat(messages)
+    assert captured["calls"] == 1  # the second came from the cache
+    assert cached.as_dict() == fresh.as_dict()
+    assert cached.request_id == "req_1"
+    assert cached.metadata["system_fingerprint"] == "fp_44709d6fcb"
+
+
+def test_an_agent_runs_unchanged_against_the_new_model(monkeypatch):
+    @tool
+    def lookup(q: str) -> str:
+        """Look up."""
+        return f"found {q}"
+
+    _patch_post(
+        monkeypatch,
+        responses=[
+            _FakeResponse(_OPENAI_BODY),
+            _FakeResponse(
+                {
+                    "choices": [{"finish_reason": "stop", "message": {"content": "all done"}}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                }
+            ),
+        ],
+    )
+    agent = Agent(LLM(provider="openai", api_key="k"), tools=[lookup])
+    assert agent.run("go") == "all done"
+    assert agent.usage["total_tokens"] == 20  # both calls, accumulated as before

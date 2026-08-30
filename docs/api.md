@@ -8,6 +8,7 @@ Auto-generated from the docstrings in `unchained.py`.
         - tool
         - Tool
         - LLM
+        - LLMResponse
         - MockLLM
         - Memory
         - RAG
