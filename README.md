@@ -41,22 +41,29 @@ compression, and multi-agent routing actually work under the hood.
 
 ## Install
 
-```bash
-# The whole framework is just two dependencies:
-pip install requests pydantic
+The framework needs only `requests` and `pydantic`:
 
-# ...or install the package with the dev/test extras:
-pip install -e ".[dev]"
+```bash
+pip install requests pydantic
 ```
 
-Prefer zero install? Take the one file — that's the point:
+Then take the one source file — that's the point:
 
 ```bash
 curl -O https://raw.githubusercontent.com/NiravRVaghasiya/unchained/main/unchained/__init__.py
 mv __init__.py unchained.py
 ```
 
-It sits in a directory in this repository only so that `pip install unchained-ai`
+Working on Unchained itself? Clone the repository and install it editable, with
+the development extras:
+
+```bash
+git clone https://github.com/NiravRVaghasiya/unchained.git
+cd unchained
+pip install -e ".[dev]"
+```
+
+The file sits in a directory in this repository only so that `pip install unchained-ai`
 can ship a PEP 561 `py.typed` marker, which a type checker will not accept on a
 bare top-level module. Dropped into your project as `unchained.py`, it works
 exactly the same.
@@ -674,6 +681,22 @@ Duplicate documents are kept rather than merged — the same text can
 legitimately arrive twice from different sources — and equal scores keep
 insertion order.
 
+Each document can carry metadata, returned alongside every hit:
+
+```python
+rag.add_many(["...", "..."], [{"source": "handbook.md"}, {"source": "faq.md"}])
+rag.search("holiday policy")  # -> [{"text": ..., "score": ..., "metadata": {...}}]
+```
+
+**What this is not.** There is no automatic chunking — split long documents
+yourself before adding them (see
+[`examples/pickmystack/`](examples/pickmystack/) for one way). There is no
+metadata filtering: `search()` takes a query and `top_k`, and ranks the whole
+corpus. Nothing is persisted — the index lives in memory and is rebuilt on
+each start. Scoring is a linear scan over every document, which is fine for
+hundreds or a few thousand chunks and is not a vector database. If you outgrow
+it, keep the `Agent` and put a real index behind the same `search()` shape.
+
 ### 📦 Structured output — validated with Pydantic
 
 ```python
@@ -1040,6 +1063,37 @@ streamlit run examples/pickmystack/ui/app_ui.py
 -->
 
 
+## Security and limitations
+
+Unchained enforces real boundaries in Python — a policy decides whether a tool
+runs, arguments are validated against the signature, retrieved and returned
+text is fenced as data, and budgets stop a runaway loop. None of that makes it
+a sandbox, and the README would be misleading if it implied otherwise:
+
+- **Tools run in your process, with your process's privileges.** A tool is an
+  ordinary Python function called in-process. It can read what your process
+  can read, open sockets, and spawn processes. Installing a tool is trusting
+  code, exactly like adding a dependency.
+- **Prompt injection is not solved.** Retrieved documents and tool results are
+  fenced and marked as data, and the system prompt says so — but a persuasive
+  document can still talk a model into asking for the wrong thing. What
+  contains it is that a `ToolPolicy` decides in Python what may run, from
+  metadata fixed at decoration time.
+- **Nothing here restricts network access.** A tool that fetches a
+  model-supplied URL will reach `localhost` and internal hosts. Validate URLs
+  and pass an explicit `timeout=` inside the tool.
+- **Running untrusted code needs external isolation** — a container, seccomp,
+  egress rules. [`examples/coder.py`](examples/coder.py) uses an isolated
+  subprocess and says plainly that this is a demo, not a sandbox.
+- **A tool timeout bounds the wait, not the work.** Python cannot cancel a
+  running thread, so after a timeout on a side-effecting tool, treat the effect
+  as unknown rather than as not having happened.
+
+**[SECURITY.md](SECURITY.md)** has the full threat model, the trust ladder over
+the five sources of text, what is enforced in code, what deliberately is not,
+and a production checklist. Read it before putting an agent in front of
+anything that matters.
+
 ## Documentation
 
 - **[API reference & docs site](https://niravrvaghasiya.github.io/unchained/)** — built with MkDocs (`pip install -e ".[docs]" && mkdocs serve`)
@@ -1059,8 +1113,8 @@ pytest --cov=unchained  # tests + coverage
 ```
 
 The test suite uses a fake LLM, so it runs fully offline with no API keys. CI
-runs all of the above across Python 3.9–3.13 on every push. See
-[CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+runs all of the above across Python 3.9–3.13 on every pull request and on
+pushes to `main`. See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
 
 ## Extending
 
@@ -1070,7 +1124,7 @@ Unchained is designed to be extended, not forked:
 |---|---|
 | New tool | `@tool` on any function (sync or async) |
 | Stricter argument rules | annotate the parameter with a Pydantic model |
-| New LLM provider | add a `_provider()` method to `LLM` |
+| New LLM provider | add a `_yourprovider()` method to `LLM`, then register it in `_PROVIDER_DEFAULTS` and `_dispatch` |
 | OpenAI-compatible provider | reuse `provider="openai"` with a different `base_url` |
 | True async HTTP | subclass `LLM` and override `chat()`/`_request()` with an async client |
 | Better retrieval | swap `RAG._rebuild_index()` + `search()` |
