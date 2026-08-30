@@ -14,36 +14,146 @@ advisory flow, or contact the maintainers directly.
 We aim to acknowledge reports within a few days and will keep you updated on
 remediation progress.
 
-## Notes for users
+## Threat model
 
-- **API keys:** never commit real keys. Use environment variables or a local
-  `.env` (see `.env.example`), both of which are gitignored.
-- **`examples/coder.py`** executes model-generated Python in-process. It is a
-  demo only. Do not expose it to untrusted input without a proper sandbox
-  (separate process, container, resource limits).
-- **The Streamlit UI** has no built-in authentication. Put it behind access
-  control before exposing it publicly, or it will spend your API quota.
-- Treat all model output as untrusted when feeding it into tools, shells, or
-  file operations.
+Read this before putting an agent in front of anything that matters. It
+describes what Unchained does and does not defend against, and every claim
+below is enforced in code — the boundaries are itemised in
+[Boundaries enforced in code](#boundaries-enforced-in-code), and the gaps in
+[Known non-boundaries](#known-non-boundaries-by-design).
 
-## Trust boundaries
+### The shape of the problem
 
-Unchained distinguishes five sources of text, and they are not equal:
+An agent takes instructions from you, input from a user, documents from a
+corpus, and results from tools — then a language model decides what to do
+next. The model is not a security boundary and cannot be made into one. So:
+
+> **Assume the model will eventually be persuaded to request the wrong thing,
+> and make sure the code refuses.**
+
+That is the whole design. Every guarantee Unchained offers is a Python check
+that holds regardless of what the model was told, believed, or produced.
+
+### Trust levels
 
 | Level | Source | Trusted for instructions? |
 |---|---|---|
-| 1 | **System prompt** — your `system_prompt` | yes; it is your code |
-| 2 | **Application config** — tools, policy, budgets, agent descriptions | yes; it is your code |
-| 3 | **User input** — the person you are serving | as a *request*, never as configuration |
-| 4 | **Retrieved documents** and **tool results** | **no — data only** |
-| 5 | **Model output** — including the memory summary | **no — data only** |
+| 1 | System prompt (`system_prompt`) | yes — it is your code |
+| 2 | Application config: tools, `ToolPolicy`, `Budget`, agent names | yes — it is your code |
+| 3 | User input | as a *request*, never as configuration |
+| 4 | **Retrieved documents, tool results** | **no — data only** |
+| 5 | **Model output**, including the memory summary | **no — data only** |
 
-Levels 4 and 5 are the ones that bite. A document in your corpus may have
-been written by anyone who can add to it; a tool result may come from a
-system that is itself relaying attacker-controlled text; and a summary is
-generated *from* those things.
+Levels 4 and 5 are the dangerous ones. A document may have been written by
+anyone who can add to your corpus; a tool result may relay text from a system
+you do not control; a summary is generated *from* both.
 
-**Structurally**, untrusted text is fenced before it reaches a provider:
+### Ten things that are true of this framework
+
+1. **Tools execute with the full privileges of the host Python process.** A
+   tool is an ordinary Python function called in-process. It can read any file
+   the process can read, open sockets, spawn processes, and reach into
+   Unchained's own objects. Installing a tool is trusting code, exactly like
+   adding a dependency.
+
+2. **Unchained is not a sandbox.** Nothing here confines what a tool does once
+   it runs. `ToolPolicy` decides *whether* a function is called;
+   `max_output_size` bounds what it *sends onward*; `timeout` bounds how long
+   the agent *waits*. None of them constrain the function's behaviour.
+
+3. **An LLM tool call is an untrusted request, not a decision.** Every
+   model-requested call takes one path — `Agent._execute` — which locates the
+   tool, validates the arguments against the Python signature, asks the
+   policy, takes approval if required, executes, and audits. A call naming a
+   tool the agent does not hold never reaches a function.
+
+4. **Retrieved documents and tool results are data, never instructions.** Both
+   are wrapped in a fence carrying a random per-agent marker before reaching a
+   provider, and any occurrence of that marker is stripped from the content,
+   so it cannot close its own block. The memory summary is fenced too — it is
+   spliced into the *system* message, so unfenced it would be a path from a
+   tool result into your instructions.
+
+5. **Prompt injection cannot be prevented by prompting, and this framework
+   does not claim to prevent it.** The system prompt states the data boundary;
+   that is the weakest layer and a persuasive document may still talk a model
+   into something. Fencing constrains *structure*, not persuasion. What
+   contains the damage is that a forged fence widens nothing: `permissions` is
+   a `frozenset` fixed at decoration, and `ToolPolicy` sees the tool, the
+   validated arguments and a context built from your code — never from
+   retrieved or returned text.
+
+6. **Least privilege is the application's job.** Give an agent the smallest
+   set of tools that lets it do its work, and gate them:
+   `PermissionPolicy(granted={"db:read"})`. A tool that declares no
+   `permissions` requires none, so declare them on everything you intend to
+   gate. Routing is *not* a privilege boundary — an injection can still steer
+   a router to a different registered agent, so give a privileged agent a
+   policy that refuses rather than relying on it being unreachable.
+
+7. **Side-effecting tools need a policy, and usually approval.** Mark them
+   `@tool(side_effects=True, permissions={...})` and, for anything
+   irreversible, `requires_approval=True`. Approval is an application callback
+   that model output cannot reach or influence; with no approver configured
+   the call is refused rather than allowed. Note that `side_effects=True` is
+   descriptive — it does **not** gate, serialise, or approve anything on its
+   own.
+
+8. **Network-facing tools must impose their own restrictions.** Unchained
+   performs no URL validation, no allow-listing, and no SSRF protection
+   anywhere. A tool that fetches a model-supplied URL will happily reach
+   `localhost`, link-local metadata endpoints, and internal hosts. If a tool
+   takes a URL, validate the scheme and resolved address inside the tool, and
+   always pass an explicit `timeout=` — a tool timeout does not abort a socket
+   read.
+
+9. **Keep secrets out of prompts.** Unchained never puts your API key in a
+   message: keys travel only in the `Authorization` / `x-api-key` headers, and
+   no placeholder is sent when none is configured. But secrets reach the
+   transcript by other routes you control — a tool that *returns* one, a tool
+   exception whose message contains one, or `Agent(event_payloads=True)`.
+   Audit events carry tool arguments verbatim by design; redact them in your
+   sink. Note also that `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` /
+   `OLLAMA_BASE_URL` redirect where your key is sent, and the endpoint appears
+   in `LLMResponse.metadata` — treat that environment as sensitive.
+
+10. **Running untrusted code requires external isolation.** If a tool executes
+    model-generated or user-supplied code, a subprocess is not enough — it can
+    still read files and reach the network. Use a container, gVisor/seccomp,
+    network egress rules and resource limits. `examples/coder.py` runs
+    snippets in an isolated subprocess with a timeout and says plainly that
+    this is a demo, not a sandbox.
+
+### Production checklist
+
+- [ ] Every tool is one an attacker may invoke with arguments of their choosing.
+- [ ] Agents hold the smallest tool set that does the job.
+- [ ] A `ToolPolicy` is configured; `permissions` are declared on every tool
+      you intend to gate.
+- [ ] Irreversible tools are `requires_approval=True` with an `approve=`
+      callback wired up.
+- [ ] Tools taking a URL validate scheme and resolved address, and pass
+      `timeout=`.
+- [ ] Tools that could return a secret redact it; audit and event sinks redact
+      arguments.
+- [ ] Tools executing code run under OS-level isolation, not just a subprocess.
+- [ ] `Budget` caps tokens, tool calls, wall clock and — if priced — spend.
+- [ ] `Agent(tool_timeout=...)` and `max_tool_output_size` are set, and you
+      accept that a timed-out side effect has an **unknown** outcome.
+- [ ] Tools whose concurrent calls would race are
+      `@tool(concurrency="exclusive")`.
+- [ ] One `Session` per user; `agent.run()` is a single conversation.
+- [ ] The RAG corpus is trusted the way user input is trusted.
+- [ ] Audit events (`on_tool_audit`) are retained somewhere you can query.
+- [ ] `Router(strict=True)` if routing decisions matter.
+- [ ] The Streamlit UI, if exposed, is behind authentication.
+- [ ] Keys come from the environment; `.env` and real keys are never committed.
+
+
+## How untrusted text is kept separate
+
+Retrieved documents, tool results and the memory summary are fenced before
+they reach a provider:
 
 ```
 <<document-9f2a1c4b7e8d0a35>>
@@ -52,59 +162,21 @@ generated *from* those things.
 <</document-9f2a1c4b7e8d0a35>>
 ```
 
-The marker carries a random per-agent value, and any occurrence of it is
-stripped from the text being fenced — so a document cannot close its own
-block and continue at instruction level. Tool results and the memory summary
-are fenced the same way. The summary matters especially: it is spliced into
-the **system** message, so unfenced it is a path from a tool result straight
-into your instructions.
+The marker carries a random per-agent value and every occurrence of it is
+stripped from the text being fenced, so content cannot close its own block and
+continue at instruction level. Documents are stored *beside* the user's turn
+rather than spliced into it, so memory records what the user actually said and
+fencing happens per-send with the current agent's marker — a conversation
+reloaded from disk never carries a dead agent's markers.
 
-Documents are stored *beside* the user's turn rather than spliced into it, so
-memory records what the user actually said, and fencing happens per-send with
-the current agent's marker — a conversation reloaded from disk never carries
-a dead agent's markers.
+Two limits, stated rather than left to be discovered:
 
-The system prompt also states the boundary. **That is the weakest layer, and
-it is not a solution.**
-
-### What this does not do
-
-**Prompt injection is not solved here, and no system prompt solves it.** A
-sufficiently persuasive document may still talk a model into saying something
-you did not want. What the fencing buys is that the model is *told* where the
-boundary is, and that the boundary is one the data cannot move.
-
-Two limits worth stating:
-
-- The marker is per agent, not per run, so it appears in every prompt for
-  that agent's life. An attacker who can both observe a response echoing the
-  marker *and then* plant new content could forge a block. Rotating per run
-  would close this and make the system prompt uncacheable.
-- Fencing constrains *structure*, not persuasion. A document that simply
-  argues convincingly is unaffected by any delimiter.
-
-**So the boundary that actually holds is in Python.** A forged fence does not
-widen what any tool may do:
-
-- Tool `permissions` are a `frozenset` fixed at decoration time. Nothing at
-  runtime reads content to decide them.
-- `ToolPolicy` receives the tool, the validated arguments, and a context
-  built from the agent, the session and the call — never from retrieved or
-  returned text. Session `metadata` comes from your `agent.session(...)` call.
-- Approval is an application callback, unreachable from model output.
-- Every model-requested call takes one path, `Agent._execute`, which
-  authorizes before it executes.
-
-Assume the model *will* eventually be talked into requesting the wrong tool,
-and make sure the policy refuses it. That is the design.
-
-### A tool is code; its output is data
-
-Installing a tool is trusting code — it runs in-process with everything your
-process can reach. Nothing here sandboxes a hostile tool, and a malicious
-tool could reach into the framework directly. The boundary described above is
-about *content*: what a tool **returns**, and what a retriever **finds**, is
-never trusted. Choose your tools the way you choose dependencies.
+- The marker is per agent, not per run, so it appears in every prompt for that
+  agent's life. An attacker who can both observe a response echoing it *and
+  then* plant new content could forge a block. Rotating per run would close
+  this and make the system prompt uncacheable.
+- Fencing constrains structure, not persuasion. A document that simply argues
+  convincingly is unaffected by any delimiter.
 
 ## Boundaries enforced in code
 
@@ -208,7 +280,11 @@ hold even when the model is confused, jailbroken, or adversarial.
   the `Authorization` / `x-api-key` header is omitted rather than sent with a
   stringified `None`.
 
-Known non-boundaries, by design:
+## Known non-boundaries, by design
+
+Things Unchained deliberately does not do. None of these is a bug; each is a
+place where the guarantee stops and yours begins.
+
 
 - **Validation is only as strict as your annotations.** A parameter with no
   annotation accepts anything (the plain function would too), a tool declaring
