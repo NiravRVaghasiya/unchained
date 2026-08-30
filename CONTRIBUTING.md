@@ -5,7 +5,7 @@ readable core, so contributions that keep things simple are especially welcome.
 
 ## Ground rules
 
-- Keep the core in `unchained.py` focused and dependency-light (requests + pydantic).
+- Keep the core in `unchained/__init__.py` focused and dependency-light (requests + pydantic).
 - New capabilities usually belong in `examples/`, not the core.
 - Every change should keep lint, type-check, and tests green.
 
@@ -19,6 +19,25 @@ python -m venv .venv
 pip install -e ".[dev]"
 pre-commit install
 ```
+
+## Why the core lives in a directory
+
+`unchained/__init__.py` is the whole framework — one file, as advertised. It
+sits in a package directory for exactly one reason: a type checker only trusts
+a distribution's inline annotations when it finds a PEP 561 `py.typed` marker,
+and a marker can only be attached to a *package*, never to a top-level module.
+Both alternatives were tried against a real wheel in a clean environment:
+
+| Layout | mypy sees |
+|---|---|
+| `unchained.py` alone | `Skipping analyzing "unchained" … missing py.typed marker` |
+| `unchained.py` + `py.typed` beside it | same — the marker is ignored |
+| `unchained.py` + `unchained.pyi` beside it | same |
+| `unchained/__init__.py` + `unchained/py.typed` | the real signatures |
+
+So `py-modules` cannot be used, and `tests/test_packaging.py` fails if anyone
+reintroduces it. Keep the core to that one file; a second module in
+`unchained/` also fails a test.
 
 ## The checks CI runs
 

@@ -1,6 +1,6 @@
 # API Reference
 
-Auto-generated from the docstrings in `unchained.py`.
+Auto-generated from the docstrings in `unchained/__init__.py`.
 
 ::: unchained
     options:
@@ -8,6 +8,7 @@ Auto-generated from the docstrings in `unchained.py`.
         - tool
         - Tool
         - LLM
+        - LLMResponse
         - MockLLM
         - Memory
         - RAG

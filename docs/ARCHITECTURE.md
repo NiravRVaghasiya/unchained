@@ -10,7 +10,7 @@ file grows).
 
 ## Design Principles
 
-1. **Single-file core** — Everything in `unchained.py`, no submodules
+1. **Single-file core** — Everything in `unchained/__init__.py`, no submodules
 2. **Two dependencies** — `requests` + `pydantic` only
 3. **Provider-agnostic** — Same code works with OpenAI, Anthropic, local Ollama, or any OpenAI-compatible endpoint
 4. **No magic** — No metaclasses, no runtime patching, no hidden state
@@ -23,7 +23,7 @@ file grows).
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              UNCHAINED FRAMEWORK                              │
-│                                (unchained.py)                                 │
+│                            (unchained/__init__.py)                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
@@ -402,7 +402,7 @@ User → Router.run_all() → Agent_A → result_a ─┐
 
 ```
 unchained/
-├── unchained.py                  ← THE framework (single file)
+├── unchained/__init__.py         ← THE framework (single file)
 ├── pyproject.toml               ← Package config + dependencies
 ├── README.md                    ← Star-attracting documentation
 ├── LICENSE                      ← MIT License
@@ -464,7 +464,7 @@ unchained/
 
 ### Why single file?
 - Entire framework readable in one sitting, no jumping between submodules
-- Copy `unchained.py` into any project — no install needed
+- Copy the one file into any project as `unchained.py` — no install needed
 - Easy to audit, understand, and modify
 - Forces discipline: every line must earn its place
 

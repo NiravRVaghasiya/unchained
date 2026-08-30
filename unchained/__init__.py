@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import re
 import threading
@@ -84,6 +85,7 @@ __all__ = [
     "Tool",
     "LLM",
     "MockLLM",
+    "LLMResponse",
     "Memory",
     "RAG",
     "Agent",
@@ -721,6 +723,84 @@ def tool(
 
 
 # --- 2. LLM backend (unified across providers) -----------------------------
+# Provider vocabularies for "why did generation stop", mapped onto OpenAI's,
+# which is the one most code already expects. Anything unrecognised is passed
+# through unchanged rather than guessed at, and the provider's own wording is
+# always kept in LLMResponse.metadata.
+_FINISH_REASONS = {
+    "end_turn": "stop",  # anthropic
+    "stop_sequence": "stop",  # anthropic
+    "tool_use": "tool_calls",  # anthropic
+    "max_tokens": "length",  # anthropic
+}
+# Headers providers use to identify a request, in the order we prefer them.
+_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "x-amzn-requestid")
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    """One provider reply, in the shape the rest of the framework speaks.
+
+    Every provider is reduced to this, so ``Agent`` never has to know whether
+    a reply came from OpenAI, Anthropic, Ollama or an OpenAI-compatible
+    endpoint:
+
+    * ``content``       - the assistant text, "" if it only asked for tools.
+    * ``tool_calls``    - ``[{"name", "arguments", "id"}]``, arguments parsed.
+    * ``usage``         - ``prompt_tokens`` / ``completion_tokens`` /
+      ``total_tokens``, whatever the provider called them.
+    * ``finish_reason`` - ``stop``, ``tool_calls``, ``length``,
+      ``content_filter``, or the provider's own word if it is not one we
+      recognise. ``None`` when the provider did not say and it cannot be
+      inferred. **``length`` means the answer was cut off**, which nothing
+      else in the reply reveals.
+    * ``provider`` / ``model`` - who answered, and with what. ``model`` is
+      the model the provider reports, which is often more specific than the
+      one requested (``gpt-4o-mini-2024-07-18`` for ``gpt-4o-mini``).
+    * ``request_id``    - for quoting to a provider's support. Taken from the
+      response headers, falling back to the body's own id.
+    * ``metadata``      - everything provider-specific worth keeping:
+      timings, fingerprints, the raw finish reason, the endpoint that
+      answered. Deliberately opaque - read it in your own code, and expect
+      nothing in the agent loop to interpret it.
+
+    It behaves like the plain dict this used to be (``response["content"]``,
+    ``response.get("usage")``), so existing code and test doubles that return
+    a bare dict keep working. New code can use attributes.
+    """
+
+    content: str = ""
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    usage: Dict[str, int] = field(default_factory=dict)
+    finish_reason: Optional[str] = None
+    provider: str = ""
+    model: str = ""
+    request_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def truncated(self) -> bool:
+        """True when the provider stopped because it ran out of room."""
+        return self.finish_reason == "length"
+
+    def as_dict(self) -> Dict[str, Any]:
+        """A plain dict, for logging or storage."""
+        return asdict(self)
+
+    # -- the mapping face, so the previous dict contract still holds --
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key) from None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and hasattr(self, key)
+
+
 _PROVIDER_DEFAULTS = {
     "openai": ("gpt-4o-mini", "https://api.openai.com"),
     "anthropic": ("claude-3-5-sonnet-20241022", "https://api.anthropic.com"),
@@ -740,9 +820,10 @@ _PROVIDER_ENV_URL = {
 class LLM:
     """One chat interface for OpenAI, Anthropic and Ollama.
 
-    Every provider returns the same normalised dict::
-
-        {"content": str, "tool_calls": [{"name", "arguments", "id"}], "usage": dict}
+    Every provider is reduced to the same :class:`LLMResponse`, so nothing
+    downstream needs to know which one answered. Provider-specific detail is
+    kept rather than discarded, but confined to ``response.metadata`` where
+    the agent loop never looks at it.
     """
 
     def __init__(
@@ -782,7 +863,7 @@ class LLM:
             )
         # An LRU cache (OrderedDict, oldest first) capped at cache_size entries;
         # each value optionally expires after cache_ttl seconds.
-        self.cache: Optional[OrderedDict[str, tuple[float, Dict[str, Any]]]] = (
+        self.cache: Optional[OrderedDict[str, tuple[float, LLMResponse]]] = (
             OrderedDict() if self.cache_policy != "none" else None
         )
         env_key = _PROVIDER_ENV_KEY.get(self.provider)
@@ -796,7 +877,7 @@ class LLM:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+    ) -> LLMResponse:
         """Send a chat request and return the normalised response dict.
 
         With caching enabled, identical requests are served from an in-memory
@@ -818,7 +899,7 @@ class LLM:
             return result
         return self._dispatch(messages, tools, response_format)
 
-    def _should_store(self, result: Dict[str, Any]) -> bool:
+    def _should_store(self, result: LLMResponse) -> bool:
         """Decide whether a fresh response may enter the cache.
 
         A response carrying ``tool_calls`` is a decision to *act*. Storing it
@@ -844,7 +925,7 @@ class LLM:
         if self.cache is not None:
             self.cache.clear()
 
-    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+    def _cache_get(self, key: str) -> Optional[LLMResponse]:
         assert self.cache is not None
         entry = self.cache.get(key)
         if entry is None:
@@ -856,7 +937,7 @@ class LLM:
         self.cache.move_to_end(key)  # refresh LRU order on hit
         return self._copy_result(result)
 
-    def _cache_put(self, key: str, result: Dict[str, Any]) -> None:
+    def _cache_put(self, key: str, result: LLMResponse) -> None:
         assert self.cache is not None
         self.cache[key] = (time.time(), self._copy_result(result))
         self.cache.move_to_end(key)
@@ -864,7 +945,7 @@ class LLM:
             self.cache.popitem(last=False)  # evict the oldest entry
 
     @staticmethod
-    def _copy_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    def _copy_result(result: LLMResponse) -> LLMResponse:
         """Copy a response in and out of the cache.
 
         Callers put responses into conversation memory and read them later;
@@ -874,20 +955,17 @@ class LLM:
         """
         # Deep, not shallow: tool-call arguments are nested dicts, and a
         # per-call shallow copy would still share them.
-        return copy.deepcopy(
-            {
-                "content": result.get("content", ""),
-                "tool_calls": result.get("tool_calls") or [],
-                "usage": result.get("usage") or {},
-            }
-        )
+        # deepcopy the whole reply rather than rebuilding three keys: a
+        # rebuild silently drops finish_reason, request_id and metadata, so a
+        # cached answer would carry less than a fresh one.
+        return copy.deepcopy(result)
 
     async def achat(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+    ) -> LLMResponse:
         """Async wrapper around :meth:`chat`.
 
         Unchained's HTTP layer is built on the synchronous ``requests``
@@ -908,7 +986,7 @@ class LLM:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]],
         response_format: Optional[Any],
-    ) -> Dict[str, Any]:
+    ) -> LLMResponse:
         return {"openai": self._openai, "anthropic": self._anthropic, "ollama": self._ollama}[
             self.provider
         ](messages, tools, response_format)
@@ -993,8 +1071,12 @@ class LLM:
             payload["tools"] = [t.schema for t in tools]
         if response_format is not None:
             payload["response_format"] = {"type": "json_object"}
-        data = self._post("/v1/chat/completions", headers=headers, json=payload)
-        msg = data["choices"][0]["message"]
+        data, headers_out = self._post("/v1/chat/completions", headers=headers, json=payload)
+        # Indexed defensively: an OpenAI-compatible endpoint is not obliged to
+        # be a faithful one, and a missing choice should not be a KeyError
+        # from inside the framework.
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
         tool_calls = [
             {
                 "name": tc.get("function", {}).get("name", ""),
@@ -1003,11 +1085,21 @@ class LLM:
             }
             for tc in msg.get("tool_calls") or []
         ]
-        return {
-            "content": msg.get("content") or "",
-            "tool_calls": tool_calls,
-            "usage": self._normalize_usage(data.get("usage")),
-        }
+        return LLMResponse(
+            content=msg.get("content") or "",
+            tool_calls=tool_calls,
+            usage=self._normalize_usage(data.get("usage")),
+            finish_reason=self._finish_reason(choice.get("finish_reason"), tool_calls),
+            provider=self.provider,
+            model=data.get("model") or self.model,
+            request_id=self._request_id(headers_out, data),
+            metadata=self._metadata(
+                response_id=data.get("id"),
+                raw_finish_reason=choice.get("finish_reason"),
+                system_fingerprint=data.get("system_fingerprint"),
+                created=data.get("created"),
+            ),
+        )
 
     # -- Anthropic --
     def _anthropic(self, messages, tools, response_format):
@@ -1026,7 +1118,7 @@ class LLM:
             payload["system"] = system
         if tools:
             payload["tools"] = [self._anthropic_tool(t) for t in tools]
-        data = self._post("/v1/messages", headers=headers, json=payload)
+        data, headers_out = self._post("/v1/messages", headers=headers, json=payload)
         content, tool_calls = "", []
         for block in data.get("content", []):
             if block.get("type") == "text":
@@ -1039,11 +1131,20 @@ class LLM:
                         "id": block.get("id"),
                     }
                 )
-        return {
-            "content": content,
-            "tool_calls": tool_calls,
-            "usage": self._normalize_usage(data.get("usage")),
-        }
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=self._normalize_usage(data.get("usage")),
+            finish_reason=self._finish_reason(data.get("stop_reason"), tool_calls),
+            provider=self.provider,
+            model=data.get("model") or self.model,
+            request_id=self._request_id(headers_out, data),
+            metadata=self._metadata(
+                response_id=data.get("id"),
+                raw_finish_reason=data.get("stop_reason"),
+                stop_sequence=data.get("stop_sequence"),
+            ),
+        )
 
     @staticmethod
     def _anthropic_tool(t: Tool) -> Dict[str, Any]:
@@ -1103,7 +1204,7 @@ class LLM:
             payload["tools"] = [t.schema for t in tools]
         if response_format is not None:
             payload["format"] = "json"
-        data = self._post("/api/chat", json=payload)
+        data, headers_out = self._post("/api/chat", json=payload)
         msg = data.get("message", {})
         tool_calls = [
             {
@@ -1113,11 +1214,23 @@ class LLM:
             }
             for tc in msg.get("tool_calls") or []
         ]
-        return {
-            "content": msg.get("content", ""),
-            "tool_calls": tool_calls,
-            "usage": self._normalize_usage(data),
-        }
+        return LLMResponse(
+            content=msg.get("content", ""),
+            tool_calls=tool_calls,
+            # Ollama reports token counts at the top level, not under "usage".
+            usage=self._normalize_usage(data),
+            finish_reason=self._finish_reason(data.get("done_reason"), tool_calls),
+            provider=self.provider,
+            model=data.get("model") or self.model,
+            request_id=self._request_id(headers_out, data),
+            metadata=self._metadata(
+                raw_finish_reason=data.get("done_reason"),
+                created_at=data.get("created_at"),
+                total_duration=data.get("total_duration"),
+                load_duration=data.get("load_duration"),
+                eval_duration=data.get("eval_duration"),
+            ),
+        )
 
     @staticmethod
     def _to_ollama_messages(messages):
@@ -1257,8 +1370,14 @@ class LLM:
                 break
 
     # -- HTTP with retry/backoff --
-    def _post(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        return self._request(path, **kwargs).json()
+    def _post(self, path: str, **kwargs: Any) -> tuple:
+        """POST and return ``(body, headers)``.
+
+        Headers come back because that is where providers put the request id
+        worth quoting to their support.
+        """
+        response = self._request(path, **kwargs)
+        return response.json(), getattr(response, "headers", {}) or {}
 
     def _request(self, path: str, **kwargs: Any) -> requests.Response:
         """POST with retries on connection errors and 429/5xx responses.
@@ -1302,6 +1421,36 @@ class LLM:
             if retry_after and str(retry_after).isdigit():
                 return float(retry_after)
         return self.backoff * (2**attempt) + random.uniform(0, self.backoff)
+
+    @staticmethod
+    def _finish_reason(raw: Any, tool_calls: List[Dict[str, Any]]) -> Optional[str]:
+        """Map a provider's stop reason onto the common vocabulary.
+
+        An unrecognised word is passed through as-is rather than forced into
+        a bucket it may not belong in. When the provider said nothing, a
+        reply carrying tool calls is ``tool_calls`` - that much is evident
+        from the reply itself - and otherwise None, because guessing "stop"
+        would be indistinguishable from a provider that told us so.
+        """
+        if raw:
+            return _FINISH_REASONS.get(str(raw), str(raw))
+        return "tool_calls" if tool_calls else None
+
+    @staticmethod
+    def _request_id(headers: Any, data: Dict[str, Any]) -> Optional[str]:
+        """The id to quote to a provider, from headers or the body."""
+        lowered = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+        for name in _REQUEST_ID_HEADERS:
+            if lowered.get(name):
+                return str(lowered[name])
+        body_id = (data or {}).get("id")
+        return str(body_id) if body_id else None
+
+    def _metadata(self, **fields: Any) -> Dict[str, Any]:
+        """Provider extras worth keeping, minus the ones that were absent."""
+        kept = {name: value for name, value in fields.items() if value not in (None, "")}
+        kept["endpoint"] = self.base_url
+        return kept
 
     @staticmethod
     def _normalize_usage(raw: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -1362,14 +1511,40 @@ class MockLLM(LLM):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+    ) -> LLMResponse:
         self.calls.append(
             {"messages": messages, "tools": tools, "response_format": response_format}
         )
         return self._normalize(self._next(messages, tools))
 
+    def _normalize(self, raw: Any) -> LLMResponse:
+        """Shape a scripted reply like a real provider would.
+
+        A stand-in that returned a different shape would let a test pass
+        against something no provider produces.
+        """
+        if isinstance(raw, LLMResponse):
+            return raw
+        if isinstance(raw, dict):
+            tool_calls = list(raw.get("tool_calls") or [])
+            return LLMResponse(
+                content=raw.get("content", ""),
+                tool_calls=tool_calls,
+                usage=dict(raw.get("usage") or {}),
+                finish_reason=raw.get(
+                    "finish_reason", self._finish_reason(None, tool_calls) or "stop"
+                ),
+                provider=self.provider,
+                model=self.model,
+                request_id=raw.get("request_id"),
+                metadata=dict(raw.get("metadata") or {}),
+            )
+        return LLMResponse(
+            content=str(raw), finish_reason="stop", provider=self.provider, model=self.model
+        )
+
     def stream(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        text = self._normalize(self._next(messages, None))["content"]
+        text = self._normalize(self._next(messages, None)).content
         yield from re.findall(r"\S+\s*", text)
 
     def _next(self, messages: List[Dict[str, Any]], tools: Optional[List[Tool]]) -> Any:
@@ -1378,16 +1553,6 @@ class MockLLM(LLM):
         if self.script:
             return self.script.pop(0)
         return self.reply
-
-    @staticmethod
-    def _normalize(raw: Any) -> Dict[str, Any]:
-        if isinstance(raw, dict):
-            return {
-                "content": raw.get("content", ""),
-                "tool_calls": raw.get("tool_calls", []),
-                "usage": raw.get("usage", {}),
-            }
-        return {"content": str(raw), "tool_calls": [], "usage": {}}
 
 
 # --- 3. Memory (sliding window + compression) ------------------------------
@@ -1811,6 +1976,20 @@ class AgentEvent:
     ``ToolFailed`` can arrive without a preceding ``ToolStarted``: a call
     refused before it ran never started. Its ``metadata["reason"]`` says
     which stage refused it.
+
+    :meth:`Agent.events` adds two more that exist only there, never reaching
+    callbacks:
+
+    ===================  =========================================
+    ``LLMDelta``         one streamed chunk, in ``metadata["text"]``
+    ``FinalResponse``    the assembled answer, in ``metadata["answer"]``
+    ===================  =========================================
+
+    They carry their content in full. That is the point of asking for them,
+    and unlike the callback stream they go to one in-process consumer that
+    requested them rather than to whatever sink is attached - a per-token
+    flood is also not something a metrics sink wants. Everything that *does*
+    reach callbacks still redacts payloads unless ``event_payloads=True``.
 
     **Payloads are excluded by default.** Prompts, tool arguments, tool
     results and the final answer are the things most likely to hold personal
@@ -2653,19 +2832,27 @@ class Agent:
         )
         self._add_user_turn(session, user_input)
         tool_list = list(self.tools.values())
-        if tool_list:
-            for i in range(self._iteration_limit(state)):
-                state.iterations = i + 1
-                state.check_before_call()
-                self._emit(session, "on_iteration", i)
-                self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
-                result = self._chat(session, self._build_messages(session, None), tools=tool_list)
-                if not result["tool_calls"]:
-                    break
-                session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-                self._execute_calls(session, result["tool_calls"], state)
         chunks: List[str] = []
+        # The whole turn is covered, not just the streaming half: a budget
+        # stop or a provider error while resolving tools is just as much a
+        # failed run, and reporting only the second half meant a run could
+        # end with no AgentFinished and no AgentFailed at all.
         try:
+            if tool_list:
+                for i in range(self._iteration_limit(state)):
+                    state.iterations = i + 1
+                    state.check_before_call()
+                    self._emit(session, "on_iteration", i)
+                    self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
+                    result = self._chat(
+                        session, self._build_messages(session, None), tools=tool_list
+                    )
+                    if not result["tool_calls"]:
+                        break
+                    session.memory.add(
+                        "assistant", result["content"], tool_calls=result["tool_calls"]
+                    )
+                    self._execute_calls(session, result["tool_calls"], state)
             for chunk in self.llm.stream(self._build_messages(session, None)):
                 chunks.append(chunk)
                 yield chunk
@@ -2761,6 +2948,97 @@ class Agent:
         """Content for an event's metadata, included only when opted in."""
         return dict(fields) if self.event_payloads else {}
 
+    def events(
+        self,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Watch a whole run happen, one :class:`AgentEvent` at a time.
+
+        Equivalent to ``agent.default_session.events(...)``. See
+        :meth:`Session.events`.
+        """
+        return self.default_session.events(user_input, response_format, stream)
+
+    def _events(
+        self,
+        session: Session,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Drive a run on a worker thread and yield its events as they happen.
+
+        The loop is push-based - it notifies callbacks - so this bridges to a
+        pull-based iterator through a queue. The run itself is ordinary; the
+        only difference is which thread it is on.
+
+        Two things follow from that, and neither is hidden:
+
+        * Abandoning the iterator does **not** cancel the run. Python cannot
+          cancel a running thread, so the work finishes in the background,
+          exactly as an overrunning tool does. Drain the iterator, or accept
+          that the turn completes without you.
+        * An exception from the run is re-raised here, so ``for event in
+          agent.events(...)`` fails the way ``run()`` would - but its
+          traceback points into the worker thread.
+        """
+        outbox: queue.Queue = queue.Queue()
+        finished = object()
+        outcome: Dict[str, Any] = {}
+        listener = _EventListener(outbox.put)
+        session.callbacks.append(listener)
+
+        def local(event_type: str, metadata: Dict[str, Any]) -> AgentEvent:
+            """An event for this consumer only - never emitted to callbacks."""
+            state = session.last_run
+            return AgentEvent(
+                event_type=event_type,
+                run_id=state.id if state is not None else "",
+                session_id=session.id,
+                agent=self.name,
+                timestamp=time.time(),
+                duration=state.elapsed if state is not None else None,
+                model=getattr(self.llm, "model", None),
+                usage=dict(state.usage) if state is not None else None,
+                metadata=metadata,
+            )
+
+        def work() -> None:
+            try:
+                if stream:
+                    chunks: List[str] = []
+                    for chunk in self._stream(session, user_input):
+                        chunks.append(chunk)
+                        outbox.put(local("LLMDelta", {"text": chunk}))
+                    outcome["answer"] = "".join(chunks)
+                else:
+                    outcome["answer"] = self._run(session, user_input, response_format)
+            except BaseException as exc:  # re-raised in the consumer below
+                outcome["error"] = exc
+            finally:
+                outbox.put(finished)
+
+        # Not a daemon: a daemon thread is killed abruptly at interpreter
+        # exit, and these run tools that may be half-way through a side
+        # effect. An abandoned run holding the process open is the lesser
+        # problem, and it is the same trade the tool timeout makes.
+        worker = threading.Thread(target=work, name=f"events-{session.id}")
+        worker.start()
+        try:
+            while True:
+                item = outbox.get()
+                if item is finished:
+                    break
+                yield item
+            if "error" in outcome:
+                raise outcome["error"]
+            yield local("FinalResponse", {"answer": outcome.get("answer")})
+        finally:
+            if listener in session.callbacks:
+                session.callbacks.remove(listener)
+
     # -- budgets --
     def _begin_run(self, session: Session) -> RunState:
         """Open the accounting for one run and publish it on the session.
@@ -2787,7 +3065,7 @@ class Agent:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+    ) -> Any:
         state = session.last_run
         model = getattr(self.llm, "model", None)
         self._emit_event(
@@ -3480,6 +3758,39 @@ class Session:
     def stream(self, user_input: str) -> Iterator[str]:
         """Stream this turn's answer token by token. See :meth:`run`."""
         return self.agent._stream(self, user_input)
+
+    def events(
+        self,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Take a turn, yielding every :class:`AgentEvent` as it happens::
+
+            for event in session.events("research this"):
+                print(event.event_type)
+
+        The whole lifecycle, not just answer tokens: the run starting, each
+        iteration, every LLM request and reply, every tool call and how it
+        ended, and the answer. Each event carries ``run_id`` and
+        ``session_id``.
+
+        With ``stream=True`` (the default) the final answer is streamed and
+        arrives as ``LLMDelta`` events, then ``FinalResponse``. With
+        ``stream=False`` the ordinary :meth:`run` path is used instead - no
+        deltas, but every other event still appears, including the tool ones,
+        and ``response_format`` works, which streaming cannot support.
+
+        Provider differences are already normalised: OpenAI's and Anthropic's
+        SSE and Ollama's JSON lines all arrive as plain text chunks. Streamed
+        *tool calls* are not normalised - providers differ too much - so tool
+        calls are resolved before the answer streams, which is why tool events
+        arrive first either way.
+
+        The run happens on a worker thread; see :meth:`Agent._events` for what
+        that means if you abandon the iterator.
+        """
+        return self.agent._events(self, user_input, response_format, stream)
 
     async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
         """Await one turn off the event loop.

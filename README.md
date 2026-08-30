@@ -21,10 +21,10 @@ Tools, memory, RAG, multi-agent orchestration and structured output — in one f
 
 Most agent frameworks ask you to learn a mountain of abstractions before you
 can print "hello world". Unchained is the opposite: one readable file, two
-dependencies, zero magic. Copy `unchained.py` into your project and you are
-done.
+dependencies, zero magic. Copy the one source file into your project and you
+are done.
 
-- **Single-file core** — the whole framework fits in `unchained.py`. No submodules to jump between.
+- **Single-file core** — the whole framework is one file, `unchained/__init__.py`. No submodules to jump between.
 - **Two dependencies** — `requests` + `pydantic`. Nothing else.
 - **Provider-agnostic** — the same code runs on OpenAI, Anthropic, a local Ollama model, or any OpenAI-compatible endpoint (Groq, Together, OpenRouter, vLLM, LM Studio, ...). Change one line.
 - **No magic** — no metaclasses, no monkey-patching, no hidden global state.
@@ -49,7 +49,17 @@ pip install requests pydantic
 pip install -e ".[dev]"
 ```
 
-Prefer zero install? Copy `unchained.py` straight into your project — that's the point.
+Prefer zero install? Take the one file — that's the point:
+
+```bash
+curl -O https://raw.githubusercontent.com/NiravRVaghasiya/unchained/main/unchained/__init__.py
+mv __init__.py unchained.py
+```
+
+It sits in a directory in this repository only so that `pip install unchained-ai`
+can ship a PEP 561 `py.typed` marker, which a type checker will not accept on a
+bare top-level module. Dropped into your project as `unchained.py`, it works
+exactly the same.
 
 ## 30-second tour
 
@@ -896,6 +906,88 @@ you an answer the model already produced. In tests that hides bugs, so
 `Callback` also gained `on_event`, so a subclass can take the structured
 stream and the older hooks together. Existing subclasses are unaffected — the
 base `on_event` is a no-op.
+
+#### Watching a run as it happens
+
+Callbacks are push-based. When you'd rather iterate, `events()` yields the
+whole lifecycle — not just answer tokens:
+
+```python
+for event in agent.events("research this"):
+    if event.event_type == "LLMDelta":
+        print(event.metadata["text"], end="", flush=True)
+    elif event.event_type == "ToolStarted":
+        spinner.update(f"calling {event.tool}")
+    elif event.event_type == "FinalResponse":
+        save(event.metadata["answer"])
+```
+
+```
+AgentStarted → AgentIteration → LLMStarted → LLMFinished
+             → ToolStarted → ToolFinished
+             → AgentIteration → LLMStarted → LLMFinished
+             → LLMDelta × n → AgentFinished → FinalResponse
+```
+
+Every event carries `run_id` and `session_id`, so concurrent runs never blur
+together. `session.events(...)` is the per-conversation form.
+
+`stream=False` uses the ordinary `run()` path instead: no deltas, but **every
+other event still appears, including the tool ones** — and `response_format`
+works, which streaming cannot support.
+
+Provider differences are already normalised: OpenAI's and Anthropic's SSE and
+Ollama's JSON lines all arrive as plain `LLMDelta` text. Streamed *tool calls*
+are not normalised — providers differ too much — so tool calls are resolved
+before the answer streams, which is why tool events arrive first either way.
+
+`LLMDelta` and `FinalResponse` exist only here and are never sent to
+callbacks. They carry their content in full, which is the point of asking for
+them, and they go to one in-process consumer rather than to whatever log sink
+is attached — where a per-token flood would be unwelcome anyway. Everything
+that *does* reach callbacks still redacts payloads unless
+`event_payloads=True`.
+
+> The run happens on a worker thread. Abandoning the iterator does **not**
+> cancel it — Python cannot cancel a running thread — so the turn finishes in
+> the background. An exception from the run is re-raised at the iterator, so
+> failures surface the way `run()`'s would.
+
+### One response shape, whoever answered
+
+Every provider is reduced to the same `LLMResponse`, so nothing downstream
+needs to know which one replied:
+
+```python
+response = llm.chat([{"role": "user", "content": "hi"}])
+
+response.content  # the assistant text
+response.tool_calls  # [{"name", "arguments", "id"}], arguments parsed
+response.usage  # prompt_tokens / completion_tokens / total_tokens
+response.finish_reason  # "stop" | "tool_calls" | "length" | "content_filter"
+response.provider  # "openai" | "anthropic" | "ollama"
+response.model  # what actually answered: "gpt-4o-mini-2024-07-18"
+response.request_id  # for quoting to a provider's support
+response.metadata  # provider-specific extras, opaque to the agent loop
+```
+
+**`finish_reason` is worth having.** Anthropic's `max_tokens`, OpenAI's
+`length` and Ollama's `done_reason` all become `"length"`, and
+`response.truncated` is True — which is otherwise invisible, so an agent
+would treat a half-finished answer as a complete one. A reason we don't
+recognise is passed through unchanged rather than forced into a bucket, and
+the provider's own wording is always kept in `metadata["raw_finish_reason"]`.
+
+Provider-specific detail is preserved rather than discarded, but confined to
+`metadata` — OpenAI's `system_fingerprint`, Ollama's timings, Anthropic's
+`stop_sequence`, and the `endpoint` that answered (useful when
+`provider="openai"` is pointed at Groq or vLLM). Nothing in the agent loop
+reads it; it's there for your logs.
+
+The response still behaves like the plain dict it replaced —
+`response["content"]`, `response.get("usage")` — so existing code and test
+doubles that return a bare dict keep working. It is frozen, so a handler
+can't rewrite a reply another handler is about to see.
 
 ### Token usage tracking
 

@@ -11,7 +11,7 @@ questions and get things done. Unlike a plain chatbot, an agent can also **use
 tools** (call your functions), **remember** the conversation, and **look things
 up** in your own documents.
 
-Everything lives in a single file, `unchained.py`, and it only needs two extra
+Everything lives in a single file, `unchained/__init__.py`, and it needs two extra
 Python packages.
 
 ## Before you start

@@ -58,7 +58,7 @@ REFERENCE = {
 
 def main() -> None:
     # Measure Unchained's real line count.
-    REFERENCE["Unchained"]["loc"] = count_source_lines(_ROOT / "unchained.py")
+    REFERENCE["Unchained"]["loc"] = count_source_lines(_ROOT / "unchained" / "__init__.py")
 
     print("Unchained vs LangChain vs CrewAI")
     print("=" * 64)
