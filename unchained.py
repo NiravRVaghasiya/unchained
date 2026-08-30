@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import re
 import threading
@@ -1976,6 +1977,20 @@ class AgentEvent:
     refused before it ran never started. Its ``metadata["reason"]`` says
     which stage refused it.
 
+    :meth:`Agent.events` adds two more that exist only there, never reaching
+    callbacks:
+
+    ===================  =========================================
+    ``LLMDelta``         one streamed chunk, in ``metadata["text"]``
+    ``FinalResponse``    the assembled answer, in ``metadata["answer"]``
+    ===================  =========================================
+
+    They carry their content in full. That is the point of asking for them,
+    and unlike the callback stream they go to one in-process consumer that
+    requested them rather than to whatever sink is attached - a per-token
+    flood is also not something a metrics sink wants. Everything that *does*
+    reach callbacks still redacts payloads unless ``event_payloads=True``.
+
     **Payloads are excluded by default.** Prompts, tool arguments, tool
     results and the final answer are the things most likely to hold personal
     data or credentials, and an event stream usually ends up in a log
@@ -2817,19 +2832,27 @@ class Agent:
         )
         self._add_user_turn(session, user_input)
         tool_list = list(self.tools.values())
-        if tool_list:
-            for i in range(self._iteration_limit(state)):
-                state.iterations = i + 1
-                state.check_before_call()
-                self._emit(session, "on_iteration", i)
-                self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
-                result = self._chat(session, self._build_messages(session, None), tools=tool_list)
-                if not result["tool_calls"]:
-                    break
-                session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-                self._execute_calls(session, result["tool_calls"], state)
         chunks: List[str] = []
+        # The whole turn is covered, not just the streaming half: a budget
+        # stop or a provider error while resolving tools is just as much a
+        # failed run, and reporting only the second half meant a run could
+        # end with no AgentFinished and no AgentFailed at all.
         try:
+            if tool_list:
+                for i in range(self._iteration_limit(state)):
+                    state.iterations = i + 1
+                    state.check_before_call()
+                    self._emit(session, "on_iteration", i)
+                    self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
+                    result = self._chat(
+                        session, self._build_messages(session, None), tools=tool_list
+                    )
+                    if not result["tool_calls"]:
+                        break
+                    session.memory.add(
+                        "assistant", result["content"], tool_calls=result["tool_calls"]
+                    )
+                    self._execute_calls(session, result["tool_calls"], state)
             for chunk in self.llm.stream(self._build_messages(session, None)):
                 chunks.append(chunk)
                 yield chunk
@@ -2924,6 +2947,97 @@ class Agent:
     def _payload(self, **fields: Any) -> Dict[str, Any]:
         """Content for an event's metadata, included only when opted in."""
         return dict(fields) if self.event_payloads else {}
+
+    def events(
+        self,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Watch a whole run happen, one :class:`AgentEvent` at a time.
+
+        Equivalent to ``agent.default_session.events(...)``. See
+        :meth:`Session.events`.
+        """
+        return self.default_session.events(user_input, response_format, stream)
+
+    def _events(
+        self,
+        session: Session,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Drive a run on a worker thread and yield its events as they happen.
+
+        The loop is push-based - it notifies callbacks - so this bridges to a
+        pull-based iterator through a queue. The run itself is ordinary; the
+        only difference is which thread it is on.
+
+        Two things follow from that, and neither is hidden:
+
+        * Abandoning the iterator does **not** cancel the run. Python cannot
+          cancel a running thread, so the work finishes in the background,
+          exactly as an overrunning tool does. Drain the iterator, or accept
+          that the turn completes without you.
+        * An exception from the run is re-raised here, so ``for event in
+          agent.events(...)`` fails the way ``run()`` would - but its
+          traceback points into the worker thread.
+        """
+        outbox: queue.Queue = queue.Queue()
+        finished = object()
+        outcome: Dict[str, Any] = {}
+        listener = _EventListener(outbox.put)
+        session.callbacks.append(listener)
+
+        def local(event_type: str, metadata: Dict[str, Any]) -> AgentEvent:
+            """An event for this consumer only - never emitted to callbacks."""
+            state = session.last_run
+            return AgentEvent(
+                event_type=event_type,
+                run_id=state.id if state is not None else "",
+                session_id=session.id,
+                agent=self.name,
+                timestamp=time.time(),
+                duration=state.elapsed if state is not None else None,
+                model=getattr(self.llm, "model", None),
+                usage=dict(state.usage) if state is not None else None,
+                metadata=metadata,
+            )
+
+        def work() -> None:
+            try:
+                if stream:
+                    chunks: List[str] = []
+                    for chunk in self._stream(session, user_input):
+                        chunks.append(chunk)
+                        outbox.put(local("LLMDelta", {"text": chunk}))
+                    outcome["answer"] = "".join(chunks)
+                else:
+                    outcome["answer"] = self._run(session, user_input, response_format)
+            except BaseException as exc:  # re-raised in the consumer below
+                outcome["error"] = exc
+            finally:
+                outbox.put(finished)
+
+        # Not a daemon: a daemon thread is killed abruptly at interpreter
+        # exit, and these run tools that may be half-way through a side
+        # effect. An abandoned run holding the process open is the lesser
+        # problem, and it is the same trade the tool timeout makes.
+        worker = threading.Thread(target=work, name=f"events-{session.id}")
+        worker.start()
+        try:
+            while True:
+                item = outbox.get()
+                if item is finished:
+                    break
+                yield item
+            if "error" in outcome:
+                raise outcome["error"]
+            yield local("FinalResponse", {"answer": outcome.get("answer")})
+        finally:
+            if listener in session.callbacks:
+                session.callbacks.remove(listener)
 
     # -- budgets --
     def _begin_run(self, session: Session) -> RunState:
@@ -3644,6 +3758,39 @@ class Session:
     def stream(self, user_input: str) -> Iterator[str]:
         """Stream this turn's answer token by token. See :meth:`run`."""
         return self.agent._stream(self, user_input)
+
+    def events(
+        self,
+        user_input: str,
+        response_format: Optional[Type[BaseModel]] = None,
+        stream: bool = True,
+    ) -> Iterator[AgentEvent]:
+        """Take a turn, yielding every :class:`AgentEvent` as it happens::
+
+            for event in session.events("research this"):
+                print(event.event_type)
+
+        The whole lifecycle, not just answer tokens: the run starting, each
+        iteration, every LLM request and reply, every tool call and how it
+        ended, and the answer. Each event carries ``run_id`` and
+        ``session_id``.
+
+        With ``stream=True`` (the default) the final answer is streamed and
+        arrives as ``LLMDelta`` events, then ``FinalResponse``. With
+        ``stream=False`` the ordinary :meth:`run` path is used instead - no
+        deltas, but every other event still appears, including the tool ones,
+        and ``response_format`` works, which streaming cannot support.
+
+        Provider differences are already normalised: OpenAI's and Anthropic's
+        SSE and Ollama's JSON lines all arrive as plain text chunks. Streamed
+        *tool calls* are not normalised - providers differ too much - so tool
+        calls are resolved before the answer streams, which is why tool events
+        arrive first either way.
+
+        The run happens on a worker thread; see :meth:`Agent._events` for what
+        that means if you abandon the iterator.
+        """
+        return self.agent._events(self, user_input, response_format, stream)
 
     async def arun(self, user_input: str, response_format: Optional[Type[BaseModel]] = None) -> Any:
         """Await one turn off the event loop.

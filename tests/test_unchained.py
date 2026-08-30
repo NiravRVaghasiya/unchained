@@ -6016,3 +6016,267 @@ def test_an_agent_runs_unchanged_against_the_new_model(monkeypatch):
     agent = Agent(LLM(provider="openai", api_key="k"), tools=[lookup])
     assert agent.run("go") == "all done"
     assert agent.usage["total_tokens"] == 20  # both calls, accumulated as before
+
+
+# ---------------------------------------------------------------------------
+# Tier 19: the event-stream API
+#
+# agent.events(...) turns the push-based callback stream into something you can
+# iterate. The tests below check the whole lifecycle is visible, that it is
+# correlated, and that opening it does not widen what reaches a log sink.
+# ---------------------------------------------------------------------------
+_EVENT_SECRET = "customer-ssn-555-90-1234"
+
+
+def _lifecycle_llm(tool_name="peek", answer="the final answer here"):
+    turns = {"n": 0}
+
+    def handler(messages, tools):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            return {
+                "content": "",
+                "tool_calls": [{"name": tool_name, "arguments": {}, "id": "tc-1"}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13},
+            }
+        return {
+            "content": answer,
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+        }
+
+    return MockLLM(handler=handler)
+
+
+@pytest.fixture
+def event_stream_tools():
+    @tool
+    def peek(query: str = "x") -> str:
+        """Returns something sensitive."""
+        return f"result containing {_EVENT_SECRET}"
+
+    @tool
+    def boom() -> str:
+        """Raises."""
+        raise ValueError("kaboom")
+
+    return {"peek": peek, "boom": boom}
+
+
+# --- the lifecycle is visible ---------------------------------------------
+def test_the_whole_lifecycle_arrives_in_order(event_stream_tools):
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    kinds = [event.event_type for event in agent.session().events("research this")]
+
+    assert kinds == [
+        "AgentStarted",
+        "AgentIteration",
+        "LLMStarted",
+        "LLMFinished",
+        "ToolStarted",
+        "ToolFinished",
+        "AgentIteration",
+        "LLMStarted",
+        "LLMFinished",
+        "LLMDelta",
+        "LLMDelta",
+        "LLMDelta",
+        "LLMDelta",
+        "AgentFinished",
+        "FinalResponse",
+    ]
+
+
+def test_deltas_assemble_into_the_answer(event_stream_tools):
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    events = list(agent.session().events("go"))
+    deltas = "".join(e.metadata["text"] for e in events if e.event_type == "LLMDelta")
+    final = next(e for e in events if e.event_type == "FinalResponse")
+    assert deltas == "the final answer here"
+    assert final.metadata["answer"] == "the final answer here"
+
+
+def test_tool_events_appear_even_when_the_answer_is_not_streamed(event_stream_tools):
+    # The point of the API is the lifecycle, not just answer tokens.
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    kinds = [e.event_type for e in agent.session().events("go", stream=False)]
+
+    assert "ToolStarted" in kinds and "ToolFinished" in kinds
+    assert "LLMDelta" not in kinds  # nothing was streamed
+    assert kinds[0] == "AgentStarted" and kinds[-1] == "FinalResponse"
+
+
+def test_a_failing_tool_is_reported(event_stream_tools):
+    agent = Agent(_lifecycle_llm("boom"), tools=[event_stream_tools["boom"]])
+    events = list(agent.session().events("go"))
+    failed = next(e for e in events if e.event_type == "ToolFailed")
+    assert failed.metadata["reason"] == "raised"
+    assert "kaboom" in failed.metadata["error"]
+    assert failed.tool == "boom"
+
+
+def test_llm_events_carry_timing_and_usage(event_stream_tools):
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    events = list(agent.session().events("go"))
+    finished = [e for e in events if e.event_type == "LLMFinished"]
+    assert all(e.duration is not None for e in finished)
+    assert finished[0].usage["total_tokens"] == 13
+
+
+# --- correlation -----------------------------------------------------------
+def test_every_event_carries_the_run_and_session(event_stream_tools):
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    session = agent.session()
+    events = list(session.events("go"))
+
+    assert {e.session_id for e in events} == {session.id}
+    run_ids = {e.run_id for e in events}
+    assert len(run_ids) == 1 and "" not in run_ids
+    assert run_ids == {session.last_run.id}
+
+
+def test_two_concurrent_event_streams_stay_separate(event_stream_tools):
+    agent = Agent(
+        MockLLM(handler=lambda m, t: {"content": "done"}), tools=[event_stream_tools["peek"]]
+    )
+    collected = {}
+    start = threading.Barrier(2)
+
+    def consume(tag):
+        start.wait()
+        collected[tag] = list(agent.session().events("go"))
+
+    threads = [threading.Thread(target=consume, args=(tag,)) for tag in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ids_a = {e.run_id for e in collected["a"]}
+    ids_b = {e.run_id for e in collected["b"]}
+    assert len(ids_a) == len(ids_b) == 1
+    assert ids_a != ids_b  # different runs, never interleaved
+
+
+# --- payloads --------------------------------------------------------------
+def test_the_iterator_gets_content_the_callback_stream_does_not(event_stream_tools):
+    # Deltas and the answer are why you asked for the iterator. They are not
+    # emitted to callbacks, which keeps a log sink both redacted and free of
+    # a per-token flood.
+    seen_by_callbacks = []
+
+    class Sink(unchained.Callback):
+        def on_event(self, event):
+            seen_by_callbacks.append(event)
+
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]], callbacks=[Sink()])
+    iterated = list(agent.session().events("go"))
+
+    assert any(e.event_type == "LLMDelta" for e in iterated)
+    assert not any(e.event_type == "LLMDelta" for e in seen_by_callbacks)
+    assert not any(e.event_type == "FinalResponse" for e in seen_by_callbacks)
+
+    blob = json.dumps([e.as_dict() for e in seen_by_callbacks], default=str)
+    assert _EVENT_SECRET not in blob
+    assert "the final answer here" not in blob
+
+
+def test_the_shared_events_still_redact_payloads_by_default(event_stream_tools):
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    events = [e for e in agent.session().events("go") if e.event_type == "ToolFinished"]
+    assert _EVENT_SECRET not in json.dumps(events[0].as_dict(), default=str)
+    assert events[0].metadata["output_chars"] > 0
+
+
+# --- errors ----------------------------------------------------------------
+def test_a_failing_run_raises_out_of_the_iterator(event_stream_tools):
+    agent = Agent(
+        _lifecycle_llm(),
+        tools=[event_stream_tools["peek"]],
+        budget=Budget(max_tool_calls=0),
+    )
+    seen = []
+    with pytest.raises(unchained.ToolCallBudgetExceeded):
+        for event in agent.session().events("go"):
+            seen.append(event.event_type)
+
+    assert "AgentStarted" in seen
+    assert "AgentFailed" in seen  # the failure was reported before it was raised
+    assert "FinalResponse" not in seen  # and no answer was invented
+
+
+# --- stream=False keeps what streaming cannot do --------------------------
+def test_structured_output_works_with_stream_false():
+    class Item(BaseModel):
+        name: str
+
+    agent = Agent(MockLLM(reply='{"name": "widget"}'))
+    events = list(agent.session().events("name it", response_format=Item, stream=False))
+    final = next(e for e in events if e.event_type == "FinalResponse")
+    assert final.metadata["answer"] == Item(name="widget")
+
+
+# --- provider differences are already normalised --------------------------
+def test_deltas_are_plain_text_whatever_the_provider_sent(monkeypatch):
+    # OpenAI sends SSE, Anthropic sends different SSE, Ollama sends JSON
+    # lines. LLM.stream() reduces all three to text chunks before this API
+    # ever sees them.
+    sse = [
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+        'data: {"choices":[{"delta":{"content":"lo"}}]}',
+        "data: [DONE]",
+    ]
+    _patch_post(monkeypatch, lines=sse)
+    agent = Agent(LLM(provider="openai", api_key="k"))
+    deltas = [
+        e.metadata["text"] for e in agent.session().events("hi") if e.event_type == "LLMDelta"
+    ]
+    assert deltas == ["Hel", "lo"]
+
+
+# --- nothing existing changed ---------------------------------------------
+def test_stream_and_run_are_unaffected():
+    agent = Agent(MockLLM(reply="streamed answer"))
+    assert "".join(agent.stream("hi")).strip() == "streamed answer"
+    assert Agent(MockLLM(reply="plain")).run("hi") == "plain"
+
+
+def test_agent_events_uses_the_default_session():
+    agent = Agent(MockLLM(reply="done"))
+    events = list(agent.events("go"))
+    assert {e.session_id for e in events} == {agent.default_session.id}
+
+
+def test_the_listener_is_removed_when_the_stream_ends():
+    # Otherwise every call would leave a subscriber attached to the session.
+    agent = Agent(MockLLM(reply="done"))
+    session = agent.session()
+    before = len(session.callbacks)
+    list(session.events("go"))
+    list(session.events("again"))
+    assert len(session.callbacks) == before
+
+
+def test_a_fully_drained_stream_leaves_no_thread_behind():
+    agent = Agent(MockLLM(reply="done"))
+    baseline = threading.active_count()
+    for _ in range(5):
+        list(agent.session().events("go"))
+    deadline = time.perf_counter() + 3
+    while threading.active_count() > baseline and time.perf_counter() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= baseline
+
+
+def test_abandoning_the_iterator_does_not_raise(event_stream_tools):
+    # Documented: the run is not cancelled, it finishes in the background.
+    # What must not happen is an exception in the consumer.
+    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
+    session = agent.session()
+    stream = session.events("go")
+    assert next(stream).event_type == "AgentStarted"
+    stream.close()  # abandon it
+
+    deadline = time.perf_counter() + 3
+    while session.last_run is None and time.perf_counter() < deadline:
+        time.sleep(0.05)
+    assert session.last_run is not None  # the run went ahead

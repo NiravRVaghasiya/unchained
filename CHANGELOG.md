@@ -7,6 +7,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`agent.events(...)`: the run as an iterator.** Callbacks are push-based;
+  this yields the whole lifecycle instead - the run starting, each iteration,
+  every LLM request and reply, every tool call and how it ended, streamed
+  answer tokens, and the answer:
+
+  ```python
+  for event in agent.events("research this"):
+      ...
+  ```
+
+  - Two event types exist only here and never reach callbacks: `LLMDelta`
+    (one streamed chunk) and `FinalResponse` (the assembled answer). They
+    carry their content in full - that is the point of asking for them, and
+    they go to one in-process consumer rather than to a log sink, where a
+    per-token flood would be unwelcome. Everything that does reach callbacks
+    still redacts payloads unless `event_payloads=True`.
+  - `stream=False` uses the ordinary `run()` path: no deltas, but every other
+    event still appears - including the tool ones - and `response_format`
+    works, which streaming cannot support.
+  - Provider streaming is already normalised by `LLM.stream()`, so deltas are
+    plain text whichever provider answered. Streamed *tool calls* are not
+    normalised - providers differ too much - so tool calls are resolved
+    before the answer streams.
+  - Every event carries `run_id` and `session_id`. `session.events(...)` is
+    the per-conversation form.
+  - `stream()` and `run()` are untouched.
+  - The run happens on a worker thread; abandoning the iterator does not
+    cancel it, and an exception from the run is re-raised at the iterator.
+
+### Fixed
+- **A streaming run that failed while resolving tools reported nothing.**
+  `Agent.stream()` only wrapped the token loop, so a budget stop or provider
+  error during tool resolution ended the run with neither `AgentFinished` nor
+  `AgentFailed`. The whole turn is covered now.
+
+### Added
+
 - **`LLMResponse`: one normalised reply shape across providers.** `chat()`
   returned a three-key dict - content, tool_calls, usage - and discarded
   everything else the provider said. It now returns an `LLMResponse` carrying

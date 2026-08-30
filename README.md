@@ -897,6 +897,52 @@ you an answer the model already produced. In tests that hides bugs, so
 stream and the older hooks together. Existing subclasses are unaffected — the
 base `on_event` is a no-op.
 
+#### Watching a run as it happens
+
+Callbacks are push-based. When you'd rather iterate, `events()` yields the
+whole lifecycle — not just answer tokens:
+
+```python
+for event in agent.events("research this"):
+    if event.event_type == "LLMDelta":
+        print(event.metadata["text"], end="", flush=True)
+    elif event.event_type == "ToolStarted":
+        spinner.update(f"calling {event.tool}")
+    elif event.event_type == "FinalResponse":
+        save(event.metadata["answer"])
+```
+
+```
+AgentStarted → AgentIteration → LLMStarted → LLMFinished
+             → ToolStarted → ToolFinished
+             → AgentIteration → LLMStarted → LLMFinished
+             → LLMDelta × n → AgentFinished → FinalResponse
+```
+
+Every event carries `run_id` and `session_id`, so concurrent runs never blur
+together. `session.events(...)` is the per-conversation form.
+
+`stream=False` uses the ordinary `run()` path instead: no deltas, but **every
+other event still appears, including the tool ones** — and `response_format`
+works, which streaming cannot support.
+
+Provider differences are already normalised: OpenAI's and Anthropic's SSE and
+Ollama's JSON lines all arrive as plain `LLMDelta` text. Streamed *tool calls*
+are not normalised — providers differ too much — so tool calls are resolved
+before the answer streams, which is why tool events arrive first either way.
+
+`LLMDelta` and `FinalResponse` exist only here and are never sent to
+callbacks. They carry their content in full, which is the point of asking for
+them, and they go to one in-process consumer rather than to whatever log sink
+is attached — where a per-token flood would be unwelcome anyway. Everything
+that *does* reach callbacks still redacts payloads unless
+`event_payloads=True`.
+
+> The run happens on a worker thread. Abandoning the iterator does **not**
+> cancel it — Python cannot cancel a running thread — so the turn finishes in
+> the background. An exception from the run is re-raised at the iterator, so
+> failures surface the way `run()`'s would.
+
 ### One response shape, whoever answered
 
 Every provider is reduced to the same `LLMResponse`, so nothing downstream
