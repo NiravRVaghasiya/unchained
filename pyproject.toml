@@ -64,18 +64,17 @@ Source = "https://github.com/NiravRVaghasiya/unchained"
 Issues = "https://github.com/NiravRVaghasiya/unchained/issues"
 
 [tool.setuptools]
-py-modules = ["unchained"]
-# NOTE: no py.typed marker is shipped. PEP 561 does not define a mechanism
-# for module-only (py-modules) distributions to ship one inside the built
-# wheel - only package (directory) distributions can. Verified by building
-# and inspecting the wheel: setuptools' package-data / include-package-data
-# do not attach a data file to a bare py-modules entry, and mypy reports
-# "missing library stubs or py.typed marker" against the installed wheel
-# even with such a marker file present in the source tree. Making this
-# fully work for `pip install unchained-ai` would require converting
-# unchained.py into a package directory, which conflicts with the
-# single-file design. The core is still fully inline-typed and mypy-clean
-# when developed from source (which is also how CI type-checks it).
+# The framework is one source file, unchained/__init__.py. It lives in a
+# directory rather than as a bare unchained.py purely so PEP 561 can work:
+# a type checker only trusts a distribution's inline annotations when it
+# finds a py.typed marker, and a marker can only be attached to a package,
+# not to a top-level module. Verified both ways against a built wheel in a
+# clean environment - see tests/test_packaging.py, which fails if the
+# marker ever stops shipping.
+packages = ["unchained"]
+
+[tool.setuptools.package-data]
+unchained = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -110,7 +109,7 @@ ignore = [
 # Runtime supports 3.9+, but mypy itself only type-checks against 3.10+.
 # 3.9 syntax compatibility is enforced separately by ruff (target-version py39).
 python_version = "3.10"
-files = ["unchained.py"]
+files = ["unchained"]
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = false

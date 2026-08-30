@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`pip install unchained-ai` gave downstream code no type information.** The
+  wheel shipped a bare `unchained.py` with no PEP 561 marker, so mypy reported
+  `Skipping analyzing "unchained": module is installed, but missing library
+  stubs or py.typed marker` and every symbol resolved to `Any` - a wrong
+  annotation in a user's code went unflagged. The core now ships as
+  `unchained/__init__.py` with a `py.typed` marker beside it, and a consumer's
+  checker sees the real signatures.
+
+  It is still exactly one source file. The directory exists only because a
+  marker cannot be attached to a top-level module - the previous note in
+  `pyproject.toml` was right that `py-modules` cannot carry one, but wrong
+  that a package meant restructuring: a one-file package is not a hierarchy.
+  Verified against a built wheel installed into a clean environment, both
+  before and after.
+
 ### Added
+- `tests/test_packaging.py`: builds a real wheel and asserts it contains
+  `unchained/py.typed` and nothing unexpected, that the core is still a single
+  module, and - by unpacking into a throwaway environment and running mypy
+  with and without the marker - that a consumer's type checker actually
+  resolves the package. The last one is asserted both ways round because the
+  obvious version of it passes for the wrong reason.
 - **`agent.events(...)`: the run as an iterator.** Callbacks are push-based;
   this yields the whole lifecycle instead - the run starting, each iteration,
   every LLM request and reply, every tool call and how it ended, streamed

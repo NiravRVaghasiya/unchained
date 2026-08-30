@@ -24,12 +24,13 @@ def _count_unchained_loc() -> int:
     """
     try:
         lines = 0
-        for raw in (_ROOT / "unchained.py").read_text(encoding="utf-8").splitlines():
+        source = _ROOT / "unchained" / "__init__.py"
+        for raw in source.read_text(encoding="utf-8").splitlines():
             stripped = raw.strip()
             if stripped and not stripped.startswith("#"):
                 lines += 1
         return lines
-    except OSError:  # pragma: no cover - unchained.py always ships alongside this file
+    except OSError:  # pragma: no cover - the core always ships alongside this file
         return 0
 
 

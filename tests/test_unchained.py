@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Literal, Optional
 import pytest
 import requests
 
-# Make the top-level unchained.py importable regardless of how pytest is invoked.
+# Make the top-level unchained package importable regardless of how pytest is invoked.
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))

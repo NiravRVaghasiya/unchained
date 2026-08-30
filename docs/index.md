@@ -9,7 +9,7 @@ Ollama model.
 
 ```bash
 pip install requests pydantic
-# then drop unchained.py into your project, or: pip install -e ".[dev]"
+# then drop the one file into your project, or: pip install -e ".[dev]"
 ```
 
 ## Try it with zero setup

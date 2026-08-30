@@ -21,10 +21,10 @@ Tools, memory, RAG, multi-agent orchestration and structured output — in one f
 
 Most agent frameworks ask you to learn a mountain of abstractions before you
 can print "hello world". Unchained is the opposite: one readable file, two
-dependencies, zero magic. Copy `unchained.py` into your project and you are
-done.
+dependencies, zero magic. Copy the one source file into your project and you
+are done.
 
-- **Single-file core** — the whole framework fits in `unchained.py`. No submodules to jump between.
+- **Single-file core** — the whole framework is one file, `unchained/__init__.py`. No submodules to jump between.
 - **Two dependencies** — `requests` + `pydantic`. Nothing else.
 - **Provider-agnostic** — the same code runs on OpenAI, Anthropic, a local Ollama model, or any OpenAI-compatible endpoint (Groq, Together, OpenRouter, vLLM, LM Studio, ...). Change one line.
 - **No magic** — no metaclasses, no monkey-patching, no hidden global state.
@@ -49,7 +49,17 @@ pip install requests pydantic
 pip install -e ".[dev]"
 ```
 
-Prefer zero install? Copy `unchained.py` straight into your project — that's the point.
+Prefer zero install? Take the one file — that's the point:
+
+```bash
+curl -O https://raw.githubusercontent.com/NiravRVaghasiya/unchained/main/unchained/__init__.py
+mv __init__.py unchained.py
+```
+
+It sits in a directory in this repository only so that `pip install unchained-ai`
+can ship a PEP 561 `py.typed` marker, which a type checker will not accept on a
+bare top-level module. Dropped into your project as `unchained.py`, it works
+exactly the same.
 
 ## 30-second tour
 

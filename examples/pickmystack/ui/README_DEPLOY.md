@@ -41,7 +41,7 @@ sibling container on the same network.
 
 ### Hugging Face Spaces
 1. Create a new **Streamlit** Space.
-2. Add `unchained.py` and the `examples/` folder, plus a `requirements.txt` mirroring `ui/requirements.txt`.
+2. Add the `unchained/` package and the `examples/` folder, plus a `requirements.txt` mirroring `ui/requirements.txt`.
 3. Set the app file to `examples/pickmystack/ui/app_ui.py` and add your key as a Space secret.
 
 ### Render / Fly.io / Cloud Run

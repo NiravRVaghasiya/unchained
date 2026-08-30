@@ -1,6 +1,6 @@
 # API Reference
 
-Auto-generated from the docstrings in `unchained.py`.
+Auto-generated from the docstrings in `unchained/__init__.py`.
 
 ::: unchained
     options:
