@@ -27,10 +27,15 @@ def add(a: int, b: int) -> int:
 
 def tool_calling_demo() -> None:
     # Script the mock: first turn requests the tool, second turn answers.
+    # Each reply reports token usage, which the agent adds up across turns.
+    usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     llm = MockLLM(
         script=[
-            {"tool_calls": [{"name": "add", "arguments": {"a": 2, "b": 3}, "id": "1"}]},
-            {"content": "2 + 3 = 5."},
+            {
+                "tool_calls": [{"name": "add", "arguments": {"a": 2, "b": 3}, "id": "1"}],
+                "usage": usage,
+            },
+            {"content": "2 + 3 = 5.", "usage": usage},
         ]
     )
     agent = Agent(llm, tools=[add])

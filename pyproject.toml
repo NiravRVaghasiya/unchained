@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "unchained-ai"
-version = "0.4.0"
+dynamic = ["version"]
 description = "A single-file agentic AI framework: tools, memory, RAG, multi-agent orchestration and structured output with just two dependencies."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Unchained Contributors" }]
 keywords = [
     "ai",
@@ -25,13 +25,14 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 dependencies = [
     "requests>=2.28",
@@ -42,19 +43,9 @@ dependencies = [
 # Runs on every supported Python (including 3.9).
 test = ["pytest>=7.0", "pytest-cov>=4.0"]
 # Linters/type-checkers; mypy requires 3.10+, so run these on a newer Python.
-lint = ["ruff>=0.6", "mypy>=1.8", "types-requests"]
+lint = ["ruff>=0.12", "mypy>=1.8", "types-requests"]
 # Everything a contributor needs locally.
-dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "ruff>=0.6",
-    "mypy>=1.8",
-    "types-requests",
-    "pre-commit>=3.5",
-    "build>=1.0",
-    "twine>=5.0",
-]
-ui = ["streamlit>=1.30"]
+dev = ["unchained-ai[test,lint]", "pre-commit>=3.5", "build>=1.0"]
 docs = ["mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
 [project.urls]
@@ -76,6 +67,9 @@ packages = ["unchained"]
 [tool.setuptools.package-data]
 unchained = ["py.typed"]
 
+[tool.setuptools.dynamic]
+version = { attr = "unchained.__version__" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
@@ -91,18 +85,16 @@ extend-exclude = ["build", "dist"]
 select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
 ignore = [
     "E501",   # line length is handled by the formatter
-    "B008",   # function calls in argument defaults (intentional in a few tools)
     "UP035",  # keep typing.Dict/List imports for 3.9 clarity
-    "UP006",  # keep Dict/List annotations for 3.9 compatibility
+    "UP006",  # keep Dict/List annotations (CONTRIBUTING.md style)
     "UP007",  # keep Optional[X]/Union[X, Y] style
     "UP045",  # keep Optional[X] rather than X | None
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Examples, benchmarks and tests bootstrap sys.path before importing the
-# framework, so a top-of-file import ordering (E402) is expected there.
+# Examples and tests bootstrap sys.path before importing the framework, so
+# a top-of-file import ordering (E402) is expected there.
 "examples/**" = ["E402"]
-"benchmarks/**" = ["E402"]
 "tests/**" = ["E402"]
 
 [tool.mypy]
@@ -112,8 +104,6 @@ python_version = "3.10"
 files = ["unchained"]
 ignore_missing_imports = true
 warn_redundant_casts = true
-warn_unused_ignores = false
-no_implicit_optional = true
 check_untyped_defs = true
 
 [tool.coverage.run]
@@ -122,8 +112,3 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
-exclude_lines = [
-    "pragma: no cover",
-    "if __name__ == .__main__.:",
-    "raise NotImplementedError",
-]

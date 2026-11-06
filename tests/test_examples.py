@@ -2,7 +2,7 @@
 
 These run fully offline, same as tests/test_unchained.py: real network calls
 (researcher.web_search) are monkeypatched, and PickMyStack agents use
-MockLLM/FakeLLM stand-ins instead of a real provider.
+MockLLM (or a local failing stand-in) instead of a real provider.
 
     pytest tests/test_examples.py
 """
@@ -176,15 +176,6 @@ def test_estimate_cost_respects_explicit_hosting_choice():
 # ---------------------------------------------------------------------------
 # examples/pickmystack/tools/benchmark_fetcher.py
 # ---------------------------------------------------------------------------
-def test_framework_data_known_and_unknown():
-    from examples.pickmystack.tools.benchmark_fetcher import framework_data
-
-    data = framework_data("LangChain")
-    assert data["dependencies"] == 50
-    assert data["multi_agent"] is True
-    assert framework_data("not-a-real-framework") == {}
-
-
 def test_compare_frameworks_all_vs_subset():
     from examples.pickmystack.tools.benchmark_fetcher import compare_frameworks
 
@@ -326,17 +317,17 @@ def test_recommend_isolates_a_failing_specialist(monkeypatch):
 # examples/policy.py
 # ---------------------------------------------------------------------------
 def test_policy_example_read_only_agent_cannot_write():
-    from examples.policy import TOOLS, apply_refund
-    from unchained import Agent, MockLLM, PermissionPolicy
+    from examples.policy import ORDERS, TOOLS
+    from unchained import Agent, PermissionPolicy
 
     agent = Agent(MockLLM(), tools=TOOLS, policy=PermissionPolicy(granted={"billing:read"}))
-    before = dict(apply_refund.func.__globals__["ORDERS"]["A-1"])
+    before = dict(ORDERS["A-1"])
     observation = agent._execute(
         agent.session(),
         {"name": "apply_refund", "arguments": {"order_id": "A-1", "amount": 42.0}, "id": "c"},
     )
     assert "billing:write" in observation
-    assert apply_refund.func.__globals__["ORDERS"]["A-1"] == before  # nothing changed
+    assert ORDERS["A-1"] == before  # nothing changed
 
 
 def test_policy_example_approval_hook_is_consulted():
@@ -381,3 +372,69 @@ def test_sessions_example_runs_end_to_end(capsys):
     out = capsys.readouterr().out
     assert "0 errors" in out
     assert "every session's history contains only its own turns" in out
+
+
+# ---------------------------------------------------------------------------
+# examples/sqlite_memory.py
+# ---------------------------------------------------------------------------
+def test_sqlite_memory_persists_and_reloads(tmp_path):
+    from examples.sqlite_memory import SQLiteMemory
+
+    db = str(tmp_path / "mem.db")
+    mem = SQLiteMemory(db_path=db, session_id="s1")
+    mem.add("user", "hello")
+    mem.add("assistant", "hi", tool_calls=[{"name": "x", "arguments": {}}])
+    mem.close()
+
+    reloaded = SQLiteMemory(db_path=db, session_id="s1")
+    assert [m["content"] for m in reloaded.get()] == ["hello", "hi"]
+    assert reloaded.get()[1]["tool_calls"][0]["name"] == "x"  # extra fields persisted
+
+    other = SQLiteMemory(db_path=db, session_id="s2")  # sessions are isolated
+    assert other.get() == []
+    reloaded.close()
+    other.close()
+
+
+def test_sqlite_memory_reload_never_starts_with_an_orphaned_tool_result(tmp_path):
+    # Providers reject a tool result without the assistant turn that asked for
+    # it, so a reloaded window walks back to that turn, as Memory's own does.
+    from examples.sqlite_memory import SQLiteMemory
+
+    db = str(tmp_path / "mem.db")
+    mem = SQLiteMemory(db_path=db, session_id="s", max_messages=10)
+    mem.add("user", "q")
+    mem.add("assistant", "", tool_calls=[{"name": "x", "arguments": {}, "id": "c1"}])
+    mem.add("tool", "result", tool_call_id="c1", name="x")
+    mem.add("assistant", "answer")
+    mem.close()
+
+    reloaded = SQLiteMemory(db_path=db, session_id="s", max_messages=2)
+    assert [m["role"] for m in reloaded.get()] == ["assistant", "tool", "assistant"]
+    assert reloaded.get()[0]["tool_calls"][0]["id"] == "c1"
+    reloaded.close()
+    empty = SQLiteMemory(db_path=db, session_id="none", max_messages=0)
+    assert empty.get() == []
+    empty.close()
+
+
+# ---------------------------------------------------------------------------
+# examples/coder.py
+# ---------------------------------------------------------------------------
+def test_coder_run_python_executes():
+    from examples.coder import run_python
+
+    assert run_python("print(6 * 7)") == "42"
+
+
+def test_coder_run_python_reports_errors():
+    from examples.coder import run_python
+
+    assert run_python("raise ValueError('boom')").startswith("Error")
+
+
+def test_coder_run_python_times_out(monkeypatch):
+    import examples.coder as coder
+
+    monkeypatch.setattr(coder, "EXEC_TIMEOUT_SECONDS", 1)
+    assert "timed out" in coder.run_python("while True:\n    pass")

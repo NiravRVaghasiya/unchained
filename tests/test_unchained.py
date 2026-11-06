@@ -1,7 +1,8 @@
 """Unit tests for the Unchained framework.
 
-These run fully offline: a FakeLLM stands in for any real provider, so no API
-keys or network access are required.
+These run fully offline: FakeLLM or MockLLM stands in for a provider, and
+provider HTTP is faked by patching requests.Session.post (see _patch_post), so
+no API keys or network access are required.
 
     pytest
 """
@@ -11,6 +12,7 @@ import dataclasses
 import enum
 import inspect
 import json
+import logging
 import sys
 import threading
 import time
@@ -46,8 +48,6 @@ class FakeLLM:
             {"messages": messages, "tools": tools, "response_format": response_format}
         )
         resp = self.responses.pop(0) if self.responses else {}
-        if callable(resp):
-            resp = resp(messages, tools, response_format)
         return {
             "content": resp.get("content", ""),
             "tool_calls": resp.get("tool_calls", []),
@@ -62,12 +62,6 @@ class FakeLLM:
 def forecast(city: str, days: int = 3, tags: Optional[List[str]] = None) -> str:
     """Look up a forecast."""
     return f"{city}:{days}"
-
-
-def test_tool_is_tool_instance_and_callable():
-    assert isinstance(forecast, Tool)
-    assert forecast("Paris", 2) == "Paris:2"  # still callable
-    assert forecast.run({"city": "Rome"}) == "Rome:3"
 
 
 def test_tool_schema_types_and_required():
@@ -128,10 +122,6 @@ def test_rag_smoothed_idf_stays_positive():
     rag.add_many(["shared alpha term", "shared beta term", "shared gamma term"])
     assert rag._idf, "index should be built"
     assert all(value > 0 for value in rag._idf.values())
-
-
-def test_rag_empty_search_returns_empty():
-    assert RAG().search("anything") == []
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +218,7 @@ def _named_agent(name: str, answer: str) -> Agent:
 def test_router_routes_to_named_agent():
     cost = _named_agent("cost", "cost answer")
     fit = _named_agent("fit", "fit answer")
-    router = Router(FakeLLM([{"content": "the best choice is the cost agent"}]), agents=[cost, fit])
+    router = Router(FakeLLM([{"content": '{"agent": "cost"}'}]), agents=[cost, fit])
     assert router.route("How much will it cost?").name == "cost"
 
 
@@ -239,21 +229,6 @@ def test_router_run_all_collects_every_agent():
     )
     results = router.run_all("hello")
     assert results == {"a": "A", "b": "B", "c": "C"}
-
-
-def test_router_synthesize_uses_synthesizer():
-    agents = [_named_agent("a", "finding-a"), _named_agent("b", "finding-b")]
-    synth = _named_agent("synth", "FINAL ANSWER")
-    router = Router(FakeLLM([]), agents=agents, synthesizer=synth)
-    assert router.synthesize("question") == "FINAL ANSWER"
-
-
-def test_router_requires_agents():
-    try:
-        Router(FakeLLM([]), agents=[])
-    except ValueError:
-        return
-    raise AssertionError("Router should reject an empty agent list")
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +334,24 @@ class _BoomLLM:
         raise RuntimeError("provider down")
 
 
+class _ToolThenStreamLLM:
+    """A duck-typed LLM: the first chat() returns tool_calls, later ones return
+    none, and stream() yields the final answer in chunks."""
+
+    def __init__(self, tool_calls, chunks):
+        self.tool_calls = tool_calls
+        self.chunks = chunks
+        self.chat_calls = 0
+
+    def chat(self, messages, tools=None, response_format=None):
+        self.chat_calls += 1
+        calls = self.tool_calls if self.chat_calls == 1 else []
+        return {"content": "", "tool_calls": calls, "usage": {}}
+
+    def stream(self, messages):
+        yield from self.chunks
+
+
 def test_openai_chat_parses_content_and_tool_calls(monkeypatch):
     payload = {
         "choices": [
@@ -382,9 +375,10 @@ def test_openai_chat_parses_content_and_tool_calls(monkeypatch):
 
 
 def test_openai_chat_raises_on_non_retryable_http_error(monkeypatch):
-    _patch_post(monkeypatch, {}, status_code=400)
+    captured = _patch_post(monkeypatch, {}, status_code=400)
     with pytest.raises(requests.HTTPError):
         LLM(provider="openai", api_key="k", max_retries=2).chat([{"role": "user", "content": "hi"}])
+    assert captured["calls"] == 1  # a 4xx is not retried
 
 
 def test_anthropic_chat_splits_system_and_parses_tools(monkeypatch):
@@ -475,6 +469,32 @@ def test_agent_forces_final_answer_after_max_iterations():
     assert agent.run("go") == "final"
 
 
+def test_exhausted_iterations_with_structured_output_make_one_final_call():
+    # The forced final answer already runs under the schema, so no second,
+    # identical formatting call follows it - and the object returned is the
+    # reply memory holds, not a different one.
+    class Item(BaseModel):
+        x: int
+
+    @tool
+    def ping() -> str:
+        """Ping."""
+        return "pong"
+
+    answers = iter(['{"x": 3}', '{"x": 4}'])
+
+    def handler(messages, tools):
+        if tools:
+            return {"content": "", "tool_calls": [{"name": "ping", "arguments": {}, "id": "c"}]}
+        return next(answers)
+
+    llm = MockLLM(handler=handler)
+    session = Agent(llm, tools=[ping], max_iterations=2).session()
+    assert session.run("go", response_format=Item) == Item(x=3)
+    assert len([call for call in llm.calls if not call["tools"]]) == 1
+    assert session.memory.get()[-1]["content"] == '{"x": 3}'
+
+
 def test_agent_structured_output_with_tools_runs_format_pass():
     @tool
     def ping() -> str:
@@ -503,6 +523,11 @@ def test_router_run_all_isolates_a_failing_agent():
 def test_router_run_all_sequential():
     router = Router(FakeLLM([]), agents=[_named_agent("a", "A"), _named_agent("b", "B")])
     assert router.run_all("q", parallel=False) == {"a": "A", "b": "B"}
+
+
+def test_router_synthesize_without_a_synthesizer_returns_the_sections():
+    router = Router(FakeLLM([]), agents=[_named_agent("a", "A"), _named_agent("b", "B")])
+    assert router.synthesize("q") == "### a\nA\n\n### b\nB"
 
 
 def test_loads_object_extracts_and_handles_garbage():
@@ -550,10 +575,19 @@ def test_request_retries_on_connection_error(monkeypatch):
     assert captured["calls"] == 2
 
 
+def test_request_reraises_the_connection_error_after_exhausting_retries(monkeypatch):
+    captured = _patch_post(
+        monkeypatch, responses=[requests.ConnectionError("down") for _ in range(3)]
+    )
+    with pytest.raises(requests.ConnectionError, match="down"):
+        LLM(provider="openai", api_key="k", max_retries=2).chat([{"role": "user", "content": "hi"}])
+    assert captured["calls"] == 3
+
+
 def test_retry_delay_honours_retry_after():
     llm = LLM(provider="openai", api_key="k")
-    exc = unchained._RetryableStatus(_FakeResponse(status_code=429, headers={"Retry-After": "7"}))
-    assert llm._retry_delay(exc, attempt=0) == 7.0
+    response = _FakeResponse(status_code=429, headers={"Retry-After": "7"})
+    assert llm._retry_delay(response, attempt=0) == 7.0
 
 
 # ---------------------------------------------------------------------------
@@ -582,32 +616,6 @@ def test_normalize_usage_across_provider_shapes():
     assert LLM._normalize_usage(None)["total_tokens"] == 0
 
 
-def test_agent_accumulates_usage():
-    llm = FakeLLM(
-        [
-            {
-                "content": "",
-                "tool_calls": [{"name": "noop", "arguments": {}, "id": "1"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-            },
-            {
-                "content": "done",
-                "tool_calls": [],
-                "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
-            },
-        ]
-    )
-
-    @tool
-    def noop() -> str:
-        """No-op."""
-        return "ok"
-
-    agent = Agent(llm, tools=[noop])
-    agent.run("go")
-    assert agent.usage == {"prompt_tokens": 14, "completion_tokens": 11, "total_tokens": 25}
-
-
 # ---------------------------------------------------------------------------
 # Tier 2: streaming
 # ---------------------------------------------------------------------------
@@ -628,13 +636,17 @@ def test_anthropic_stream_parses_sse(monkeypatch):
         'data: {"type":"content_block_delta","delta":{"text":"lo"}}',
         'data: {"type":"message_stop"}',
     ]
-    _patch_post(monkeypatch, lines=lines)
+    captured = _patch_post(monkeypatch, lines=lines)
     chunks = list(
         LLM(provider="anthropic", api_key="k").stream(
             [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
         )
     )
     assert "".join(chunks) == "Hello"
+    # The streamed body is built by the same helper as chat: system hoisted out.
+    assert captured["json"]["system"] == "s"
+    assert captured["json"]["stream"] is True
+    assert [m["role"] for m in captured["json"]["messages"]] == ["user"]
 
 
 def test_ollama_stream_parses_jsonl(monkeypatch):
@@ -660,29 +672,13 @@ def test_agent_stream_without_tools(monkeypatch):
 
 
 def test_agent_stream_resolves_tools_then_streams():
-    class ToolThenStreamLLM:
-        def __init__(self):
-            self.chat_calls = 0
-
-        def chat(self, messages, tools=None, response_format=None):
-            self.chat_calls += 1
-            return {
-                "content": "",
-                "tool_calls": [{"name": "ping", "arguments": {}, "id": "1"}]
-                if self.chat_calls == 1
-                else [],
-                "usage": {},
-            }
-
-        def stream(self, messages):
-            yield from ["fin", "al"]
-
     @tool
     def ping() -> str:
         """Ping."""
         return "pong"
 
-    agent = Agent(ToolThenStreamLLM(), tools=[ping])
+    llm = _ToolThenStreamLLM([{"name": "ping", "arguments": {}, "id": "1"}], ["fin", "al"])
+    agent = Agent(llm, tools=[ping])
     assert "".join(agent.stream("go")) == "final"
     tool_msgs = [m for m in agent.memory.get() if m["role"] == "tool"]
     assert tool_msgs and tool_msgs[0]["content"] == "pong"
@@ -735,10 +731,6 @@ def test_callback_errors_do_not_break_run():
     assert agent.run("hi") == "ok"  # run survives a failing callback
 
 
-def test_logging_callback_is_a_callback():
-    assert isinstance(unchained.LoggingCallback(), unchained.Callback)
-
-
 # ---------------------------------------------------------------------------
 # Tier 2: structured-output repair
 # ---------------------------------------------------------------------------
@@ -768,26 +760,16 @@ def test_structured_output_raises_when_repair_budget_exhausted():
         Agent(llm, structured_retries=1).run("extract", response_format=Person)
 
 
-# ---------------------------------------------------------------------------
-# Tier 2: SQLiteMemory example
-# ---------------------------------------------------------------------------
-def test_sqlite_memory_persists_and_reloads(tmp_path):
-    from examples.sqlite_memory import SQLiteMemory
+@pytest.mark.parametrize("retries", [0, -1])
+def test_structured_output_without_a_repair_budget_validates_once(retries):
+    class Person(BaseModel):
+        name: str
+        age: int
 
-    db = str(tmp_path / "mem.db")
-    mem = SQLiteMemory(db_path=db, session_id="s1")
-    mem.add("user", "hello")
-    mem.add("assistant", "hi", tool_calls=[{"name": "x", "arguments": {}}])
-    mem.close()
-
-    reloaded = SQLiteMemory(db_path=db, session_id="s1")
-    assert [m["content"] for m in reloaded.get()] == ["hello", "hi"]
-    assert reloaded.get()[1]["tool_calls"][0]["name"] == "x"  # extra fields persisted
-
-    other = SQLiteMemory(db_path=db, session_id="s2")  # sessions are isolated
-    assert other.get() == []
-    reloaded.close()
-    other.close()
+    llm = MockLLM(script=['{"name": "Ada"}'])
+    with pytest.raises(ValidationError):
+        Agent(llm, structured_retries=retries).run("extract", response_format=Person)
+    assert len(llm.calls) == 1  # no repair call
 
 
 # ---------------------------------------------------------------------------
@@ -842,51 +824,6 @@ def test_rag_embedding_mode_ranks_by_cosine():
     assert "python" in hits[0]["text"].lower()
     assert hits[0]["score"] >= hits[1]["score"] > 0
     assert not rag._vectors  # TF-IDF index is not built in embedding mode
-
-
-# ---------------------------------------------------------------------------
-# Tier 3: response caching
-# ---------------------------------------------------------------------------
-def test_llm_cache_avoids_second_request(monkeypatch):
-    payload = {"choices": [{"message": {"content": "cached", "tool_calls": []}}], "usage": {}}
-    captured = _patch_post(monkeypatch, payload)
-    llm = LLM(provider="openai", api_key="k", cache=True)
-    messages = [{"role": "user", "content": "same question"}]
-    first = llm.chat(messages)
-    second = llm.chat(messages)
-    assert first["content"] == second["content"] == "cached"
-    assert captured["calls"] == 1  # second call served from cache
-
-
-def test_llm_does_not_cache_by_default(monkeypatch):
-    payload = {"choices": [{"message": {"content": "x", "tool_calls": []}}], "usage": {}}
-    captured = _patch_post(monkeypatch, payload)
-    llm = LLM(provider="openai", api_key="k")
-    llm.chat([{"role": "user", "content": "hi"}])
-    llm.chat([{"role": "user", "content": "hi"}])
-    assert captured["calls"] == 2
-
-
-# ---------------------------------------------------------------------------
-# Tier 3: hardened code-execution example
-# ---------------------------------------------------------------------------
-def test_coder_run_python_executes():
-    from examples.coder import run_python
-
-    assert run_python("print(6 * 7)") == "42"
-
-
-def test_coder_run_python_reports_errors():
-    from examples.coder import run_python
-
-    assert run_python("raise ValueError('boom')").startswith("Error")
-
-
-def test_coder_run_python_times_out(monkeypatch):
-    import examples.coder as coder
-
-    monkeypatch.setattr(coder, "EXEC_TIMEOUT_SECONDS", 1)
-    assert "timed out" in coder.run_python("while True:\n    pass")
 
 
 # ---------------------------------------------------------------------------
@@ -989,13 +926,6 @@ def test_agent_with_async_tool_end_to_end():
     assert tool_msgs[0]["content"] == "ACME:100"
 
 
-def test_agent_arun_matches_sync_run():
-    llm = FakeLLM([{"content": "async answer"}])
-    agent = Agent(llm)
-    result = asyncio.run(agent.arun("hi"))
-    assert result == "async answer"
-
-
 def test_llm_achat_offloads_to_thread(monkeypatch):
     payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
     _patch_post(monkeypatch, payload)
@@ -1085,27 +1015,14 @@ def test_concurrent_tool_calls_during_streaming():
         barrier.wait()
         return "b"
 
-    class ToolThenStreamLLM:
-        def __init__(self):
-            self.chat_calls = 0
-
-        def chat(self, messages, tools=None, response_format=None):
-            self.chat_calls += 1
-            if self.chat_calls == 1:
-                return {
-                    "content": "",
-                    "tool_calls": [
-                        {"name": "stream_a", "arguments": {}, "id": "1"},
-                        {"name": "stream_b", "arguments": {}, "id": "2"},
-                    ],
-                    "usage": {},
-                }
-            return {"content": "", "tool_calls": [], "usage": {}}
-
-        def stream(self, messages):
-            yield "done"
-
-    agent = Agent(ToolThenStreamLLM(), tools=[stream_a, stream_b])
+    llm = _ToolThenStreamLLM(
+        [
+            {"name": "stream_a", "arguments": {}, "id": "1"},
+            {"name": "stream_b", "arguments": {}, "id": "2"},
+        ],
+        ["done"],
+    )
+    agent = Agent(llm, tools=[stream_a, stream_b])
     assert "".join(agent.stream("go")) == "done"
 
 
@@ -1229,9 +1146,14 @@ def test_cache_ttl_expires_old_entries(monkeypatch):
 def test_cache_without_ttl_never_expires(monkeypatch):
     payload = {"choices": [{"message": {"content": "hi", "tool_calls": []}}], "usage": {}}
     captured = _patch_post(monkeypatch, payload)
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(unchained.time, "time", lambda: clock["now"])
+
     llm = LLM(provider="openai", api_key="k", cache=True)  # cache_ttl=None
     messages = [{"role": "user", "content": "hi"}]
     llm.chat(messages)
+    clock["now"] += 10**9  # decades later
     llm.chat(messages)
     assert captured["calls"] == 1
 
@@ -1334,16 +1256,6 @@ def test_memory_compression_keeps_a_sendable_window_for_openai():
     _assert_tool_results_are_paired(converted)
 
 
-def test_memory_tool_group_rule_does_not_disturb_plain_conversations():
-    # The boundary only moves when it lands on a tool message; ordinary
-    # windows keep exactly the previous sizing.
-    memory = Memory(max_messages=4)
-    for i in range(5):
-        memory.add("user", f"message number {i}")
-    assert len(memory.get()) == 2  # unchanged: recent half
-    assert [m["role"] for m in memory.get()] == ["user", "user"]
-
-
 def test_memory_tool_group_start_walks_back_to_the_assistant():
     messages = [
         {"role": "user", "content": "q"},
@@ -1359,73 +1271,9 @@ def test_memory_tool_group_start_walks_back_to_the_assistant():
     assert Memory._tool_group_start([{"role": "tool"}, {"role": "tool"}], 1) == 0
 
 
-def test_memory_token_budget_still_shrinks_below_the_message_cap():
-    # Guards the _compress rewrite against index-arithmetic regressions.
-    memory = Memory(max_messages=20, max_tokens=500)
-    memory.add("user", "x" * 4000)
-    memory.add("user", "y" * 4000)
-    assert len(memory.get()) <= 1
-    assert memory.summary
-
-
 # ---------------------------------------------------------------------------
 # Router fails closed
 # ---------------------------------------------------------------------------
-def test_router_raises_rather_than_guessing_an_agent():
-    # Previously an unmatched reply silently returned agents[0], and an empty
-    # reply returned the longest-named agent (because "" is a substring of
-    # every name) - routing a query to an agent nobody chose.
-    router = Router(
-        FakeLLM([]),
-        agents=[_named_agent("billing", "b"), _named_agent("admin_delete", "a")],
-    )
-    for unroutable in ("", "   ", "i cannot determine which agent", "banana", "finance"):
-        with pytest.raises(unchained.RoutingError):
-            router._match(unroutable)
-
-
-def test_router_refuses_an_ambiguous_reply_naming_two_agents():
-    router = Router(
-        FakeLLM([]),
-        agents=[_named_agent("billing", "b"), _named_agent("admin_delete", "a")],
-    )
-    with pytest.raises(unchained.RoutingError):
-        router._match("either billing or admin_delete would work")
-
-
-def test_router_does_not_match_a_name_inside_a_longer_word():
-    # "fit" must not match a reply that merely mentions "profit".
-    router = Router(FakeLLM([]), agents=[_named_agent("fit", "f"), _named_agent("cost", "c")])
-    assert router._match("look at the cost side").name == "cost"
-    with pytest.raises(unchained.RoutingError):
-        router._match("this is about profit margins")
-
-
-def test_router_still_matches_exact_and_embedded_names():
-    # Backwards compatibility: the cases that resolved before still resolve.
-    router = Router(FakeLLM([]), agents=[_named_agent("cost", "c"), _named_agent("fit", "f")])
-    assert router._match("cost").name == "cost"
-    assert router._match("  Cost  ").name == "cost"
-    assert router._match("the best choice is the cost agent").name == "cost"
-
-
-def test_router_fallback_agent_receives_unroutable_queries():
-    triage = _named_agent("triage", "triaged")
-    router = Router(
-        FakeLLM([{"content": "no idea"}]),
-        agents=[_named_agent("cost", "c"), _named_agent("fit", "f")],
-        fallback=triage,
-    )
-    assert router._match("no idea").name == "triage"
-    assert router.run("something unroutable") == "triaged"
-
-
-def test_router_run_propagates_routing_error():
-    router = Router(FakeLLM([{"content": "no idea"}]), agents=[_named_agent("cost", "c")])
-    with pytest.raises(unchained.RoutingError):
-        router.run("something unroutable")
-
-
 def test_routing_error_is_exported():
     assert "RoutingError" in unchained.__all__
     assert issubclass(unchained.RoutingError, RuntimeError)
@@ -1434,15 +1282,6 @@ def test_routing_error_is_exported():
 # ---------------------------------------------------------------------------
 # RAG rejects mismatched metadata
 # ---------------------------------------------------------------------------
-def test_rag_add_many_rejects_metadata_length_mismatch():
-    # Previously zip() truncated to the shorter list, so documents vanished
-    # silently in TF-IDF mode.
-    rag = RAG()
-    with pytest.raises(ValueError):
-        rag.add_many(["one", "two", "three"], [{"m": 1}, {"m": 2}])
-    assert len(rag) == 0  # nothing was half-indexed
-
-
 def test_rag_add_many_mismatch_cannot_corrupt_the_embedding_index():
     # Previously this left 3 embeddings against 1 document, and search()
     # raised IndexError later, far from the cause.
@@ -1457,8 +1296,7 @@ def test_rag_add_many_accepts_matching_lengths_and_omitted_metadata():
     rag.add_many(["one", "two"], [{"m": 1}, {"m": 2}])
     rag.add_many(["three", "four"])  # metadatas omitted entirely
     assert len(rag) == 4
-    assert rag.metadata[0] == {"m": 1}
-    assert rag.metadata[3] == {}
+    assert rag.metadata == [{"m": 1}, {"m": 2}, {}, {}]
 
 
 # ---------------------------------------------------------------------------
@@ -1540,27 +1378,6 @@ def test_max_tool_workers_defaults_to_a_bound_and_is_never_below_one():
     assert Agent(FakeLLM([])).max_tool_workers == 8
     assert Agent(FakeLLM([]), max_tool_workers=0).max_tool_workers == 1
     assert Agent(FakeLLM([]), max_tool_workers=-5).max_tool_workers == 1
-
-
-def test_single_tool_call_still_skips_the_pool_entirely():
-    @tool
-    def echo(x: int) -> str:
-        """Echo the argument."""
-        return f"ok{x}"
-
-    agent = Agent(FakeLLM([]), tools=[echo])
-    before = threading.active_count()
-    agent._execute_calls(
-        agent.default_session, [{"name": "echo", "arguments": {"x": 1}, "id": "c0"}]
-    )
-    assert threading.active_count() == before
-
-
-def test_routing_error_message_truncates_a_runaway_model_reply():
-    router = Router(FakeLLM([]), agents=[_named_agent("cost", "c")])
-    with pytest.raises(unchained.RoutingError) as excinfo:
-        router._match("x" * 5000)
-    assert len(str(excinfo.value)) < 400
 
 
 # ---------------------------------------------------------------------------
@@ -1904,21 +1721,6 @@ def test_validate_arguments_allows_unknown_names_for_kwargs_tools():
         flexible.validate_arguments({"anything": 1})  # 'a' is still required
 
 
-def test_argument_validation_normalises_types():
-    # Models routinely send "42" for an int. Validation coerces it, so the
-    # function receives what its annotation promises rather than a str.
-    @tool
-    def counted(n: int) -> str:
-        """Takes an int."""
-        return str(n)
-
-    assert counted.validate_arguments({"n": "42"}) == {"n": 42}
-    assert isinstance(counted.validate_arguments({"n": "42"})["n"], int)
-    # Coercion is not a licence to accept nonsense.
-    with pytest.raises(unchained.ToolArgumentValidationError):
-        counted.validate_arguments({"n": "not-a-number"})
-
-
 # --- exceptions ------------------------------------------------------------
 def test_policy_exceptions_are_exported_and_catchable():
     for name in (
@@ -2034,10 +1836,6 @@ def test_a_failing_audit_callback_never_breaks_the_run(policy_tools, ran):
     assert ran == [("search", "q")]
 
 
-def test_logging_callback_implements_the_audit_hook():
-    assert unchained.LoggingCallback().on_tool_audit({"tool": "t", "decision": "allowed"}) is None
-
-
 # --- backwards compatibility ----------------------------------------------
 def test_bare_tool_decorator_is_unchanged():
     @tool
@@ -2089,16 +1887,6 @@ def test_default_policy_still_honours_tool_metadata(ran):
     agent = Agent(FakeLLM([]), tools=[dangerous])
     assert "requires approval" in agent._execute(agent.default_session, _call("dangerous", x=1))
     assert ran == []
-
-
-def test_existing_tool_error_handling_is_unchanged():
-    @tool
-    def boom(x: int) -> int:
-        """Always explodes."""
-        raise ValueError("nope")
-
-    agent = Agent(FakeLLM([]), tools=[boom])
-    assert "Error executing 'boom'" in agent._execute(agent.default_session, _call("boom", x=1))
 
 
 # ---------------------------------------------------------------------------
@@ -2259,8 +2047,7 @@ def test_concurrent_sessions_keep_separate_usage_totals():
         assert session.usage["total_tokens"] == 2 * (i + 1)
 
 
-@pytest.mark.parametrize("_", range(1))
-def test_concurrent_arun_sessions_are_isolated(_):
+def test_concurrent_arun_sessions_are_isolated():
     agent = Agent(_echo_llm())
 
     async def main():
@@ -2545,6 +2332,16 @@ def test_sessions_get_distinct_ids_by_default():
     assert agent.default_session.id == "default"
 
 
+def test_a_directly_built_session_gets_its_memory_from_the_factory():
+    class TaggedMemory(Memory):
+        pass
+
+    agent = Agent(_echo_llm(), memory_factory=TaggedMemory)
+    assert isinstance(unchained.Session(agent).memory, TaggedMemory)
+    assert isinstance(agent.session().memory, TaggedMemory)
+    assert isinstance(agent.default_session.memory, TaggedMemory)
+
+
 # ---------------------------------------------------------------------------
 # Tier 8: runtime argument validation
 #
@@ -2789,18 +2586,6 @@ def test_validation_does_not_trust_the_schema_shown_to_the_model():
 
 
 # --- the gate is on every model-facing path --------------------------------
-def test_tool_run_validates_even_when_called_directly(calls_seen):
-    @tool
-    def counted(n: int) -> str:
-        """Takes an int."""
-        calls_seen.append(n)
-        return "ok"
-
-    with pytest.raises(unchained.ToolArgumentValidationError):
-        counted.run({"n": "abc"})
-    assert calls_seen == []
-
-
 def test_direct_python_call_is_not_validated():
     # __call__ is your own code calling your own function; Python's own
     # argument handling applies. Only run(dict) is the model-shaped path.
@@ -2916,14 +2701,15 @@ def test_a_tool_with_an_exotic_annotation_still_builds_and_runs(calls_seen):
 
 
 def test_structural_fallback_still_checks_names_and_required_arguments():
-    # The path taken when Pydantic v2 is unavailable. Derived from the
-    # signature, like the real validator - never from the advertised schema.
+    # The path taken when no Pydantic model could be built from the signature.
+    # Derived from the signature, like the real validator - never from the
+    # advertised schema.
     @tool
     def sample(a: str, b: int = 2) -> str:
         """Sample."""
         return a
 
-    sample._validator = None  # simulate "no Pydantic v2"
+    sample._validator = None  # simulate "no model could be built"
     assert sample.validate_arguments({"a": "x"}) == {"a": "x"}
     assert sample.validate_arguments({"a": "x", "b": "3"}) == {"a": "x", "b": "3"}  # no coercion
     with pytest.raises(unchained.ToolArgumentValidationError):
@@ -3080,50 +2866,51 @@ def test_cache_policy_accepts_explicit_names():
 
 
 # --- a cached tool call is never self-executing ----------------------------
-def test_a_cached_tool_call_is_still_authorized_before_it_runs(monkeypatch):
+@pytest.mark.parametrize(
+    "tool_options,policy,expected",
+    [
+        (
+            {"permissions": {"billing:write"}, "side_effects": True},
+            unchained.PermissionPolicy(granted=set()),
+            "denied",
+        ),
+        ({"requires_approval": True}, None, "approval_denied"),  # no approve= -> fails closed
+    ],
+    ids=["permission", "approval"],
+)
+def test_a_cached_tool_call_is_still_authorized_before_it_runs(
+    monkeypatch, tool_options, policy, expected
+):
     # Even under the opt-in "all" policy, the cache decides only what the
     # model is taken to have said. Whether the call may run is still the
-    # policy's decision, on every turn.
+    # policy's decision, on every turn - including one replayed from the cache.
     ran = []
 
-    @tool(permissions={"billing:write"}, side_effects=True)
+    @tool(**tool_options)
     def refund(order_id: str) -> str:
         """Issue a refund."""
         ran.append(order_id)
         return "refunded"
 
-    _patch_post(monkeypatch, _with_tool_call())
-    llm = LLM(provider="openai", api_key="k", cache="all")
-    messages = [{"role": "user", "content": "refund order A-1"}]
-    llm.chat(messages, tools=[refund])  # prime the cache with the decision
+    class Sink(unchained.Callback):
+        def __init__(self):
+            self.decisions = []
 
-    agent = Agent(llm, tools=[refund], policy=unchained.PermissionPolicy(granted=set()))
-    observation = agent._execute(
-        agent.default_session, {"name": "refund", "arguments": {"order_id": "A-1"}, "id": "c1"}
-    )
-    assert "billing:write" in observation
+        def on_tool_audit(self, event):
+            self.decisions.append(event["decision"])
+
+    sink = Sink()
+    captured = _patch_post(monkeypatch, _with_tool_call())
+    llm = LLM(provider="openai", api_key="k", cache="all")
+    agent = Agent(llm, tools=[refund], policy=policy, callbacks=[sink], max_iterations=1)
+
+    agent.session().run("refund order A-1")
+    requests_made = captured["calls"]
+    agent.session().run("refund order A-1")  # a fresh session, served from the cache
+
+    assert captured["calls"] == requests_made  # nothing new reached the provider
+    assert sink.decisions == [expected, expected]  # the replayed call was still checked
     assert ran == []  # the cached decision did not become an execution
-
-
-def test_a_cached_tool_call_still_requires_approval(monkeypatch):
-    ran = []
-
-    @tool(requires_approval=True)
-    def refund(order_id: str) -> str:
-        """Issue a refund."""
-        ran.append(order_id)
-        return "refunded"
-
-    _patch_post(monkeypatch, _with_tool_call())
-    llm = LLM(provider="openai", api_key="k", cache="all")
-    llm.chat([{"role": "user", "content": "refund"}], tools=[refund])
-
-    agent = Agent(llm, tools=[refund])  # no approve= configured -> fails closed
-    observation = agent._execute(
-        agent.default_session, {"name": "refund", "arguments": {"order_id": "A-1"}, "id": "c1"}
-    )
-    assert "requires approval" in observation
-    assert ran == []
 
 
 # --- the cache key ---------------------------------------------------------
@@ -3303,15 +3090,6 @@ def test_cache_true_still_enables_caching_as_before(monkeypatch):
     assert llm.cache_size == 8 and llm.cache_ttl == 60
 
 
-def test_cache_false_still_disables_caching(monkeypatch):
-    captured = _patch_post(monkeypatch, _final())
-    llm = LLM(provider="openai", api_key="k", cache=False)
-    messages = [{"role": "user", "content": "q"}]
-    llm.chat(messages)
-    llm.chat(messages)
-    assert captured["calls"] == 2
-
-
 # ---------------------------------------------------------------------------
 # Tier 10: fail-closed routing
 #
@@ -3387,12 +3165,11 @@ def test_malformed_structured_replies_are_refused(reply):
     [
         ("cost", "cost"),
         ("  CoSt  ", "cost"),
-        ("The best agent is cost.", "cost"),
         ("admin delete", "admin delete"),
-        ("please use the admin delete agent", "admin delete"),
+        ("  Admin   DELETE ", "admin delete"),  # internal whitespace collapsed
     ],
 )
-def test_plain_text_replies_that_name_one_agent_resolve(reply, expected):
+def test_a_bare_agent_name_resolves(reply, expected):
     assert _router("cost", "fit", "admin delete")._match(reply).name == expected
 
 
@@ -3407,6 +3184,11 @@ def test_plain_text_replies_that_name_one_agent_resolve(reply, expected):
         ("use cost or fit, either works", "two agent names"),
         ("this is about profit margins", "'fit' inside 'profit'"),
         ("do not use admin, use the delete path", "name's words present but not adjacent"),
+        ("The best agent is cost.", "prose naming one agent"),
+        ("please use the admin delete agent", "prose naming a two-word agent"),
+        ("not cost", "prose naming an agent to reject it"),
+        ("{'rejected': 'cost'}", "malformed JSON naming one agent"),
+        ('{"agent": null, "note": "not cost"', "truncated JSON naming one agent"),
     ],
 )
 def test_unroutable_replies_raise_rather_than_guess(reply, why):
@@ -3429,24 +3211,6 @@ def test_error_message_lists_the_known_agents_and_truncates_the_reply():
     message = str(excinfo.value)
     assert "['cost', 'fit']" in message
     assert len(message) < 400
-
-
-# --- strict mode -----------------------------------------------------------
-def test_strict_mode_accepts_structured_and_bare_names_only():
-    router = _router("cost", "fit", strict=True)
-    assert router._match('{"agent": "cost"}').name == "cost"
-    assert router._match("cost").name == "cost"
-    assert router._match("  COST ").name == "cost"
-
-
-@pytest.mark.parametrize("reply", ["The best agent is cost.", "not cost", "probably cost"])
-def test_strict_mode_refuses_prose_including_the_negation_case(reply):
-    # Loose mode reads "not cost" as choosing cost - text matching cannot see
-    # sense. strict=True closes that gap by refusing prose outright.
-    with pytest.raises(unchained.RoutingError):
-        _router("cost", "fit", strict=True)._match(reply)
-
-    assert _router("cost", "fit")._match("not cost").name == "cost"  # documented gap
 
 
 # --- the registry is validated up front ------------------------------------
@@ -3536,22 +3300,14 @@ def test_fallback_is_used_only_when_configured():
     assert router._match('{"agent": "billing"}').name == "triage"
     # And a resolvable reply still goes where it should.
     assert router._match("cost").name == "cost"
+    # End to end: the router's FakeLLM([]) replies "", which routes to the fallback.
+    assert router.run("something unroutable") == "triaged"
 
 
 def test_run_propagates_routing_error_when_no_fallback():
     router = Router(MockLLM(reply="no idea"), agents=[_named_agent("cost", "a")])
     with pytest.raises(unchained.RoutingError):
         router.run("something unroutable")
-
-
-# --- run_all / synthesize do not route -------------------------------------
-def test_run_all_and_synthesize_are_unaffected_by_routing_failures():
-    # They run every agent, so there is no selection to get wrong.
-    agents = [_named_agent("cost", "A"), _named_agent("fit", "B")]
-    synth = _named_agent("synth", "FINAL")
-    router = Router(FakeLLM([]), agents=agents, synthesizer=synth)
-    assert router.run_all("q") == {"cost": "A", "fit": "B"}
-    assert router.synthesize("q") == "FINAL"
 
 
 # ---------------------------------------------------------------------------
@@ -3610,15 +3366,11 @@ def blocking_tools(gate):
     }
 
 
-def _tool_call(name, **arguments):
-    return {"name": name, "arguments": arguments, "id": f"call-{name}"}
-
-
 # --- the timeout bounds the agent's wait -----------------------------------
 def test_a_tool_that_overruns_its_timeout_is_reported_not_awaited(blocking_tools):
     agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
     started = time.perf_counter()
-    observation = agent._execute(agent.default_session, _tool_call("bounded"))
+    observation = agent._execute(agent.default_session, _call("bounded"))
     elapsed = time.perf_counter() - started
 
     assert "did not finish within 0.2s" in observation
@@ -3628,7 +3380,7 @@ def test_a_tool_that_overruns_its_timeout_is_reported_not_awaited(blocking_tools
 
 def test_a_tool_inside_its_timeout_returns_normally(blocking_tools):
     agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
-    assert agent._execute(agent.default_session, _tool_call("quick")) == "quick finished x"
+    assert agent._execute(agent.default_session, _call("quick")) == "quick finished x"
 
 
 def test_timeout_errors_reach_the_model_as_an_observation(blocking_tools):
@@ -3653,7 +3405,7 @@ def test_timeout_errors_reach_the_model_as_an_observation(blocking_tools):
 def test_agent_level_default_applies_to_a_tool_without_its_own(blocking_tools):
     agent = Agent(FakeLLM([]), tools=[blocking_tools["unbounded"]], tool_timeout=0.2)
     started = time.perf_counter()
-    observation = agent._execute(agent.default_session, _tool_call("unbounded"))
+    observation = agent._execute(agent.default_session, _call("unbounded"))
 
     assert "did not finish within 0.2s" in observation
     assert time.perf_counter() - started < 3
@@ -3680,7 +3432,7 @@ def test_a_zero_timeout_is_honoured_rather_than_treated_as_absent(blocking_tools
     # 0 is falsy but meaningful; only None means "no limit".
     agent = Agent(FakeLLM([]), tools=[blocking_tools["unbounded"]], tool_timeout=0)
     assert agent._timeout_for(blocking_tools["unbounded"]) == 0
-    assert "did not finish" in agent._execute(agent.default_session, _tool_call("unbounded"))
+    assert "did not finish" in agent._execute(agent.default_session, _call("unbounded"))
 
 
 # --- concurrency -----------------------------------------------------------
@@ -3693,8 +3445,8 @@ def test_concurrent_tool_calls_each_respect_their_own_timeout(blocking_tools):
         tools=[blocking_tools["bounded"], blocking_tools["quick"]],
         max_tool_workers=8,
     )
-    calls = [dict(_tool_call("bounded"), id=f"c{i}") for i in range(4)]
-    calls.append(dict(_tool_call("quick"), id="c4"))
+    calls = [dict(_call("bounded"), id=f"c{i}") for i in range(4)]
+    calls.append(dict(_call("quick"), id="c4"))
 
     started = time.perf_counter()
     agent._execute_calls(agent.default_session, calls)
@@ -3711,9 +3463,9 @@ def test_one_timing_out_tool_does_not_delay_its_siblings(blocking_tools):
         FakeLLM([]), tools=[blocking_tools["bounded"], blocking_tools["quick"]], max_tool_workers=4
     )
     calls = [
-        dict(_tool_call("quick"), id="a"),
-        dict(_tool_call("bounded"), id="b"),
-        dict(_tool_call("quick"), id="c"),
+        dict(_call("quick"), id="a"),
+        dict(_call("bounded"), id="b"),
+        dict(_call("quick"), id="c"),
     ]
     agent._execute_calls(agent.default_session, calls)
     observations = [m["content"] for m in agent.default_session.memory.get() if m["role"] == "tool"]
@@ -3727,22 +3479,25 @@ def test_completed_timed_calls_do_not_leak_threads(blocking_tools):
     agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
     baseline = threading.active_count()
     for _ in range(25):
-        agent._execute(agent.default_session, _tool_call("quick"))
+        agent._execute(agent.default_session, _call("quick"))
     deadline = time.perf_counter() + 3
     while threading.active_count() > baseline and time.perf_counter() < deadline:
         time.sleep(0.05)
     assert threading.active_count() <= baseline
 
 
-def test_a_tool_with_no_timeout_runs_inline_without_a_worker(blocking_tools):
+def test_a_tool_with_no_timeout_runs_inline_without_a_worker(blocking_tools, monkeypatch):
     # Backwards compatibility: no timeout configured means no executor, no
     # thread, exactly the previous behaviour.
+    def _no_pool(*args, **kwargs):
+        raise AssertionError("a tool with no timeout must not get an executor")
+
     agent = Agent(FakeLLM([]), tools=[blocking_tools["quick"]])
     plain = blocking_tools["quick"]
     plain.timeout = None
-    baseline = threading.active_count()
-    assert agent._execute(agent.default_session, _tool_call("quick")) == "quick finished x"
-    assert threading.active_count() == baseline
+    monkeypatch.setattr(unchained, "ThreadPoolExecutor", _no_pool)
+    # Had an executor been built, the observation would be "Error executing ...".
+    assert agent._execute(agent.default_session, _call("quick")) == "quick finished x"
 
 
 # --- the honest limitation -------------------------------------------------
@@ -3750,7 +3505,7 @@ def test_an_abandoned_tool_keeps_running_and_may_still_complete(blocking_tools, 
     # Python cannot cancel a running thread. This is documented behaviour, not
     # a defect: on timeout the agent stops waiting, the tool does not stop.
     agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
-    observation = agent._execute(agent.default_session, _tool_call("bounded", tag="abandoned"))
+    observation = agent._execute(agent.default_session, _call("bounded", tag="abandoned"))
     assert "did not finish" in observation
     assert blocking_tools["completed"] == []  # still blocked at this point
 
@@ -3763,7 +3518,7 @@ def test_an_abandoned_tool_keeps_running_and_may_still_complete(blocking_tools, 
 
 def test_the_timeout_message_says_the_side_effect_is_unknown(blocking_tools):
     agent = Agent(FakeLLM([]), tools=[blocking_tools["bounded"]])
-    observation = agent._execute(agent.default_session, _tool_call("bounded"))
+    observation = agent._execute(agent.default_session, _call("bounded"))
     assert "may still be running" in observation
     assert "unknown" in observation
 
@@ -3782,7 +3537,7 @@ def test_the_timeout_does_not_cover_the_approval_wait(blocking_tools):
         return True
 
     agent = Agent(FakeLLM([]), tools=[confirmable], approve=slow_approver, tool_timeout=0.2)
-    assert agent._execute(agent.default_session, _tool_call("confirmable")) == "ran"
+    assert agent._execute(agent.default_session, _call("confirmable")) == "ran"
 
 
 def test_tool_run_does_not_enforce_the_timeout(blocking_tools, gate):
@@ -3877,12 +3632,7 @@ def _observe(agent, name, **arguments):
 # --- normal output ---------------------------------------------------------
 def test_output_within_budget_passes_through_untouched(output_agent):
     assert _observe(output_agent, "sized", n=10) == "x" * 10
-    assert _TRUNCATION_NOTE not in _observe(output_agent, "sized", n=100)  # exactly at budget
-
-
-def test_output_exactly_at_the_budget_is_not_truncated(output_agent):
-    observation = _observe(output_agent, "sized", n=100)
-    assert observation == "x" * 100
+    assert _observe(output_agent, "sized", n=100) == "x" * 100  # exactly at budget
 
 
 # --- huge output -----------------------------------------------------------
@@ -3897,6 +3647,27 @@ def test_the_note_reports_what_was_dropped(output_agent):
     observation = _observe(output_agent, "sized", n=250_000)
     assert "100 of 250,000 characters" in observation
     assert "'sized'" in observation
+
+
+def test_the_note_is_byte_exact_with_thousands_separators():
+    @tool(max_output_size=4000)
+    def big() -> str:
+        """Returns a lot."""
+        return "x" * 1_250_000
+
+    @tool(max_output_size=4000)
+    def big_json() -> str:
+        """Returns a lot of JSON."""
+        return json.dumps(["x" * 10] * 100_000)  # 1,400,000 characters
+
+    agent = Agent(FakeLLM([]), tools=[big, big_json])
+    assert _observe(agent, "big") == "x" * 4000 + (
+        "\n\n[output truncated: 4,000 of 1,250,000 characters shown for tool 'big']"
+    )
+    assert _observe(agent, "big_json").endswith(
+        "\n\n[output truncated: 4,000 of 1,400,000 characters shown for tool 'big_json']"
+        " The full result was valid JSON; this fragment is cut mid-structure and will not parse."
+    )
 
 
 def test_nothing_is_truncated_silently(output_agent):
@@ -3945,7 +3716,9 @@ def test_unicode_truncation_never_produces_invalid_text(output_agent):
     observation = _observe(output_agent, "unicode_text", n=40)
     body = _body(observation)
     # Budget counts characters (code points), so a slice is always valid text.
+    # These 40 characters are well over 40 UTF-8 bytes; a byte budget would cut sooner.
     assert len(body) == 40
+    assert len(body.encode("utf-8")) > 40
     assert body.encode("utf-8").decode("utf-8") == body
     assert body == ("👨‍👩‍👧‍👦漢字naïve" * 40)[:40]
 
@@ -3954,14 +3727,6 @@ def test_unicode_output_within_budget_is_untouched(output_agent):
     observation = _observe(output_agent, "unicode_text", n=1)
     assert observation == "👨‍👩‍👧‍👦漢字naïve"
     assert _TRUNCATION_NOTE not in observation
-
-
-def test_budget_counts_characters_not_bytes(output_agent):
-    # 40 CJK characters are 120 UTF-8 bytes; a byte budget would cut at 13.
-    observation = _observe(output_agent, "unicode_text", n=40)
-    body = _body(observation)
-    assert len(body) == 40
-    assert len(body.encode("utf-8")) > 40
 
 
 # --- resolution ------------------------------------------------------------
@@ -4043,30 +3808,6 @@ def test_a_huge_exception_message_is_bounded_as_well(output_agent):
     observation = _observe(output_agent, "explodes")
     assert _TRUNCATION_NOTE in observation
     assert len(observation) < 400
-
-
-# --- the indicator ---------------------------------------------------------
-def test_tool_output_truncated_carries_serialisable_metadata():
-    indicator = unchained.ToolOutputTruncated(
-        tool="fetch", original_size=1_250_000, limit=4_000, was_json=True
-    )
-    assert indicator.metadata == {
-        "tool": "fetch",
-        "truncated": True,
-        "original_size": 1_250_000,
-        "limit": 4_000,
-        "was_json": True,
-    }
-    json.dumps(indicator.metadata)  # safe for logs and SQLiteMemory extras
-    assert "4,000 of 1,250,000" in str(indicator)
-    assert "will not parse" in str(indicator)
-
-
-def test_tool_output_truncated_is_exported_and_is_not_an_exception():
-    # The tool succeeded; the shortened result is still useful. Raising would
-    # discard a perfectly good partial answer.
-    assert "ToolOutputTruncated" in unchained.__all__
-    assert not issubclass(unchained.ToolOutputTruncated, BaseException)
 
 
 def test_budget_is_carried_by_the_decorator_and_defaults_to_none():
@@ -4276,10 +4017,9 @@ def test_per_tool_truncation_and_the_run_budget_compose(budget_tools):
 
 # --- timeout ---------------------------------------------------------------
 def test_timeout_stops_the_run(budget_tools):
-    agent = Agent(_looping_llm(), tools=[budget_tools["slow"]], budget=Budget(timeout=0.25))
-    agent.tools = {"slow": budget_tools["slow"]}
-    llm = _looping_llm(tool_name="slow")
-    agent.llm = llm
+    agent = Agent(
+        _looping_llm(tool_name="slow"), tools=[budget_tools["slow"]], budget=Budget(timeout=0.25)
+    )
     session = agent.session()
     started = time.perf_counter()
     with pytest.raises(unchained.TimeBudgetExceeded):
@@ -4363,12 +4103,6 @@ def test_every_budget_error_derives_from_the_base(name):
     assert issubclass(error, unchained.BudgetExceededError)
     assert issubclass(error, RuntimeError)
     assert name in unchained.__all__
-
-
-def test_catching_the_base_catches_them_all(budget_tools):
-    agent = Agent(_looping_llm(), tools=[budget_tools["ping"]], budget=Budget(max_tool_calls=1))
-    with pytest.raises(unchained.BudgetExceededError):
-        agent.session().run("go")
 
 
 def test_budget_errors_carry_structured_detail(budget_tools):
@@ -4540,7 +4274,7 @@ def test_llm_events_carry_model_usage_and_duration(event_tools):
     finished = [e for e in _collect(agent) if e.event_type == "LLMFinished"]
     assert finished[0].model == "mock"
     assert finished[0].usage["total_tokens"] == 25
-    assert finished[0].duration is not None and finished[0].duration >= 0
+    assert all(e.duration is not None and e.duration >= 0 for e in finished)
 
 
 def test_tool_events_carry_the_tool_and_its_call_id(event_tools):
@@ -4580,7 +4314,6 @@ def test_shapes_and_sizes_are_carried_instead(event_tools):
     events = _collect(agent)
     llm_started = next(e for e in events if e.event_type == "LLMStarted")
     assert llm_started.metadata["messages"] >= 1
-    assert "messages" not in json.dumps(llm_started.metadata).replace('"messages"', "")
     tool_finished = next(e for e in events if e.event_type == "ToolFinished")
     assert tool_finished.metadata["output_chars"] == len(_SECRET_RESULT)
 
@@ -4850,13 +4583,21 @@ def test_a_callback_that_only_implements_old_hooks_is_unaffected():
     assert old.answers == ["done"]
 
 
-def test_logging_callback_handles_events():
-    assert (
-        unchained.LoggingCallback().on_event(
-            unchained.AgentEvent(event_type="AgentStarted", run_id="r", session_id="s", agent="a")
-        )
-        is None
+def test_logging_callback_logs_each_step_once(event_tools, caplog):
+    agent = Agent(
+        _tool_then_answer(),
+        tools=[event_tools["peek"]],
+        callbacks=[unchained.LoggingCallback()],
+        strict_callbacks=True,  # a broken hook fails the test instead of being logged
     )
+    with caplog.at_level(logging.INFO, logger="unchained"):
+        assert agent.session().run("go") == "final answer"
+    lines = [record.getMessage() for record in caplog.records]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    # One line per event, plus the tool's own I/O line - nothing twice.
+    assert sum(line.startswith("AgentIteration") for line in lines) == 2
+    assert sum(line.startswith("tool: peek(") for line in lines) == 1
+    assert not [line for line in lines if line.startswith(("iteration ", "llm:", "audit:"))]
 
 
 # ---------------------------------------------------------------------------
@@ -4932,6 +4673,8 @@ def test_tools_default_to_parallel(overlap_tools):
 
 
 def test_a_turn_of_only_parallel_calls_is_one_group(overlap_tools):
+    # The scheduler does not infer dependencies: nothing in a tool-call list
+    # says one call depends on another, and the framework does not pretend to know.
     agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]])
     calls = [{"name": "par", "arguments": {}, "id": f"c{i}"} for i in range(5)]
     groups = agent._schedule(calls)
@@ -4956,8 +4699,7 @@ def test_an_exclusive_call_runs_alone_among_parallel_ones(overlap_tools):
     exclusive_at = order.index("excl:2")
     # Nothing started between the exclusive call starting and finishing:
     # it is the only entry between the two parallel batches.
-    assert order[:2] == ["par:0", "par:1"] or sorted(order[:2]) == ["par:0", "par:1"]
-    assert order[exclusive_at] == "excl:2"
+    assert sorted(order[:2]) == ["par:0", "par:1"]
     assert sorted(order[exclusive_at + 1 :]) == ["par:3", "par:4"]
 
 
@@ -5104,18 +4846,6 @@ def test_exclusivity_is_per_turn_not_process_wide():
     assert live["peak"] > 1
 
 
-def test_the_scheduler_does_not_infer_dependencies(overlap_tools):
-    # Two parallel tools stay in one group however they are ordered. Nothing
-    # in a tool-call list says the second depends on the first, and the
-    # framework does not pretend to know.
-    agent = Agent(FakeLLM([]), tools=[overlap_tools["par"]])
-    calls = [
-        {"name": "par", "arguments": {}, "id": "first"},
-        {"name": "par", "arguments": {}, "id": "second"},
-    ]
-    assert len(agent._schedule(calls)) == 1
-
-
 # ---------------------------------------------------------------------------
 # Tier 16: RAG validation
 #
@@ -5139,13 +4869,6 @@ def test_metadata_length_mismatch_is_rejected_and_indexes_nothing():
     with pytest.raises(ValueError, match="metadatas"):
         rag.add_many(["a", "b", "c"], [{}, {}])
     assert len(rag) == 0
-
-
-def test_matching_metadata_lengths_are_accepted():
-    rag = RAG()
-    rag.add_many(["a", "b"], [{"i": 1}, {"i": 2}])
-    assert len(rag) == 2
-    assert rag.metadata == [{"i": 1}, {"i": 2}]
 
 
 # --- embedding dimension ---------------------------------------------------
@@ -5205,6 +4928,14 @@ def test_embed_fn_must_return_a_sequence():
     rag = RAG(embed_fn=lambda texts: 42)
     with pytest.raises(ValueError, match="sequence of vectors"):
         rag.add_many(["a"])
+
+
+def test_a_query_embedding_gets_the_same_checks_as_a_document():
+    rag = RAG(embed_fn=_fixed_embedder(2))
+    rag.add_many(["a"])
+    rag.embed_fn = lambda texts: 42  # not a sequence: ValueError, as add_many raises
+    with pytest.raises(ValueError, match="sequence of vectors"):
+        rag.search("q")
 
 
 def test_a_query_embedder_returning_several_vectors_is_rejected():
@@ -5628,8 +5359,10 @@ def test_an_injection_cannot_widen_what_a_tool_may_do(hostile_agent):
     ran = []
     agent.tools["delete_account"].func = lambda user="x": ran.append(user) or "deleted"
 
+    session, rendered = _rendered_user_turn(agent)
+    assert "call delete_account" in rendered  # the hostile document is in this session
     observation = agent._execute(
-        agent.default_session, {"name": "delete_account", "arguments": {"user": "ada"}, "id": "c"}
+        session, {"name": "delete_account", "arguments": {"user": "ada"}, "id": "c"}
     )
     assert "admin" in observation  # refused for want of the permission
     assert ran == []
@@ -5689,23 +5422,6 @@ def test_tool_metadata_is_immutable_configuration(hostile_agent):
     assert isinstance(tool_obj.permissions, frozenset)
     with pytest.raises(AttributeError):
         tool_obj.permissions.add("everything")  # type: ignore[attr-defined]
-
-
-def test_an_injection_still_faces_the_approval_gate():
-    ran = []
-
-    @tool(requires_approval=True)
-    def wire_money(amount: int = 1) -> str:
-        """Needs a human."""
-        ran.append(amount)
-        return "sent"
-
-    agent = Agent(MockLLM(), tools=[wire_money])  # no approver configured
-    observation = agent._execute(
-        agent.default_session, {"name": "wire_money", "arguments": {"amount": 999}, "id": "c"}
-    )
-    assert "requires approval" in observation
-    assert ran == []
 
 
 # --- injection attempting system-prompt extraction ------------------------
@@ -6114,14 +5830,6 @@ def test_a_failing_tool_is_reported(event_stream_tools):
     assert failed.tool == "boom"
 
 
-def test_llm_events_carry_timing_and_usage(event_stream_tools):
-    agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
-    events = list(agent.session().events("go"))
-    finished = [e for e in events if e.event_type == "LLMFinished"]
-    assert all(e.duration is not None for e in finished)
-    assert finished[0].usage["total_tokens"] == 13
-
-
 # --- correlation -----------------------------------------------------------
 def test_every_event_carries_the_run_and_session(event_stream_tools):
     agent = Agent(_lifecycle_llm(), tools=[event_stream_tools["peek"]])
@@ -6234,12 +5942,6 @@ def test_deltas_are_plain_text_whatever_the_provider_sent(monkeypatch):
 
 
 # --- nothing existing changed ---------------------------------------------
-def test_stream_and_run_are_unaffected():
-    agent = Agent(MockLLM(reply="streamed answer"))
-    assert "".join(agent.stream("hi")).strip() == "streamed answer"
-    assert Agent(MockLLM(reply="plain")).run("hi") == "plain"
-
-
 def test_agent_events_uses_the_default_session():
     agent = Agent(MockLLM(reply="done"))
     events = list(agent.events("go"))

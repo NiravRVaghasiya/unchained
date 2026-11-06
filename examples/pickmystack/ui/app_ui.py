@@ -1,5 +1,7 @@
 """PickMyStack - Streamlit web interface.
 
+Needs Streamlit: pip install streamlit
+
 Launch from the project root:
 
     streamlit run examples/pickmystack/ui/app_ui.py

@@ -6,29 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-- **`pip install unchained-ai` gave downstream code no type information.** The
-  wheel shipped a bare `unchained.py` with no PEP 561 marker, so mypy reported
-  `Skipping analyzing "unchained": module is installed, but missing library
-  stubs or py.typed marker` and every symbol resolved to `Any` - a wrong
-  annotation in a user's code went unflagged. The core now ships as
-  `unchained/__init__.py` with a `py.typed` marker beside it, and a consumer's
-  checker sees the real signatures.
-
-  It is still exactly one source file. The directory exists only because a
-  marker cannot be attached to a top-level module - the previous note in
-  `pyproject.toml` was right that `py-modules` cannot carry one, but wrong
-  that a package meant restructuring: a one-file package is not a hierarchy.
-  Verified against a built wheel installed into a clean environment, both
-  before and after.
-
 ### Added
-- `tests/test_packaging.py`: builds a real wheel and asserts it contains
-  `unchained/py.typed` and nothing unexpected, that the core is still a single
-  module, and - by unpacking into a throwaway environment and running mypy
-  with and without the marker - that a consumer's type checker actually
-  resolves the package. The last one is asserted both ways round because the
-  obvious version of it passes for the wrong reason.
 - **`agent.events(...)`: the run as an iterator.** Callbacks are push-based;
   this yields the whole lifecycle instead - the run starting, each iteration,
   every LLM request and reply, every tool call and how it ended, streamed
@@ -57,15 +35,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `stream()` and `run()` are untouched.
   - The run happens on a worker thread; abandoning the iterator does not
     cancel it, and an exception from the run is re-raised at the iterator.
-
-### Fixed
-- **A streaming run that failed while resolving tools reported nothing.**
-  `Agent.stream()` only wrapped the token loop, so a budget stop or provider
-  error during tool resolution ended the run with neither `AgentFinished` nor
-  `AgentFailed`. The whole turn is covered now.
-
-### Added
-
 - **`LLMResponse`: one normalised reply shape across providers.** `chat()`
   returned a three-key dict - content, tool_calls, usage - and discarded
   everything else the provider said. It now returns an `LLMResponse` carrying
@@ -86,10 +55,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `system_fingerprint`, Ollama's timings, Anthropic's `stop_sequence`, and
     the `endpoint` that answered, which distinguishes an OpenAI-compatible
     host from OpenAI itself. Nothing in the agent loop reads it.
-  - Backwards compatible: `LLMResponse` supports the mapping access the old
-    dict had (`response["content"]`, `response.get("usage")`, `in`), so
-    existing code and test doubles returning a bare dict keep working. It is
-    frozen, so a reply cannot be rewritten after the fact.
+  - Read-compatible: `LLMResponse` supports the mapping access the old dict
+    had (`response["content"]`, `response.get("usage")`, `in`), so code that
+    reads replies, and test doubles returning a bare dict, keep working. It is
+    not a `dict`, though (see Changed). It is frozen: its fields cannot be
+    reassigned (the lists and dicts inside are not copied).
   - `MockLLM` produces the same model, so a stand-in cannot pass a test
     against a shape no provider produces.
   - The response cache stores the whole reply; rebuilding a few keys would
@@ -99,67 +69,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     is a claim, not a guarantee, and a thin reply should not surface as a
     `KeyError` from inside the framework.
   - No provider SDKs; still `requests` + `pydantic`.
-
-### Security
-- **Untrusted text is now structurally separated from instructions.**
-  Retrieved documents and tool results were inserted into the conversation
-  verbatim, with nothing marking them as data. Both are now fenced with a
-  random per-agent marker, and any occurrence of that marker is stripped from
-  the text, so content cannot close its own block and continue at instruction
-  level.
-- **The conversation summary reached the system prompt unfenced.** Summaries
-  are written by the model from earlier turns - which include tool results
-  and retrieved documents - and spliced into the *system* message, the
-  highest-trust slot there is. That was a path from a tool result straight
-  into the instructions. It is fenced now.
-- **Retrieved documents are no longer spliced into the user's turn.** They
-  are stored beside it and rendered at send time, so memory records what the
-  user actually said, a document can no longer forge the `Question:` boundary
-  the old wrapper used, and a conversation reloaded from disk never carries a
-  dead agent's markers.
-- **The retrieval framing is descriptive rather than imperative.** It said
-  "Use the following context to answer", which tells the model to act on
-  whatever the corpus contains.
-- The system prompt now states the data boundary when a run can contain
-  untrusted content. This is **one layer and the weakest**: prompt injection
-  is not solved by a system prompt, and SECURITY.md says so. The boundary
-  that holds is in Python - `permissions` are a frozenset fixed at
-  decoration, and `ToolPolicy` never sees retrieved or returned text.
-- SECURITY.md gains a trust ladder for the five sources of text, what is
-  enforced structurally, and what is explicitly not defended against.
-
-### Fixed
-- **RAG silently mis-scored mismatched embeddings.** A vector of the wrong
-  width was zipped against a longer one and compared on the overlap, so a
-  2-dimensional vector scored 1.0 against a 3-dimensional corpus. The index
-  now fixes its dimension on the first vector it accepts and rejects any
-  later document or query vector that does not match; `RAG.dimension`
-  reports it.
-- **`embed_fn` returning the wrong number of vectors corrupted the index.**
-  Documents and embeddings drifted apart - too few silently dropped
-  documents from every search, too many raised `IndexError` from `search()`
-  long afterwards. It must now return exactly one vector per text.
-- **A negative `top_k` returned the wrong documents.** `search(q, top_k=-1)`
-  sliced the ranked list from the end, returning everything except the best
-  match. `top_k` must now be an integer of at least 1, and non-integers are
-  rejected rather than reaching the slice.
-- **A failing or rejected batch left the index half-updated.** Documents were
-  appended before `embed_fn` was called, so an exception left documents with
-  no embeddings. Everything is validated before anything is stored.
-- **Empty and non-finite vectors are rejected.** A zero-width vector can
-  never rank anything, and a NaN propagates into every score it touches. A
-  *zero* vector is still accepted - some models emit one - and scores 0.0.
-- **`_cosine` no longer compares a prefix.** Mismatched lengths raise instead
-  of zipping to the shorter vector, results are clamped to `[-1.0, 1.0]`, and
-  a magnitude that overflows the squared sum returns 0.0 rather than NaN,
-  which would corrupt the ranking.
-- **Empty documents are rejected.** They can never match and only dilute
-  results. Non-string documents get a distinct message.
-- **A TF-IDF query with no indexable tokens returns nothing** instead of the
-  first `top_k` documents scored 0.0. Nothing to search *with* is not the
-  same as having searched and found nothing.
-
-### Added
 - **Tool execution semantics.** A model can request several tools in one turn
   and they all ran concurrently, with no way to say that a tool must not
   overlap with itself. `@tool(concurrency="exclusive")` marks one that runs
@@ -192,7 +101,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `ToolStarted`, `ToolFinished`, `ToolFailed`, `AgentFinished`,
     `AgentFailed`. Each carries `run_id`, `session_id`, `agent`,
     `timestamp`, and where they apply `duration`, `model`, `tool`,
-    `tool_call_id`, `usage` and `metadata`. `as_dict()` is JSON-safe.
+    `tool_call_id`, `usage` and `metadata`. `as_dict()` gives a plain dict,
+    JSON-safe with the default redaction; with `event_payloads=True` a payload
+    can hold an Enum member or a Pydantic model, so use
+    `json.dumps(..., default=str)`.
   - `run_id` is unique per run, so concurrent runs never interleave
     ambiguously. `RunState.snapshot()` reports the same id.
   - `ToolFailed` may arrive without a preceding `ToolStarted` - a call
@@ -236,6 +148,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     exception for one that never fires.
   - Budgets are **per run**. `session.usage` still accumulates over the
     session's lifetime. `agent.session(budget=...)` overrides per caller.
+    Both count the non-streamed calls the agent loop makes; not counted are
+    `Memory(llm=...)` summaries, the streamed answer of `stream()` /
+    `events()`, and `Router.route`'s own routing call.
   - No tool call escapes: the budget is claimed on the single path every
     model-requested call takes, before the tool is located or authorized, so
     unknown and policy-denied calls count too.
@@ -248,8 +163,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     table - published prices change and a stale table would under-report.
     `Budget(max_cost=...)` without `pricing` raises at construction, and a
     model absent from `pricing` raises rather than being costed as zero.
-  - Budgets are checked before spending, so a call already under way can
-    carry the total slightly past a limit; the run stops immediately after.
+  - Limits are checked at the top of every iteration and before every tool
+    call. A call's cost is not known until it returns, so the call that
+    crosses a limit completes, and the calls that close a run - the forced
+    final answer, structured-output formatting and repair, the streamed
+    reply - are not gated; the next iteration or tool call raises. The
+    exception is `max_tool_output`, which raises inside the tool call that
+    pushes the total past the cap, before its result reaches memory.
 - **Tool output limits.** A tool could return megabytes straight into the
   transcript - overflowing the context window, costing money on every
   subsequent turn, and growing memory. `@tool(max_output_size=8_000)` bounds
@@ -260,7 +180,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     provider or a callback - there is no path where the full text gets
     through. An oversized exception message is bounded the same way.
   - **Nothing is truncated silently**: an oversized result carries a note
-    stating how much was dropped.
+    stating how much was dropped, and each truncation is logged as a warning
+    on the `unchained` logger. It is not an exception - the tool succeeded and
+    a shortened result is still useful.
   - **JSON is never silently corrupted**: if the full result was valid JSON,
     the note says so and warns that the fragment will not parse, because a
     model handed JSON will otherwise try. Structured output that fits is
@@ -268,9 +190,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The budget counts **characters, not bytes**, so a slice can never split a
     code point and produce invalid text, and it lines up with
     `Memory(max_tokens=...)`, which estimates tokens the same way.
-  - New `ToolOutputTruncated`, carrying `.metadata` as a plain JSON-safe dict.
-    It is not an exception - the tool succeeded and a shortened result is
-    still useful.
   - This is a context and cost boundary, **not a security sandbox**: it limits
     what a tool sends onward, not what it can read or do. Documented in the
     README and SECURITY.md.
@@ -296,62 +215,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     SECURITY.md rather than papered over.
   - Approval waits are deliberately outside the budget: a human pausing to
     confirm must not be read as a hanging tool.
-
-### Security
-- **Routing decisions are now validated against the agent registry.**
-  `Router.route()` asks for JSON constrained to the registered agent names
-  and resolves the answer by looking it up in that registry, so no reply can
-  name an agent the router does not hold. A decision is valid only if it
-  identifies exactly one registered agent.
-- **Agent names are validated when the `Router` is built.** A blank name, or
-  two names that collide once case and surrounding whitespace are normalised,
-  now raises `ValueError`. Both were previously silent: a blank-named agent
-  could never be routed to, and one of two identically-named agents always
-  won, so "resolve to exactly one agent" was not achievable.
-- **Agent descriptions can no longer forge entries in the router's agent
-  list.** Descriptions are interpolated into the routing prompt; one
-  containing newlines could present extra `- name:` lines. Whitespace is now
-  collapsed and the text capped.
-- **Text matching no longer ignores word order.** A multi-word agent name
-  matched any reply containing its words anywhere, so an `admin delete` agent
-  was selected by "do not use admin, use the delete path". Matching now
-  requires the name to appear as a contiguous run of words.
-- `Agent._loads_object()` now always returns a dict. A reply of `null` or
-  `[1, 2]` is valid JSON but not an object, and returning it handed a
-  non-mapping to `schema(**data)` in the structured-output repair loop, where
-  it raised `TypeError` instead of the expected `ValidationError`.
-
-### Added
-- `Router(strict=True)` accepts only a structured decision or a bare exact
-  name, refusing prose. Text matching cannot read sense - prose mentioning one
-  agent in order to reject it ("not cost") resolves to it - and `strict`
-  closes that gap for deployments that need it.
-
-### Security
-- **Tool-call responses are no longer cached by default.** A cached response
-  carrying `tool_calls` is a stored decision to act: an identical later prompt
-  replayed it without the model being consulted, and without a request going
-  out to make the replay visible — the same refund issued twice from one
-  model decision. `LLM(cache=True)` now means the `"final_only"` policy:
-  plain answers are cached, tool-call responses are returned to the caller but
-  never stored.
-- **The cache key no longer collides across different tools sharing a name.**
-  Tools were keyed by name alone, so a `search` over public documents and a
-  `search` over internal records — or the same tool before and after its
-  description or parameters changed — served each other's cached responses.
-  Tools are now keyed by their full schema, sorted so that offering the same
-  tools in a different order still hits.
-- **Response formats are keyed by schema, not by class name.** Two unrelated
-  Pydantic models both called `Item` previously collided.
-- **`max_tokens`, `base_url` and `provider` are now part of the cache key.**
-  `max_tokens` is sent to Anthropic and truncates the reply, so two `LLM`s
-  differing only in it returned each other's answers.
-- **Cached responses are handed out as private copies.** Every hit previously
-  returned the same dict, and `Agent` puts responses into conversation memory
-  — so one conversation mutating a response silently rewrote what the cache
-  served the next.
-
-### Added
 - `LLM(cache=...)` accepts a policy name as well as a bool: `"none"`,
   `"final_only"` (the default, and what `cache=True` means) or `"all"` for
   read-only tool sets that want tool-call responses cached too. An unknown
@@ -383,18 +246,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the exception is raised outside the `except` block so neither
     `__cause__` nor `__context__` retains the original.
   - No new dependency: Pydantic was already required.
+- **Tool authorization layer.** A model requesting a tool is now a request
+  that is granted or refused in Python, before the function runs - not a
+  prompt asking the model to behave.
+  - `@tool` accepts optional security metadata: `permissions`,
+    `requires_approval`, `side_effects`, and an `allowed(arguments, context)`
+    hook for per-call rules. `@tool` bare is unchanged. None of this metadata
+    is sent to the model.
+  - `ToolPolicy` decides: `authorize()` (raise `ToolAuthorizationError` to
+    deny) and `requires_approval()`. It is also the default policy, and the
+    default is permissive - an agent with no `policy=` behaves exactly as it
+    did before, except that a tool marked `requires_approval` is now gated
+    rather than decorative.
+  - `PermissionPolicy(granted=..., approval_for=...)` allows only tools whose
+    declared permissions have all been granted.
+  - `Agent(policy=..., approve=...)`. The approval callback is supplied by the
+    application and is unreachable from model output; it is serialised with a
+    lock so a turn's concurrent tool calls cannot re-enter your prompt.
+  - `Callback.on_tool_audit(event)` records every decision before execution.
+  - New exceptions: `ToolAuthorizationError`, `ToolApprovalRequired`,
+    `ToolArgumentValidationError`.
+  - Fail-closed throughout: a policy that raises denies, an approval callback
+    that raises is a refusal, and a tool needing approval with no approver
+    configured does not run.
+  - See `examples/policy.py` and the SECURITY.md boundary list.
+- `RoutingError`, exported from the package, raised by `Router.route()` when
+  no single agent can be identified.
+- `Router(fallback=...)` to nominate an agent for unroutable queries.
+- `Agent(max_tool_workers=8)` to tune the tool-call concurrency cap.
 
 ### Changed
-- **Arguments are now normalised**, reversing an earlier deliberate choice not
-  to coerce. A function receives what its annotations promise: `"42"` arrives
-  as `42` for an `int`, and a nested dict arrives as the declared model.
-  - **An `Enum`-annotated parameter now receives the enum member** (`Color.red`)
-    rather than the raw value (`"red"`). Tools annotated with an `Enum` that
-    assumed a string need `.value`.
+- **BREAKING - `Router.route()` now fails closed.** It previously fell back to
+  `agents[0]` whenever the model's reply didn't match an agent, and matched by
+  substring in both directions - so an empty reply matched *every* agent (and
+  returned the longest-named one), and an agent named `fit` matched a reply
+  mentioning "profit". A query could therefore be dispatched to an agent
+  nobody chose, which matters because agents differ in the tools, and so the
+  privileges, they carry. A reply now resolves only if it is a JSON decision
+  (`{"agent": "cost"}`) or a bare agent name (case and surrounding whitespace
+  are ignored), and it must name exactly one registered agent. Everything
+  else raises the new `RoutingError`: an empty, evasive, hallucinated or
+  ambiguous reply, malformed JSON, and prose - including prose and decorated
+  names that point at exactly one agent ("The best agent is cost.", `cost.`,
+  `**cost**`), which 0.4.0 accepted. Matching words cannot tell "use cost"
+  from "not cost", and a malformed decision such as `{'rejected': 'cost'}`
+  mentions exactly the agent it rules out. This mainly affects models that
+  answer in prose: the routing call puts OpenAI (`json_object`) and Ollama
+  (`format="json"`) into JSON mode, but Anthropic has none, and some
+  OpenAI-compatible endpoints ignore it.
+
+  To restore a default destination, name it explicitly; every reply that
+  does not resolve then goes there instead of raising:
+
+  ```python
+  Router(llm, agents=[...], fallback=triage_agent)
+  ```
+- **BREAKING - `RAG.add_many()` raises `ValueError`** on a `texts`/`metadatas`
+  length mismatch instead of silently truncating (see Fixed).
+- **BREAKING - An `Enum`-annotated tool parameter now receives the enum
+  member** (`Color.red`) rather than the raw value (`"red"`), because
+  arguments are now normalised (below). Tools annotated with an `Enum` that
+  assumed a string need `.value`.
+- **BREAKING -** `Tool.run(dict)` validates; `Tool.__call__` (`my_tool(1, 2)`)
+  still calls straight through, unvalidated — it is your code calling your
+  function.
+- **BREAKING - `LLM.chat()` returns an `LLMResponse`, not a `dict`** (see
+  Added). Reading it works as before; code that serialises, copies or mutates
+  the reply - `json.dumps(reply)`, `dict(reply)`, `{**reply}`,
+  `reply["k"] = v` - needs `reply.as_dict()`.
+- **Arguments are now normalised.** A function receives what its annotations
+  promise: `"42"` arrives as `42` for an `int`, and a nested dict arrives as
+  the declared model.
   - A parameter with **no annotation** accepts anything, matching the plain
     Python function. The schema still advertises it as a string.
-- `Tool.run(dict)` validates; `Tool.__call__` (`my_tool(1, 2)`) still calls
-  straight through, unvalidated — it is your code calling your function.
 - Tools with parameters named `model_name`, `json` or `schema` no longer emit
   Pydantic shadowing warnings at decoration time.
 - **`Session`: agent configuration is now separate from conversation state.**
@@ -414,17 +338,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so two sessions have nothing to contend over.
   - `Agent.session(memory=, callbacks=, metadata=, session_id=)` starts an
     independent conversation. `metadata` reaches `ToolPolicy` hooks as
-    `context["metadata"]` and appears in audit events and approval requests,
-    which is how a policy authorizes per user rather than per agent.
+    `context["metadata"]` and appears in approval requests (audit events
+    carry the session id), which is how a policy authorizes per user rather
+    than per agent.
   - `Agent.memory_factory` (default `Memory`) supplies each new session's
-    memory. `Agent(memory=<instance>)` still works and now seeds the *default
-    session only* - it is deliberately not shared with `agent.session()`.
+    memory, including a `Session(agent)` constructed directly without
+    `memory=`. `Agent(memory=<instance>)` still works and now seeds the
+    *default session only* - it is deliberately not shared with
+    `agent.session()`.
   - `Session.run/stream/arun/reset`, and `Agent.reset()` for the default one.
   - Session-level callbacks fire only for that conversation; Agent-level
     callbacks still see every session.
   - Audit events and approval requests now carry the session id.
-
-### Changed
 - `agent.run()`, `agent.stream()` and `agent.arun()` are unchanged, and
   `agent.memory` / `agent.usage` still work: they now address a **persistent
   default session**, created on first use and reused for the life of the
@@ -439,35 +364,116 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Results are returned as before but are no longer retained in agent memory.
   `run`, `run_all` and `synthesize` accept `metadata=` to pass the caller's
   identity through to each session and its policy.
-- **Tool authorization layer.** A model requesting a tool is now a request
-  that is granted or refused in Python, before the function runs - not a
-  prompt asking the model to behave.
-  - `@tool` accepts optional security metadata: `permissions`,
-    `requires_approval`, `side_effects`, and an `allowed(arguments, context)`
-    hook for per-call rules. `@tool` bare is unchanged. None of this metadata
-    is sent to the model.
-  - `ToolPolicy` decides: `authorize()` (raise `ToolAuthorizationError` to
-    deny) and `requires_approval()`. It is also the default policy, and the
-    default is permissive - an agent with no `policy=` behaves exactly as it
-    did before, except that a tool marked `requires_approval` is now gated
-    rather than decorative.
-  - `PermissionPolicy(granted=..., approval_for=...)` allows only tools whose
-    declared permissions have all been granted.
-  - `Agent(policy=..., approve=...)`. The approval callback is supplied by the
-    application and is unreachable from model output; it is serialised with a
-    lock so a turn's concurrent tool calls cannot re-enter your prompt.
-  - `Tool.validate_arguments()` rejects non-mappings, non-string argument
-    names, unknown parameter names and missing required parameters before the
-    call. Structural only - types are not coerced.
-  - `Callback.on_tool_audit(event)` records every decision before execution.
-  - New exceptions: `ToolAuthorizationError`, `ToolApprovalRequired`,
-    `ToolArgumentValidationError`.
-  - Fail-closed throughout: a policy that raises denies, an approval callback
-    that raises is a refusal, and a tool needing approval with no approver
-    configured does not run.
-  - See `examples/policy.py` and the SECURITY.md boundary list.
+- **Tool fan-out is bounded.** `Agent` sized its thread pool to the number of
+  tool calls in a turn, but that count is chosen by the model, so one response
+  could spawn a thread per call (250 calls produced ~176 live threads). The
+  pool is now capped by the new `Agent(max_tool_workers=8)`. Excess calls
+  queue and still run, in the same order; only their concurrency is bounded.
+- `Memory` may now keep slightly more than `max_messages` (or `max_tokens`)
+  rather than split a tool group - a window one group over budget is still
+  sendable, whereas one starting with an orphaned tool result is not.
+- **Importing `unchained` without Pydantic now fails** with `ImportError`,
+  instead of importing in a silently degraded mode (tool-argument validation
+  fell back to name-only checks). Pydantic was already a declared dependency,
+  so a normal install is unaffected.
+- **`LoggingCallback` logs each step once.** It writes one INFO line per
+  `AgentEvent` (through `on_event`), plus a line per tool call with its
+  arguments and the first 120 characters of the result, verbatim. The separate
+  `iteration N`, `llm: ...` and `finished (N chars)` lines are gone: the event
+  lines cover the same steps with durations, token counts and the run id, and
+  the message, tool-call and character counts remain in `event.metadata`.
+  Refusals and timeouts are still logged at WARNING by the agent itself.
+- **Tools plus `response_format` make one fewer LLM call when the iterations
+  run out.** The forced final answer already runs under the schema, so the
+  formatting pass that followed it is skipped (likewise when a custom backend
+  ends the loop with `content=None`): one fewer LLM call and one fewer
+  `LLMStarted`/`LLMFinished` pair. The returned object is parsed from the reply
+  stored in memory; before, the two could differ.
+- A negative `structured_retries` behaves like `0`: the output is validated
+  once and a failure raises `ValidationError`, where it used to raise
+  `RuntimeError("unreachable")`.
+- RAG query embeddings go through the same validation as document
+  embeddings, so an `embed_fn` that returns something other than a sequence of
+  vectors for a query raises `ValueError` rather than a raw `TypeError`.
+- The retry warning names the status as `HTTP 503` rather than
+  `retryable status 503`.
+- Packaging: the version is read from `unchained.__version__` alone; license
+  metadata is the SPDX expression `MIT` (building needs `setuptools>=77`); the
+  `dev` extra includes `test` and `lint` by reference (needs pip 21.2+); the
+  `lint` extra needs `ruff>=0.12` (the config ignores `UP045`, stable from
+  0.12; releases before 0.9 reject it as an unknown rule); classifiers add Python 3.13 and `Typing :: Typed`. The pre-commit
+  mypy hook, which matched no file after the move to `unchained/`, runs again.
+- README is now an overview; the full feature reference moved, essentially
+  verbatim, to `docs/GUIDE.md` (Developer guide, also on the docs site).
+
+### Removed
+- `benchmarks/compare_frameworks.py`, the line-count, dependency and
+  import-time comparison against LangChain and CrewAI.
+- The PickMyStack deployment files: `examples/pickmystack/ui/Dockerfile`,
+  `README_DEPLOY.md`, `.streamlit/config.toml` and `requirements.txt`. The
+  Dockerfile no longer built once the core moved to `unchained/__init__.py`.
+  The UI itself stays: `pip install streamlit`, then
+  `streamlit run examples/pickmystack/ui/app_ui.py`.
+- The `ui` extra (`unchained-ai[ui]`); install `streamlit` directly.
+- `twine` from the `dev` extra, which is now `test` + `lint` plus `pre-commit`
+  and `build`.
+- `ToolOutputTruncated` and `Router(strict=...)`, both added on `main` after
+  0.4.0 and never released. No `ToolOutputTruncated` ever reached user code
+  (truncations are logged instead), and strict routing is now the only mode,
+  so passing `strict=` raises `TypeError`.
 
 ### Fixed
+- **`pip install unchained-ai` gave downstream code no type information.** The
+  wheel shipped a bare `unchained.py` with no PEP 561 marker, so mypy reported
+  `Skipping analyzing "unchained": module is installed, but missing library
+  stubs or py.typed marker` and every symbol resolved to `Any` - a wrong
+  annotation in a user's code went unflagged. The core now ships as
+  `unchained/__init__.py` with a `py.typed` marker beside it, and a consumer's
+  checker sees the real signatures.
+
+  It is still exactly one source file. The directory exists only because a
+  marker cannot be attached to a top-level module - the previous note in
+  `pyproject.toml` was right that `py-modules` cannot carry one, but wrong
+  that a package meant restructuring: a one-file package is not a hierarchy.
+  Verified against a built wheel installed into a clean environment, both
+  before and after, and guarded by `tests/test_packaging.py`: it builds a real
+  wheel, asserts it contains `unchained/py.typed` and nothing unexpected and
+  that the core is still a single module, and runs mypy on the unpacked
+  package with and without the marker - both ways round, because the obvious
+  version of that check passes for the wrong reason.
+- **A streaming run that failed while resolving tools reported nothing.**
+  `Agent.stream()` only wrapped the token loop, so a budget stop or provider
+  error during tool resolution ended the run with neither `AgentFinished` nor
+  `AgentFailed`. The whole turn is covered now.
+- **RAG silently mis-scored mismatched embeddings.** A vector of the wrong
+  width was zipped against a longer one and compared on the overlap, so a
+  2-dimensional vector scored 1.0 against a 3-dimensional corpus. The index
+  now fixes its dimension on the first vector it accepts and rejects any
+  later document or query vector that does not match; `RAG.dimension`
+  reports it.
+- **`embed_fn` returning the wrong number of vectors corrupted the index.**
+  Documents and embeddings drifted apart - too few silently dropped
+  documents from every search, too many raised `IndexError` from `search()`
+  long afterwards. It must now return exactly one vector per text.
+- **A negative `top_k` returned the wrong documents.** `search(q, top_k=-1)`
+  sliced the ranked list from the end, returning everything except the best
+  match. `top_k` must now be an integer of at least 1, and non-integers are
+  rejected rather than reaching the slice.
+- **A failing or rejected batch left the index half-updated.** Documents were
+  appended before `embed_fn` was called, so an exception left documents with
+  no embeddings. Everything is validated before anything is stored.
+- **Empty and non-finite vectors are rejected.** A zero-width vector can
+  never rank anything, and a NaN propagates into every score it touches. A
+  *zero* vector is still accepted - some models emit one - and scores 0.0.
+- **`_cosine` no longer compares a prefix.** Mismatched lengths raise instead
+  of zipping to the shorter vector, results are clamped to `[-1.0, 1.0]`, and
+  a magnitude that overflows the squared sum returns 0.0 rather than NaN,
+  which would corrupt the ranking.
+- **Empty documents are rejected.** They can never match and only dilute
+  results. Non-string documents get a distinct message.
+- **A TF-IDF query with no indexable tokens returns nothing** instead of the
+  first `top_k` documents scored 0.0. Nothing to search *with* is not the
+  same as having searched and found nothing.
 - **Memory compression no longer produces an unsendable window.** When the
   sliding window overflowed, the boundary could fall between an assistant
   message carrying `tool_calls` and the `tool` messages answering them,
@@ -487,39 +493,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Authorization: Bearer None`; Anthropic sent `x-api-key: `. Both headers are
   now omitted entirely, which is also what local OpenAI-compatible servers
   (vLLM, LM Studio, llama.cpp) expect. Affects both `chat()` and `stream()`.
+- The README's Anthropic example used a retired model id,
+  `claude-3-5-sonnet-20241022` (retired Oct 28, 2025); it now uses
+  `claude-sonnet-4-6`. The README also notes that `LLM(provider="anthropic")`
+  without `model=` still defaults to the retired id, and that Claude 4.7 and
+  later models reject the `temperature` Unchained always sends.
 
-### Changed
-- **BREAKING - `Router.route()` now fails closed.** It previously fell back to
-  `agents[0]` whenever the model's reply didn't match an agent, and matched by
-  substring in both directions - so an empty reply matched *every* agent (and
-  returned the longest-named one), and an agent named `fit` matched a reply
-  mentioning "profit". A query could therefore be dispatched to an agent
-  nobody chose, which matters because agents differ in the tools, and so the
-  privileges, they carry. Matching is now exact-name-first, then whole-word,
-  and must resolve to exactly one agent; an empty, evasive, hallucinated or
-  ambiguous reply raises the new `RoutingError`.
-
-  To restore a default destination, name it explicitly:
-
-  ```python
-  Router(llm, agents=[...], fallback=triage_agent)
-  ```
-- **BREAKING - `RAG.add_many()` raises `ValueError`** on a `texts`/`metadatas`
-  length mismatch instead of silently truncating (see Fixed, above).
-- **Tool fan-out is bounded.** `Agent` sized its thread pool to the number of
-  tool calls in a turn, but that count is chosen by the model, so one response
-  could spawn a thread per call (250 calls produced ~176 live threads). The
-  pool is now capped by the new `Agent(max_tool_workers=8)`. Excess calls
-  queue and still run, in the same order; only their concurrency is bounded.
-- `Memory` may now keep slightly more than `max_messages` (or `max_tokens`)
-  rather than split a tool group - a window one group over budget is still
-  sendable, whereas one starting with an orphaned tool result is not.
-
-### Added
-- `RoutingError`, exported from the package, raised by `Router.route()` when
-  no single agent can be identified.
-- `Router(fallback=...)` to nominate an agent for unroutable queries.
-- `Agent(max_tool_workers=8)` to tune the tool-call concurrency cap.
+### Security
+- **Untrusted text is now structurally separated from instructions.**
+  Retrieved documents and tool results were inserted into the conversation
+  verbatim, with nothing marking them as data. Both are now fenced with a
+  random per-agent marker, and any occurrence of that marker is stripped from
+  the text, so content cannot close its own block and continue at instruction
+  level.
+- **The conversation summary reached the system prompt unfenced.** Summaries
+  are written by the model from earlier turns - which include tool results
+  and retrieved documents - and spliced into the *system* message, the
+  highest-trust slot there is. That was a path from a tool result straight
+  into the instructions. It is fenced now.
+- **Retrieved documents are no longer spliced into the user's turn.** They
+  are stored beside it and rendered at send time, so memory records what the
+  user actually said, a document can no longer forge the `Question:` boundary
+  the old wrapper used, and a conversation reloaded from disk never carries a
+  dead agent's markers.
+- **The retrieval framing is descriptive rather than imperative.** It said
+  "Use the following context to answer", which tells the model to act on
+  whatever the corpus contains.
+- The system prompt now states the data boundary when a run can contain
+  untrusted content. This is **one layer and the weakest**: prompt injection
+  is not solved by a system prompt, and SECURITY.md says so. The boundary
+  that holds is in Python - `permissions` are a frozenset fixed at
+  decoration, and `ToolPolicy` never sees retrieved or returned text.
+- SECURITY.md gains a trust ladder for the five sources of text, what is
+  enforced structurally, and what is explicitly not defended against.
+- **Routing decisions are now validated against the agent registry.**
+  `Router.route()` asks for JSON constrained to the registered agent names
+  and resolves the answer by looking it up in that registry, so no reply can
+  name an agent the router does not hold. A decision is valid only if it
+  identifies exactly one registered agent.
+- **Agent names are validated when the `Router` is built.** A blank name, or
+  two names that collide once case and surrounding whitespace are normalised,
+  now raises `ValueError`. Both were previously silent: a blank-named agent
+  could never be routed to, and one of two identically-named agents always
+  won, so "resolve to exactly one agent" was not achievable.
+- **Agent descriptions can no longer forge entries in the router's agent
+  list.** Descriptions are interpolated into the routing prompt; one
+  containing newlines could present extra `- name:` lines. Whitespace is now
+  collapsed and the text capped.
+- `Agent._loads_object()` now always returns a dict. A reply of `null` or
+  `[1, 2]` is valid JSON but not an object, and returning it handed a
+  non-mapping to `schema(**data)` in the structured-output repair loop, where
+  it raised `TypeError` instead of the expected `ValidationError`.
+- **Tool-call responses are no longer cached by default.** A cached response
+  carrying `tool_calls` is a stored decision to act: an identical later prompt
+  replayed it without the model being consulted, and without a request going
+  out to make the replay visible — the same refund issued twice from one
+  model decision. `LLM(cache=True)` now means the `"final_only"` policy:
+  plain answers are cached, tool-call responses are returned to the caller but
+  never stored.
+- **The cache key no longer collides across different tools sharing a name.**
+  Tools were keyed by name alone, so a `search` over public documents and a
+  `search` over internal records — or the same tool before and after its
+  description or parameters changed — served each other's cached responses.
+  Tools are now keyed by their full schema, sorted so that offering the same
+  tools in a different order still hits.
+- **Response formats are keyed by schema, not by class name.** Two unrelated
+  Pydantic models both called `Item` previously collided.
+- **`max_tokens`, `base_url` and `provider` are now part of the cache key.**
+  `max_tokens` is sent to Anthropic and truncates the reply, so two `LLM`s
+  differing only in it returned each other's answers.
+- **Cached responses are handed out as private copies.** Every hit previously
+  returned the same dict, and `Agent` puts responses into conversation memory
+  — so one conversation mutating a response silently rewrote what the cache
+  served the next.
 
 ## [0.4.0] - 2026-08-10
 

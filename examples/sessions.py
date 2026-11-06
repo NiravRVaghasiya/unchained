@@ -74,26 +74,27 @@ def main() -> None:
     print("    neither can see the other's conversation.")
 
     # ---- many at once ---------------------------------------------------
-    print("\n50 concurrent requests across 10 users")
+    print("\n10 users in parallel, 5 turns each")
     errors: List[Exception] = []
 
     def worker(index: int) -> None:
+        user = f"user{index}"
         try:
-            handle_request(f"user{index % 10}", f"request {index}")
+            for turn in range(5):
+                handle_request(user, f"[{user}] request {turn}")
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
     print(f"    {len(errors)} errors, {len(SESSIONS)} sessions")
-    for user in sorted(SESSIONS):
-        history = [str(m["content"]) for m in SESSIONS[user].memory.get()]
-        # Every line in this session was addressed to this user's session.
-        assert all("request" in h or "name is" in h or "you said" in h for h in history)
+    for user, s in SESSIONS.items():
+        if user.startswith("user"):
+            assert all(f"[{user}]" in str(m["content"]) for m in s.memory.get())
     print("    every session's history contains only its own turns")
 
     # ---- usage is per conversation, not per agent ------------------------

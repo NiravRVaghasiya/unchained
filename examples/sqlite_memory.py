@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from unchained import LLM, Agent, Memory
+from unchained import LLM, Agent, Memory, MockLLM
 
 
 class SQLiteMemory(Memory):
@@ -38,8 +38,9 @@ class SQLiteMemory(Memory):
         super().__init__(max_messages=max_messages, llm=llm)
         self.db_path = db_path
         self.session_id = session_id
-        # check_same_thread=False so a single connection can be shared across
-        # the worker threads used by Router.run_all.
+        # check_same_thread=False: Session.events() and arun() run a turn on a
+        # worker thread, and a server may handle the next turn on another
+        # thread. One Session must still never be driven by two threads at once.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS messages (
@@ -78,7 +79,10 @@ class SQLiteMemory(Memory):
 
     def _reload_window(self) -> None:
         """Load the most recent messages back into the sliding window."""
-        self.messages = self.history()[-self.max_messages :]
+        history = self.history()
+        # Like Memory itself, keep at least the most recent message.
+        start = max(0, len(history) - max(1, self.max_messages))
+        self.messages = history[self._tool_group_start(history, start) :]
 
     def close(self) -> None:
         """Close the underlying database connection."""
@@ -99,8 +103,9 @@ def _demo() -> None:
     reloaded = SQLiteMemory(db_path=db, session_id="alice")
     print("Reloaded window:", [m["content"] for m in reloaded.get()])
 
-    # Wire it into an agent exactly like the built-in Memory (needs a live LLM).
-    _ = Agent(LLM(provider="ollama"), memory=reloaded)
+    session = Agent(MockLLM(reply="Python, as you told me.")).session(memory=reloaded)
+    print("Agent says:", session.run("What is my favourite language?"))
+    print(f"{len(reloaded.history())} messages now persisted")
     reloaded.close()
     Path(db).unlink(missing_ok=True)
 

@@ -64,8 +64,8 @@ you do not control; a summary is generated *from* both.
 3. **An LLM tool call is an untrusted request, not a decision.** Every
    model-requested call takes one path — `Agent._execute` — which locates the
    tool, validates the arguments against the Python signature, asks the
-   policy, takes approval if required, executes, and audits. A call naming a
-   tool the agent does not hold never reaches a function.
+   policy, takes approval if required, audits the decision, then executes. A
+   call naming a tool the agent does not hold never reaches a function.
 
 4. **Retrieved documents and tool results are data, never instructions.** Both
    are wrapped in a fence carrying a random per-agent marker before reaching a
@@ -145,7 +145,6 @@ you do not control; a summary is generated *from* both.
 - [ ] One `Session` per user; `agent.run()` is a single conversation.
 - [ ] The RAG corpus is trusted the way user input is trusted.
 - [ ] Audit events (`on_tool_audit`) are retained somewhere you can query.
-- [ ] `Router(strict=True)` if routing decisions matter.
 - [ ] The Streamlit UI, if exposed, is behind authentication.
 - [ ] Keys come from the environment; `.env` and real keys are never committed.
 
@@ -189,10 +188,10 @@ hold even when the model is confused, jailbroken, or adversarial.
 - **Every model-requested tool call passes a policy first.** `Agent._execute`
   is the single path from model output to a tool function, and its sequence is
   fixed: locate the tool, validate the arguments, `ToolPolicy.authorize()`,
-  approval if required, execute, audit. `Agent.run()`, `Agent.stream()` and
-  `Agent.arun()` all funnel through it. A tool marked `requires_approval` is
-  gated even when no policy is configured, so the metadata is never
-  decorative. See "Tool authorization" in the README.
+  approval if required, audit, execute. `Agent.run()`, `stream()`, `arun()`,
+  `events()` and their `Session` forms all funnel through it. A tool marked
+  `requires_approval` is gated even when no policy is configured, so the
+  metadata is never decorative. See [Tool authorization](docs/GUIDE.md#tool-authorization) in the Developer guide.
 - **Refusals fail closed, including when the machinery itself breaks.** A
   policy that raises an unexpected exception denies the call rather than
   falling through to execution; an approval callback that raises is a refusal,
@@ -259,12 +258,17 @@ hold even when the model is confused, jailbroken, or adversarial.
   requested as JSON constrained to the registered agent names, then resolved
   by looking the answer up in that registry — so no reply, however crafted,
   can name an agent the `Router` does not hold. A decision is valid only if
-  it identifies exactly one registered agent; an empty reply, a refusal, a
-  hallucinated name, malformed JSON, or a reply naming two agents all raise
-  `RoutingError`. This matters because agents differ in the tools, and
-  therefore the privileges, they hold: a silent fallback would let a confused
-  router hand a query to a more privileged agent than the one intended. Pass
-  `Router(..., fallback=agent)` to choose a default explicitly.
+  it identifies exactly one registered agent, and only two reply shapes can:
+  a JSON decision (`{"agent": "cost"}`) or a bare agent name. An empty reply,
+  a refusal, a hallucinated name, malformed JSON, and prose — even prose
+  naming exactly one agent — all raise `RoutingError`; prose is refused
+  because matching words cannot tell "use cost" from "not cost". This
+  matters because agents differ in the tools, and therefore the privileges,
+  they hold: a silent fallback would let a confused router hand a query to a
+  more privileged agent than the one intended. Pass
+  `Router(..., fallback=agent)` to choose a default explicitly; it then
+  receives every reply that does not resolve, so make it an agent you would
+  accept for any query.
 - **Agent descriptions cannot forge the router's agent list.** Descriptions
   are interpolated into the routing prompt, so one containing newlines could
   present extra `- name:` entries — agents that do not exist, or instructions
@@ -316,9 +320,6 @@ place where the guarantee stops and yours begins.
   bounds the damage is that the chosen agent's own `ToolPolicy` still governs
   what it may do. Do not rely on routing to keep a privileged agent
   unreachable; give it a policy that refuses.
-- **Text routing replies cannot read sense.** With the default (non-`strict`)
-  `Router`, prose that mentions exactly one agent in order to *reject* it
-  ("not cost") resolves to that agent. Use `strict=True` where that matters.
 - **The policy layer is not a sandbox.** It decides *whether* a function runs,
   not what that function can then do. A tool that shells out or writes files
   still needs OS-level confinement (see `examples/coder.py`).

@@ -5,22 +5,18 @@ matter when picking a stack: size, dependency weight, ease of use, and whether
 multi-agent and RAG are supported out of the box.
 """
 
-import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[3]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
 from unchained import tool
+
+_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _count_unchained_loc() -> int:
     """Count Unchained's own non-blank, non-comment source lines, live.
 
     Measured rather than hardcoded so this comparison can't silently go
-    stale as the framework grows (see benchmarks/compare_frameworks.py for
-    the same approach against the other frameworks).
+    stale as the framework grows.
     """
     try:
         lines = 0
@@ -84,11 +80,6 @@ FRAMEWORKS = {
 }
 
 
-def framework_data(name: str) -> dict:
-    """Return the raw data dict for a single framework (or an empty dict)."""
-    return FRAMEWORKS.get((name or "").strip().lower(), {})
-
-
 @tool
 def compare_frameworks(names: str = "") -> str:
     """Compare agent frameworks side by side.
@@ -116,7 +107,3 @@ def compare_frameworks(names: str = "") -> str:
         )
     notes = [f"- {k}: {FRAMEWORKS[k]['note']}" for k in selected if k in FRAMEWORKS]
     return "\n".join(rows) + "\n\nNotes:\n" + "\n".join(notes)
-
-
-if __name__ == "__main__":
-    print(compare_frameworks("unchained, langchain, crewai"))

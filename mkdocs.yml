@@ -29,6 +29,7 @@ theme:
 nav:
   - Home: index.md
   - User Manual: USER_MANUAL.md
+  - Developer Guide: GUIDE.md
   - Architecture: ARCHITECTURE.md
   - API Reference: api.md
 
