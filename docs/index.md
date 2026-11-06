@@ -9,7 +9,7 @@ Ollama model.
 
 ```bash
 pip install requests pydantic
-# then drop the one file into your project, or: pip install -e ".[dev]"
+# then copy unchained/__init__.py into your project as unchained.py (see the README)
 ```
 
 ## Try it with zero setup
@@ -42,5 +42,6 @@ use a real model - the rest of the code is identical.
 ## Where next
 
 - [User Manual](USER_MANUAL.md) - a friendly, task-by-task guide.
+- [Developer Guide](GUIDE.md) - the full reference for every feature.
 - [Architecture](ARCHITECTURE.md) - how the pieces fit together.
 - [API Reference](api.md) - every public class and function.

@@ -207,7 +207,7 @@ Run it from the command line:
 python -m examples.pickmystack.app "Build a customer-support chatbot" --budget 200 --team 3
 ```
 
-Or open the friendly web version:
+Or open the friendly web version (it needs Streamlit: `pip install streamlit`):
 
 ```bash
 streamlit run examples/pickmystack/ui/app_ui.py
@@ -265,6 +265,11 @@ logging.basicConfig(level=logging.INFO)
 agent = Agent(llm, tools=[...], callbacks=[LoggingCallback()])
 ```
 
+You get one line per step, plus a line for each tool call showing what was
+sent to the tool and the start of what it returned, word for word. That makes
+it a debugging aid: don't leave it on where the logs could capture private
+data.
+
 You can also check how many tokens a run used:
 
 ```python
@@ -287,7 +292,7 @@ llm = LLM(provider="openai", max_retries=3, backoff=0.5)
 Ollama isn't running. Start it, then confirm a model is available with
 `ollama pull llama3.1`.
 
-**"An API key is required"**
+**"401 Client Error: Unauthorized"** (in the PickMyStack UI: "An API key is required")
 You chose OpenAI or Anthropic but didn't provide a key. Set the environment
 variable (see "Your first agent") or paste the key into the web UI's sidebar.
 
@@ -306,6 +311,7 @@ or add RAG so a smaller model can still answer accurately.
 
 ## Where to go next
 
-- [Overview](index.md) - a quick tour and feature list.
+- [Overview](index.md) - a quick tour.
+- [Developer Guide](GUIDE.md) - the full reference for every feature.
 - [Architecture](ARCHITECTURE.md) - how everything works under the hood.
 - `examples/` - short, self-contained agents you can copy and adapt.

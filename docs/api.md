@@ -8,14 +8,12 @@ Auto-generated from the docstrings in `unchained/__init__.py`.
         - tool
         - Tool
         - LLM
-        - LLMResponse
         - MockLLM
+        - LLMResponse
         - Memory
         - RAG
         - Agent
         - Session
-        - Budget
-        - RunState
         - Router
         - Callback
         - LoggingCallback
@@ -26,3 +24,12 @@ Auto-generated from the docstrings in `unchained/__init__.py`.
         - ToolAuthorizationError
         - ToolApprovalRequired
         - ToolArgumentValidationError
+        - ToolTimeoutError
+        - Budget
+        - RunState
+        - BudgetExceededError
+        - TokenBudgetExceeded
+        - ToolCallBudgetExceeded
+        - ToolOutputBudgetExceeded
+        - TimeBudgetExceeded
+        - CostBudgetExceeded

@@ -16,6 +16,7 @@ git clone https://github.com/NiravRVaghasiya/unchained.git
 cd unchained
 python -m venv .venv
 # Windows: .venv\Scripts\activate    |    macOS/Linux: source .venv/bin/activate
+python -m pip install --upgrade pip   # the dev extra refers to the test/lint extras
 pip install -e ".[dev]"
 pre-commit install
 ```
@@ -62,7 +63,7 @@ pytest --cov=unchained  # tests + coverage
 
 ## Tests
 
-- Tests must run offline. Use the `FakeLLM` pattern (see `tests/test_unchained.py`) or monkeypatch `unchained.requests.post`. Never call a real provider in a test.
+- Tests must run offline. Use the `FakeLLM` pattern (see `tests/test_unchained.py`) or monkeypatch `unchained.requests.Session.post` (see `_patch_post` in `tests/test_unchained.py`). Never call a real provider in a test.
 - Cover the behavior you add, including at least one error path.
 
 ## Coding style
@@ -74,7 +75,7 @@ pytest --cov=unchained  # tests + coverage
 ## Reporting bugs and requesting features
 
 Open an issue using the templates in `.github/ISSUE_TEMPLATE`. For security
-issues, please do not open a public issue; see `SECURITY.md` if present or
+issues, please do not open a public issue; see [SECURITY.md](SECURITY.md) or
 contact the maintainers directly.
 
 ## License

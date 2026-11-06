@@ -4,10 +4,6 @@
 
 Unchained is a **single-file agentic AI framework** that provides everything needed to build intelligent AI agents — tool calling, memory, retrieval-augmented generation, multi-agent orchestration, and structured output.
 
-For the exact current size, run `python benchmarks/compare_frameworks.py` (it
-counts live rather than relying on a number in prose, which goes stale as the
-file grows).
-
 ## Design Principles
 
 1. **Single-file core** — Everything in `unchained/__init__.py`, no submodules
@@ -30,7 +26,7 @@ file grows).
 │  │                         MULTI-AGENT LAYER                           │    │
 │  │  ┌──────────┐                                                       │    │
 │  │  │  Router  │ → Intent classification → Route to best agent         │    │
-│  │  │          │ → run_all(): parallel execution + synthesis           │    │
+│  │  │          │ → run_all() / synthesize(): parallel (+ synthesis)    │    │
 │  │  └──────────┘                                                       │    │
 │  └────────────────────────────────┬────────────────────────────────────┘    │
 │                                   │                                         │
@@ -104,8 +100,9 @@ file grows).
 ```
 
 When an agent turn produces more than one tool call, `Agent._execute_calls`
-runs them concurrently on a `ThreadPoolExecutor` (most tools are I/O-bound)
-and feeds the results back to the model in the original order.
+runs consecutive parallel calls concurrently on a `ThreadPoolExecutor` (capped
+by `max_tool_workers`; most tools are I/O-bound); a `concurrency="exclusive"`
+tool runs alone; results return to the model in the original order.
 
 ### 2. LLM Backend (Unified Interface)
 
@@ -114,26 +111,21 @@ LLM.chat(messages, tools, response_format)
      │
      ├── provider == "openai"
      │   └── POST /v1/chat/completions
-     │       └── Returns: {content, tool_calls[], usage}
+     │       └── Returns: LLMResponse
      │
      ├── provider == "anthropic"
      │   └── POST /v1/messages
      │       └── Converts: system msg → system param
      │       └── Converts: tools → Anthropic tool format
-     │       └── Returns: {content, tool_calls[], usage}
+     │       └── Returns: LLMResponse
      │
      └── provider == "ollama"
          └── POST /api/chat
-             └── Returns: {content, tool_calls[], usage}
+             └── Returns: LLMResponse
 
-All providers return IDENTICAL response format:
-{
-  "content": str,        # Text response
-  "tool_calls": [        # Tools the LLM wants to call
-    {"name": str, "arguments": dict}
-  ],
-  "usage": dict          # Token counts
-}
+All providers return an LLMResponse (content, tool_calls [{name, arguments,
+id}], usage, finish_reason, provider, model, request_id, metadata), which also
+supports dict-style read access.
 
 Cross-cutting LLM behaviour:
   • base_url per provider can come from an env var (OPENAI_BASE_URL /
@@ -141,8 +133,9 @@ Cross-cutting LLM behaviour:
     target any OpenAI-compatible endpoint with no code change.
   • Requests go through a persistent requests.Session (one per LLM instance)
     so repeated calls reuse the TCP/TLS connection.
-  • cache=True stores responses in a bounded LRU (cache_size, default 256)
-    with an optional cache_ttl, rather than an unbounded dict.
+  • cache=True (policy "final_only") stores plain answers, never tool-call
+    responses, in a bounded LRU (cache_size, default 256) with an optional
+    cache_ttl.
   • achat() offloads chat() to a worker thread (asyncio.to_thread) so it can
     be awaited from async code - it does not add non-blocking sockets.
 ```
@@ -174,6 +167,9 @@ Optional max_tokens (rough 4-chars/token estimate, no tokenizer dependency):
   small max_messages. When set, _compress() keeps shrinking the retained
   window below max_messages // 2 (down to a minimum of 1 message) until the
   kept messages fit the token budget too.
+
+The window is never cut inside an assistant tool_calls group, so it may
+exceed max_messages/max_tokens by that one group.
 ```
 
 ### 4. RAG (TF-IDF + Smoothed IDF + Cosine Similarity)
@@ -205,22 +201,26 @@ Why smoothed IDF?
 ```
 agent.run(user_input)
      │
-     ├── [1] RAG augmentation (if rag provided)
-     │        └── Search → prepend context to input
+     ├── [1] Add the user turn to memory (RAG hits, if any, are stored
+     │        beside it and fenced when the messages are rendered)
      │
-     ├── [2] Add to memory
+     ├── [2] Loop (max_iterations):
+     │        │
+     │        ├── Build messages (system + summary + history)
+     │        ├── Call LLM with tool schemas
+     │        │
+     │        ├── IF no tool_calls → that is the answer; leave the loop
+     │        │
+     │        └── IF tool_calls:
+     │             ├── Authorize + execute each (concurrently if >1)
+     │             ├── Add each tool call + result to memory, in order
+     │             └── Continue loop (LLM sees results next iteration)
      │
-     └── [3] Loop (max_iterations):
-              │
-              ├── Build messages (system + summary + history)
-              ├── Call LLM with tool schemas
-              │
-              ├── IF no tool_calls → return content (DONE)
-              │
-              └── IF tool_calls:
-                   ├── Authorize + execute each (concurrently if >1)
-                   ├── Add each tool call + result to memory, in order
-                   └── Continue loop (LLM sees results next iteration)
+     └── [3] After the loop:
+              ├── Iterations exhausted → one final call without tools
+              │   (under the schema, if response_format is set)
+              ├── response_format + tools, loop answered → formatting pass
+              └── response_format → validate, repairing up to structured_retries
 ```
 
 Every model-requested tool call reaches a function through one fixed path in
@@ -229,15 +229,18 @@ Every model-requested tool call reaches a function through one fixed path in
 ```
 model asks for a tool
      │
+     ├── claim one call from the run budget   → exhausted: raise
+     │                                          BudgetExceededError (run stops)
      ├── locate it in this agent's tools      → unknown  ─┐
      ├── Tool.validate_arguments(...)         → invalid  ─┤
      ├── ToolPolicy.authorize(...)            → denied   ─┤
      ├── approval, if the policy wants it     → refused  ─┤
      │                                                    │
-     ├── tool.func(**arguments)                           │
-     └── audit the decision  ◄─────────────────────────────┘
-                                    (refusals become an observation
-                                     for the model; the loop continues)
+     ├── audit the decision  ◄─────────────────────────────┘
+     │                              (refusals end here as an observation
+     │                               for the model; the loop continues)
+     ├── tool.run(arguments)  (via _invoke: timeout)
+     └── bound output
 ```
 
 Three jobs are kept separate inside `Tool`, and conflating them is how
@@ -254,9 +257,10 @@ Validation is built from `inspect.signature` + `get_type_hints`, never from
 model was free to disregard.
 
 The policy is Python, not prompt text: nothing the model emits can widen what
-it is allowed to call. With no `policy=`, the default allows everything the
-agent was given, so agents written before this layer existed are unaffected.
-See the Tool authorization section of the README and `SECURITY.md`.
+it is allowed to call. With no `policy=`, the default `ToolPolicy` allows every
+tool the agent was given, subject only to each tool's own `allowed=` hook and
+`requires_approval` flag. See [Tool authorization](GUIDE.md#tool-authorization) in the Developer guide and
+`SECURITY.md`.
 
 `agent.arun(...)` offloads the whole method above to a worker thread via
 `asyncio.to_thread`, so it can be awaited from async code (FastAPI, aiohttp,
@@ -268,8 +272,8 @@ against the Agent:
 ```
 Agent  (shared, safe to reuse)        Session  (one conversation)
   llm, tools, system_prompt             memory
-  rag, callbacks, policy                usage
-  max_iterations, approve               metadata, callbacks
+  rag, callbacks, policy                usage, last_run
+  max_iterations, approve, budget       metadata, callbacks, budget
 ```
 
 Every Agent method that touches conversation state takes the session as its
@@ -286,35 +290,20 @@ separate objects, not from locking.
 router.route(query)              router.run_all(query)
      │                                │
      ├── Build agent descriptions     ├── For each agent:
-     ├── Ask LLM for JSON: {agent}    │   └── agent.run(query)
+     ├── Ask LLM for JSON: {agent}    │   └── agent.session().run(query)
      ├── Look it up in the registry   │
      └── Delegate, or RoutingError    └── Return {name: result}
-
-Routing fails closed. The decision is requested as JSON constrained to the
-registered names, then resolved by a lookup in that registry - the prompt is
-where the model is told what is allowed, the lookup is what enforces it. A
-decision is valid only if it identifies exactly one registered agent; empty,
-evasive, hallucinated, malformed and ambiguous replies all raise
-`RoutingError` rather than falling back to an arbitrary agent. Agents differ
-in the tools - and so the privileges - they hold, so this is an authorization
-decision, enforced in Python rather than by trusting the router prompt.
-`Router(..., fallback=agent)` names a default explicitly; `strict=True`
-refuses prose replies entirely.
-
-PickMyStack uses run_all() → Synthesizer pattern:
-  ┌──────────┐  ┌──────────┐  ┌──────────┐
-  │ CostAgent│  │ FitAgent │  │TrendAgent│   ← All run in parallel
-  └────┬─────┘  └────┬─────┘  └────┬─────┘
-       │              │              │
-       └──────────────┼──────────────┘
-                      ▼
-              ┌──────────────┐
-              │ Synthesizer  │   ← Combines all results
-              └──────────────┘
-                      │
-                      ▼
-              Final Recommendation
 ```
+
+Routing fails closed: the reply must be a JSON decision or a bare registered
+name, and it is resolved by a lookup in the agent registry, so anything else -
+prose included - raises `RoutingError` unless `Router(..., fallback=agent)`
+names a default. Agents differ in the tools - and so the privileges - they
+hold, so this is an authorization decision, enforced in Python rather than by
+trusting the router prompt. See [Multi-agent routing](GUIDE.md#multi-agent-routing) and SECURITY.md.
+
+`synthesize()` runs `run_all()` and passes the results to the synthesizer
+agent; see Pattern 4.
 
 ---
 
@@ -340,103 +329,9 @@ User → RAG.search() → [context] → Agent → LLM → Response
 
 ### Pattern 4: Multi-Agent Synthesis
 ```
-User → Router.run_all() → Agent_A → result_a ─┐
-                        → Agent_B → result_b ──┤─→ Synthesizer → Final
-                        → Agent_C → result_c ─┘
-```
-
----
-
-## PickMyStack Architecture
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                    STREAMLIT FRONTEND                           │
-│  ┌──────────────┐  ┌─────────────┐  ┌───────────────────┐     │
-│  │ Use Case     │  │ Constraints │  │ Progress Display  │     │
-│  │ (text input) │  │ (budget,    │  │ (real-time agent  │     │
-│  │              │  │  team, etc) │  │  status updates)  │     │
-│  └──────┬───────┘  └──────┬──────┘  └───────────────────┘     │
-│         └──────────────────┘                                   │
-│                    │                                           │
-└────────────────────┼───────────────────────────────────────────┘
-                     ▼
-┌────────────────────────────────────────────────────────────────┐
-│                   UNCHAINED BACKEND                              │
-│                                                                │
-│  ┌─────────────────────┐                                       │
-│  │   Knowledge Base    │  ← RAG over framework docs            │
-│  │   (frameworks.md,   │    (models_guide.md, pricing,         │
-│  │    models_guide.md, │     deployment_options.md)             │
-│  │    deploy.md)       │                                       │
-│  └─────────┬───────────┘                                       │
-│            │                                                   │
-│  ┌─────────▼───────────────────────────────────────────┐       │
-│  │              EVALUATION PIPELINE                     │       │
-│  │                                                     │       │
-│  │  ┌────────────┐ ┌───────────┐ ┌─────────────┐      │       │
-│  │  │ CostAgent  │ │ FitAgent  │ │ TrendAgent  │      │       │
-│  │  │ • pricing  │ │ • scoring │ │ • GitHub    │      │       │
-│  │  │ • hosting  │ │ • match % │ │ • community │      │       │
-│  │  │ • TCO      │ │ • fit     │ │ • momentum  │      │       │
-│  │  └─────┬──────┘ └─────┬─────┘ └──────┬──────┘      │       │
-│  │        └───────────────┼──────────────┘             │       │
-│  │                        ▼                            │       │
-│  │               ┌─────────────────┐                   │       │
-│  │               │   Synthesizer   │                   │       │
-│  │               │  (Final rank)   │                   │       │
-│  │               └────────┬────────┘                   │       │
-│  └────────────────────────┼────────────────────────────┘       │
-│                           │                                    │
-└───────────────────────────┼────────────────────────────────────┘
-                            ▼
-                   ┌─────────────────┐
-                   │ TOP 3 STACKS    │
-                   │ with reasoning  │
-                   └─────────────────┘
-```
-
----
-
-## File Structure (Complete)
-
-```
-unchained/
-├── unchained/__init__.py         ← THE framework (single file)
-├── pyproject.toml               ← Package config + dependencies
-├── README.md                    ← Star-attracting documentation
-├── LICENSE                      ← MIT License
-├── .gitignore
-├── examples/
-│   ├── researcher.py            ← Web research agent
-│   ├── coder.py                 ← Code execution agent
-│   ├── data_analyst.py          ← CSV analysis agent
-│   ├── quickstart.py            ← Zero-setup tour using MockLLM
-│   ├── sqlite_memory.py         ← Persistent, session-scoped Memory
-│   └── pickmystack/             ← Flagship multi-agent app
-│       ├── app.py               ← CLI entry point
-│       ├── tools/
-│       │   ├── cost_estimator.py    ← Pricing data + estimation
-│       │   ├── benchmark_fetcher.py ← Framework comparison data
-│       │   └── doc_retriever.py     ← RAG search over knowledge
-│       ├── knowledge/
-│       │   ├── frameworks_comparison.md
-│       │   ├── models_guide.md
-│       │   └── deployment_options.md
-│       └── ui/
-│           ├── app_ui.py        ← Streamlit web interface
-│           ├── requirements.txt ← UI dependencies
-│           ├── Dockerfile       ← Container deployment
-│           ├── README_DEPLOY.md ← Deployment guide
-│           └── .streamlit/
-│               └── config.toml  ← Theme configuration
-├── benchmarks/
-│   └── compare_frameworks.py    ← Unchained vs LangChain vs CrewAI
-├── tests/
-│   └── test_unchained.py         ← Unit tests (pytest)
-└── docs/
-    ├── ARCHITECTURE.md          ← This file
-    └── USER_MANUAL.md           ← Non-technical user guide
+User → Router.synthesize() → Agent_A → result_a ─┐
+                           → Agent_B → result_b ──┤─→ Synthesizer → Final
+                           → Agent_C → result_c ─┘
 ```
 
 ---
@@ -448,7 +343,7 @@ unchained/
 - Works offline, instant indexing
 - Good enough for 100-1000 documents
 - Uses smoothed IDF (sklearn-style) for small corpus robustness
-- Can be swapped for embeddings later (same interface)
+- Dense embeddings are opt-in via `RAG(embed_fn=...)`
 
 ### Why sliding window memory?
 - Predictable token usage (no surprise $100 bills)
@@ -474,16 +369,19 @@ unchained/
 
 Unchained is designed to be extended, not forked:
 
-| Extension | How | Difficulty |
-|---|---|---|
-| New tools | `@tool` decorator on any function (sync or async) | Easy |
-| Tool authorization | Subclass `ToolPolicy`, pass `policy=` to `Agent` | Easy |
-| New LLM provider | Add `_provider_name()` method to `LLM` | Easy |
-| OpenAI-compatible provider | Reuse `provider="openai"` with a different `base_url` | Easy |
-| Better retrieval | Replace `RAG._rebuild_index()` + `search()` | Medium |
-| Persistent memory | Subclass `Memory`, add SQLite backend | Medium |
-| Custom routing | Subclass `Router`, override `route()` | Medium |
-| True async HTTP | Subclass `LLM`, override `chat()`/`_request()` with an async client | Medium |
+| Extension | How |
+|---|---|
+| New tool | `@tool` on any function (sync or async) |
+| Stricter argument rules | annotate the parameter with a Pydantic model |
+| New LLM provider | add `_yourprovider()` (chat) and `_stream_yourprovider()` methods to `LLM`, then register them in `_PROVIDER_DEFAULTS`, `_dispatch` and `stream()` (and `_PROVIDER_ENV_KEY` / `_PROVIDER_ENV_URL` if it reads env vars). Without editing core: pass `Agent` any object with `chat(messages, tools, response_format)` (and `stream(messages)`), as `MockLLM` does |
+| OpenAI-compatible provider | reuse `provider="openai"` with a different `base_url` |
+| True async HTTP (direct LLM calls) | subclass `LLM` and override `achat()` with an async client; `Agent.arun()` still runs the synchronous loop on a worker thread |
+| Better retrieval | pass `embed_fn=` for dense embeddings, or subclass `RAG` (or supply any object) with a `search(query, top_k)` returning `[{"text", "score", "metadata"}]` |
+| Persistent memory | subclass `Memory` — see `examples/sqlite_memory.py` |
+| Custom tracing | subclass `Callback` and pass `callbacks=[...]` |
+| Custom authorization | subclass `ToolPolicy` and pass `policy=...` |
+| Per-user conversations | `agent.session(...)` — one `Session` per conversation |
+| Custom routing | subclass `Router`, override `route()` |
 
 Streaming and thread-offloaded async (`arun`/`achat`) already ship in core -
 see `LLM.stream()`, `Agent.stream()`, `Agent.arun()`, `LLM.achat()`.
@@ -495,10 +393,4 @@ see `LLM.stream()`, `Agent.stream()`, `Agent.arun()`, `LLM.achat()`.
 | Operation | Time Complexity | Space |
 |---|---|---|
 | Tool registration | O(1) | O(params) |
-| RAG indexing | O(n × d) | O(n × vocab) |
-| RAG search | O(n × vocab) | O(n) |
-| Memory add | O(1) amortized | O(max_messages) |
-| Memory compress | O(overflow) | O(1) |
 | Agent.run() | O(iterations × LLM latency) | O(messages) |
-
-Where: n = documents, d = avg document length, vocab = unique terms
