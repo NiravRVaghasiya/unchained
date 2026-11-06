@@ -76,20 +76,10 @@ def wheel(tmp_path_factory):
     return built[0]
 
 
-def test_the_wheel_contains_the_py_typed_marker(wheel):
-    # Without this, `pip install unchained-ai` gives downstream code no types
-    # at all - every symbol becomes Any and nothing is checked.
-    names = zipfile.ZipFile(wheel).namelist()
-    assert "unchained/py.typed" in names
-
-
-def test_the_wheel_ships_the_source_as_a_package(wheel):
-    names = zipfile.ZipFile(wheel).namelist()
-    assert "unchained/__init__.py" in names
-    assert "unchained.py" not in names  # a flat module cannot carry the marker
-
-
-def test_the_wheel_carries_no_surprises(wheel):
+def test_the_wheel_ships_exactly_the_package_and_marker(wheel):
+    # Without py.typed, `pip install unchained-ai` gives downstream code no
+    # types at all - every symbol becomes Any and nothing is checked. And the
+    # source must ship as a package: a flat unchained.py cannot carry the marker.
     payload = [
         name
         for name in zipfile.ZipFile(wheel).namelist()
