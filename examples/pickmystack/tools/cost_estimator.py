@@ -5,11 +5,6 @@ feature: model token spend plus hosting. Prices are approximate USD and move
 often; treat the output as relative guidance rather than a quote.
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
 from unchained import tool
 
 # model name -> (USD per 1M input tokens, USD per 1M output tokens)
@@ -94,9 +89,3 @@ def estimate_cost(
         f"  ESTIMATED TOTAL: ${total:,.2f}/month  (~${total * 12:,.2f}/year)",
     ]
     return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    print(estimate_cost("gpt-4o-mini", 50_000))
-    print()
-    print(estimate_cost("llama-3.1-8b", 50_000))

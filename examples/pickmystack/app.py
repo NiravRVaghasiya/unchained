@@ -25,17 +25,8 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from unchained import LLM, Agent, Router
-
-try:  # relative import when executed as `python -m examples.pickmystack.app`
-    from .tools import compare_frameworks, estimate_cost, get_rag, search_knowledge
-except ImportError:  # absolute import when executed as `python examples/pickmystack/app.py`
-    from examples.pickmystack.tools import (
-        compare_frameworks,
-        estimate_cost,
-        get_rag,
-        search_knowledge,
-    )
+from examples.pickmystack.tools import compare_frameworks, estimate_cost, get_rag, search_knowledge
+from unchained import LLM, Agent
 
 ProgressFn = Optional[Callable[[str, str], None]]
 
@@ -106,11 +97,6 @@ def build_synthesizer(llm: LLM) -> Agent:
         ),
         max_iterations=3,
     )
-
-
-def build_router(llm: LLM) -> Router:
-    """A Router over the specialists with the synthesizer attached."""
-    return Router(llm, agents=build_specialists(llm), synthesizer=build_synthesizer(llm))
 
 
 # ---------------------------------------------------------------------------

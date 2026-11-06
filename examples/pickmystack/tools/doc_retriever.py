@@ -5,11 +5,8 @@ index (split into paragraph-sized chunks) and exposes a search tool over it.
 The index is built once and cached.
 """
 
-import sys
 from pathlib import Path
 from typing import Optional
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from unchained import RAG, tool
 
@@ -67,9 +64,3 @@ def search_knowledge(query: str) -> str:
         source = hit["metadata"].get("source", "?")
         blocks.append(f"[{source} | score {hit['score']:.2f}]\n{hit['text']}")
     return "\n\n".join(blocks)
-
-
-if __name__ == "__main__":
-    print(f"Indexed {len(get_rag())} chunks from {KNOWLEDGE_DIR}")
-    print()
-    print(search_knowledge("cheapest way to run an agent on a tight budget"))

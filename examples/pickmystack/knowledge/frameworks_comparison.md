@@ -5,8 +5,7 @@ it to judge how well a framework fits a given team, use case, and constraint.
 
 ## Unchained
 
-- Single-file core, two dependencies (requests + pydantic). Run
-  `python benchmarks/compare_frameworks.py` for the current line count.
+- Single-file core, two dependencies (requests + pydantic).
 - Best for: small teams, prototypes, learning, embedding an agent inside an existing app.
 - Strengths: tiny footprint, no lock-in, provider-agnostic (OpenAI/Anthropic/Ollama and
   any OpenAI-compatible endpoint), easy to audit. Supports streaming and has
