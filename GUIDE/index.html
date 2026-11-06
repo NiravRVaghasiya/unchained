@@ -1,0 +1,1956 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A single-file agentic AI framework - tools, memory, RAG, multi-agent, structured output.">
+      
+      
+      
+        <link rel="canonical" href="https://niravrvaghasiya.github.io/unchained/GUIDE/">
+      
+      
+        <link rel="prev" href="../USER_MANUAL/">
+      
+      
+        <link rel="next" href="../ARCHITECTURE/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>Developer Guide - Unchained</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#developer-guide" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Unchained" class="md-header__button md-logo" aria-label="Unchained" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Unchained
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Developer Guide
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="deep-purple" data-md-color-accent="deep-purple"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/NiravRVaghasiya/unchained" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    NiravRVaghasiya/unchained
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Unchained" class="md-nav__button md-logo" aria-label="Unchained" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Unchained
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/NiravRVaghasiya/unchained" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    NiravRVaghasiya/unchained
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../USER_MANUAL/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Manual
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-agent-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The agent loop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tools" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-timeouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool timeouts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-output-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool output limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#run-budgets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Run budgets
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Run budgets">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#reading-what-a-run-spent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading what a run spent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cost-estimates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cost estimates
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-authorization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool authorization
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trust-boundaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trust boundaries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sessions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RAG
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured output
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Structured output">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#self-healing-structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Self-healing structured output
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-agent-routing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-agent routing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streaming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#async" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Async
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#response-caching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Response caching
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#connection-reuse" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connection reuse
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#observability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Observability">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#observability-and-tracing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability and tracing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#structured-events" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured events
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#watching-a-run-as-it-happens" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Watching a run as it happens
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#provider-responses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider responses
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#token-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Token usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#persistent-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistent memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-agent-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The agent loop
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tools" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-timeouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool timeouts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-output-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool output limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#run-budgets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Run budgets
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Run budgets">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#reading-what-a-run-spent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reading what a run spent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cost-estimates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cost estimates
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tool-authorization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool authorization
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trust-boundaries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trust boundaries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sessions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RAG
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured output
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Structured output">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#self-healing-structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Self-healing structured output
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#multi-agent-routing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Multi-agent routing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streaming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#async" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Async
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#retries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#response-caching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Response caching
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#connection-reuse" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connection reuse
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#observability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Observability">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#observability-and-tracing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability and tracing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#structured-events" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured events
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#watching-a-run-as-it-happens" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Watching a run as it happens
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#provider-responses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider responses
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#token-usage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Token usage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#persistent-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistent memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="developer-guide">Developer guide<a class="headerlink" href="#developer-guide" title="Permanent link">&para;</a></h1>
+<p>This guide is the full reference for each Unchained feature: the code, the
+configuration, and where each guarantee stops. The
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/README.md">README</a> is the overview, and
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/SECURITY.md">SECURITY.md</a> is the threat model.</p>
+<p>Small doesn't mean toy. Unchained handles the things that actually bite in production.</p>
+<h2 id="the-agent-loop">The agent loop<a class="headerlink" href="#the-agent-loop" title="Permanent link">&para;</a></h2>
+<p>Every agent runs the classic ReAct cycle until the model stops asking for tools:</p>
+<div class="highlight"><pre><span></span><code>think (LLM)  -&gt;  act (tool)  -&gt;  observe (result)  -&gt;  repeat
+</code></pre></div>
+<h2 id="tools">Tools<a class="headerlink" href="#tools" title="Permanent link">&para;</a></h2>
+<p>The <code>@tool</code> decorator introspects the signature, maps type hints to a JSON
+schema, and turns the docstring into the description. No boilerplate.</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_weather</span><span class="p">(</span><span class="n">city</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">units</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"celsius"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Look up the current weather for a city."""</span>
+    <span class="o">...</span>
+</code></pre></div>
+<p>Beyond <code>str</code>/<code>int</code>/<code>float</code>/<code>bool</code>/<code>list</code>/<code>dict</code>/<code>Optional[X]</code>, the schema
+builder also understands <code>Literal[...]</code>, <code>Enum</code> subclasses, and nested
+Pydantic models, so the model actually sees the constraint instead of a plain
+string:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Literal</span>
+
+
+<span class="nd">@tool</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">set_thermostat</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"heat"</span><span class="p">,</span> <span class="s2">"cool"</span><span class="p">,</span> <span class="s2">"off"</span><span class="p">],</span> <span class="n">degrees</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Set the thermostat mode and target temperature."""</span>
+    <span class="o">...</span>
+</code></pre></div>
+<p><strong>That schema is what the model is shown — and arguments are validated
+independently of it before your function runs.</strong> The schema is advice the
+model may ignore; what actually arrives is checked against the Python
+signature (using Pydantic, already a dependency) and normalised to the types
+you annotated. Inside <code>set_thermostat</code>, <code>degrees</code> is an <code>int</code> even if the
+model sent <code>"21"</code>.</p>
+<p>A call of <code>{"mode": "warm", "degrees": "hot"}</code> never reaches the function.
+The model gets an observation naming each field and the rule it broke, so it
+can correct itself on the next turn:</p>
+<div class="highlight"><pre><span></span><code>Error: tool 'set_thermostat' got invalid arguments - mode: Input should be
+'heat', 'cool' or 'off'; degrees: Input should be a valid integer, unable to
+parse string as an integer
+</code></pre></div>
+<p>Rejected: missing required arguments, wrong types, malformed nested
+structures, and unknown argument names (unless the tool takes <code>**kwargs</code>).
+Nested Pydantic models are validated all the way down, and errors point at the
+exact path — <code>person.address.zip</code>.</p>
+<p>Validation errors never repeat the offending <em>value</em>, only its location and
+the rule. That text goes to the model, into memory, and into the audit log, so
+a tool taking a token or a customer record cannot leak it by failing
+validation.</p>
+<p>Two notes on normalisation: an <code>Enum</code>-annotated parameter receives the enum
+member (<code>Color.red</code>, not <code>"red"</code>), and a parameter with no annotation accepts
+anything, since the plain Python function would too.</p>
+<p>Tools can be <code>async def</code> too — <code>tool.run(...)</code> drives them to completion, or
+await <code>Agent.arun(...)</code> to run a whole turn (including async tools) off the
+event loop:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">fetch_price</span><span class="p">(</span><span class="n">ticker</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Look up a stock price."""</span>
+    <span class="o">...</span>
+
+
+<span class="n">price</span> <span class="o">=</span> <span class="k">await</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="n">fetch_price</span><span class="p">])</span><span class="o">.</span><span class="n">arun</span><span class="p">(</span><span class="s2">"What's AAPL trading at?"</span><span class="p">)</span>
+</code></pre></div>
+<p>When a model requests more than one tool call in the same turn, Unchained runs
+them concurrently on a thread pool (most tools are I/O-bound), then feeds the
+results back in the original order. How many calls arrive in a turn is decided
+by the model, so the pool is capped — <code>Agent(max_tool_workers=8)</code> — rather than
+sized to the request. Extra calls queue and still run; only concurrency is
+bounded.</p>
+<p>Concurrency is fine until a tool races with itself. Mark those <code>exclusive</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span><span class="p">(</span><span class="n">concurrency</span><span class="o">=</span><span class="s2">"exclusive"</span><span class="p">,</span> <span class="n">side_effects</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">append_ledger</span><span class="p">(</span><span class="n">entry</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Two of these at once would interleave, so it runs alone."""</span>
+</code></pre></div>
+<p>An exclusive call <strong>runs on its own</strong> — nothing else from that turn runs while
+it does. Calls keep the order the model asked for, with consecutive parallel
+ones grouped:</p>
+<div class="highlight"><pre><span></span><code>model asks for:  [read, read, append_ledger, read, append_ledger]
+runs as:         {read, read} → append_ledger → read → append_ledger
+</code></pre></div>
+<p>A turn of only parallel tools is a single group.</p>
+<blockquote>
+<p><strong><code>side_effects=True</code> does not serialize anything.</strong> It describes a tool to
+your <code>ToolPolicy</code> and to the audit log. If two concurrent calls would race,
+you must also set <code>concurrency="exclusive"</code>.</p>
+</blockquote>
+<p><strong>The framework cannot infer dependencies, and does not pretend to.</strong> A model
+emits a <em>list</em> of calls it wants; nothing in the protocol says the second
+depends on the first, and no amount of inspection can recover an ordering the
+model never expressed. <code>exclusive</code> is the one thing you can declare: <em>this
+tool must not overlap</em>. If two different tools must run in a particular order,
+that is a relationship only you know — express it in the tools themselves (one
+tool that does both steps), not by hoping the scheduler guesses.</p>
+<p>The guarantee is also <strong>per turn</strong>. Two exclusive calls in the same turn never
+overlap; the same tool called from two concurrent sessions still can, because
+those are separate runs. For process-wide exclusion, take a lock inside the
+tool.</p>
+<h2 id="tool-timeouts">Tool timeouts<a class="headerlink" href="#tool-timeouts" title="Permanent link">&para;</a></h2>
+<p>An LLM call has a timeout; a Python tool can block forever. Give a tool a
+budget, or set a default for all of them:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">fetch_data</span><span class="p">(</span><span class="n">url</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The agent waits 10s, then gives up on it."""</span>
+
+
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="n">fetch_data</span><span class="p">],</span> <span class="n">tool_timeout</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>  <span class="c1"># default for tools</span>
+</code></pre></div>
+<p>A tool's own <code>timeout</code> wins over the agent's default. <code>None</code> (the default)
+means wait forever. On overrun the agent stops waiting and the model receives
+an ordinary tool error, so the loop continues:</p>
+<div class="highlight"><pre><span></span><code>Error: tool 'fetch_data' did not finish within 10s and was abandoned; it may
+still be running, so treat any side effect as unknown rather than as not
+having happened
+</code></pre></div>
+<p><strong>Be clear about what this does not do.</strong> Python cannot cancel a running
+thread, and Unchained does not pretend otherwise:</p>
+<ul>
+<li>The tool keeps running after the timeout. It may still complete — and if it
+  has side effects, <strong>you do not know whether they happened.</strong> Treat the
+  outcome as unknown, not as failed.</li>
+<li>The abandoned thread is not reclaimed until the call ends. Because executor
+  threads are not daemons, a tool that hangs forever can delay interpreter
+  exit.</li>
+<li><strong>Hard cancellation needs process isolation.</strong> Run the work in a subprocess
+  and kill it — see <a href="https://github.com/NiravRVaghasiya/unchained/blob/main/examples/coder.py"><code>examples/coder.py</code></a>. A thread timeout
+  is a liveness guard for the agent loop, not a containment boundary.</li>
+<li><strong>A timeout does not abort a socket read.</strong> HTTP tools still need their own
+  network timeout: <code>requests.get(url, timeout=20)</code>. Without one the request
+  can block for a very long time; the tool timeout frees the agent but leaves
+  the request running and holding a connection.</li>
+</ul>
+<p>Concurrent calls each get their own budget, so one hanging tool does not delay
+its siblings or the turn.</p>
+<h2 id="tool-output-limits">Tool output limits<a class="headerlink" href="#tool-output-limits" title="Permanent link">&para;</a></h2>
+<p>A tool can return megabytes. That overflows the context window, costs money
+every turn it stays in the transcript, and grows memory. Give a tool a budget,
+or set a default:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span><span class="p">(</span><span class="n">max_output_size</span><span class="o">=</span><span class="mi">8_000</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_log</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""At most 8,000 characters reach the model."""</span>
+
+
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="n">read_log</span><span class="p">],</span> <span class="n">max_tool_output_size</span><span class="o">=</span><span class="mi">20_000</span><span class="p">)</span>
+</code></pre></div>
+<p>A tool's own <code>max_output_size</code> wins over the agent's default; <code>None</code> (the
+default) means unbounded. The budget is applied inside <code>Agent._execute</code>,
+<strong>before</strong> the result enters memory, reaches a provider, or is shown to a
+callback — there is no path where the full text gets through.</p>
+<p><strong>Nothing is truncated silently.</strong> An oversized result keeps its first <code>n</code>
+characters and gains a note:</p>
+<div class="highlight"><pre><span></span><code>[output truncated: 8,000 of 1,250,000 characters shown for tool 'read_log']
+</code></pre></div>
+<p><strong>JSON is never silently corrupted.</strong> If the full result was valid JSON, the
+note says so and warns that the fragment will not parse — because a model
+handed JSON will otherwise try:</p>
+<div class="highlight"><pre><span></span><code>... The full result was valid JSON; this fragment is cut mid-structure and
+will not parse.
+</code></pre></div>
+<p>Structured output that <em>fits</em> is passed through byte-for-byte, so a JSON tool
+under its budget still returns parseable JSON.</p>
+<p>The budget counts <strong>characters, not bytes</strong>. Python strings are sequences of
+code points, so a slice can never split one and produce invalid text — 40 CJK
+characters cost 40, not the 120 bytes they occupy. A multi-character emoji
+sequence can be split, which is cosmetic. Characters also line up with
+<code>Memory(max_tokens=...)</code>, which estimates tokens the same way.</p>
+<p>Each truncation is also logged as a warning on the <code>unchained</code> logger, if you
+want to alert on it. It is not an exception — the tool succeeded, and a
+shortened result is still useful.</p>
+<blockquote>
+<p><strong>This is a context and cost boundary, not a security sandbox.</strong> It limits
+what a tool <em>sends onward</em>; it does not stop a tool reading, computing or
+transmitting anything, and a secret inside the retained prefix is retained.
+To contain a hostile tool you need process isolation and a policy — see
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/examples/coder.py"><code>examples/coder.py</code></a> and
+<a href="#tool-authorization">Tool authorization</a>.</p>
+</blockquote>
+<h2 id="run-budgets">Run budgets<a class="headerlink" href="#run-budgets" title="Permanent link">&para;</a></h2>
+<p>Individual limits stop individual things. A budget bounds a whole run:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">Agent</span><span class="p">,</span> <span class="n">Budget</span><span class="p">,</span> <span class="n">BudgetExceededError</span>
+
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span>
+    <span class="n">llm</span><span class="p">,</span>
+    <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span>
+    <span class="n">budget</span><span class="o">=</span><span class="n">Budget</span><span class="p">(</span>
+        <span class="n">max_tool_calls</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+        <span class="n">max_total_tokens</span><span class="o">=</span><span class="mi">50_000</span><span class="p">,</span>
+        <span class="n">max_tool_output</span><span class="o">=</span><span class="mi">200_000</span><span class="p">,</span>
+        <span class="n">timeout</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+
+<span class="n">session</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">session</span><span class="p">()</span>
+<span class="k">try</span><span class="p">:</span>
+    <span class="n">answer</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"research this thoroughly"</span><span class="p">)</span>
+<span class="k">except</span> <span class="n">BudgetExceededError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">limit_name</span><span class="p">,</span> <span class="n">exc</span><span class="o">.</span><span class="n">limit</span><span class="p">,</span> <span class="n">exc</span><span class="o">.</span><span class="n">used</span><span class="p">)</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Budget</th>
+<th>Bounds</th>
+<th>On exhaustion</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_iterations</code></td>
+<td>think/act cycles</td>
+<td><strong>forces a final answer</strong> (no raise)</td>
+</tr>
+<tr>
+<td><code>max_tool_calls</code></td>
+<td>tool calls in the run</td>
+<td><code>ToolCallBudgetExceeded</code></td>
+</tr>
+<tr>
+<td><code>max_total_tokens</code></td>
+<td>prompt + completion tokens</td>
+<td><code>TokenBudgetExceeded</code></td>
+</tr>
+<tr>
+<td><code>max_tool_output</code></td>
+<td>total characters of tool output</td>
+<td><code>ToolOutputBudgetExceeded</code></td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>wall-clock seconds</td>
+<td><code>TimeBudgetExceeded</code></td>
+</tr>
+<tr>
+<td><code>max_cost</code></td>
+<td>estimated spend</td>
+<td><code>CostBudgetExceeded</code></td>
+</tr>
+</tbody>
+</table>
+<p>All subclass <code>BudgetExceededError</code>, and each carries <code>.limit_name</code>, <code>.limit</code>
+and <code>.used</code>.</p>
+<p><strong><code>max_iterations</code> is the exception that does not raise.</strong> Running out of
+turns ends with one final call and an answer — ending a turn with nothing is
+worse than one more call. It defaults to the agent's own <code>max_iterations</code>.</p>
+<p><strong>Budgets are per run</strong>, not per session: a ten-turn conversation gets the
+budget ten times. Lifetime token accounting is <code>session.usage</code>, which keeps
+accumulating. A session can carry its own budget, so one agent can serve
+callers on different allowances:</p>
+<div class="highlight"><pre><span></span><code><span class="n">agent</span><span class="o">.</span><span class="n">session</span><span class="p">(</span><span class="n">budget</span><span class="o">=</span><span class="n">Budget</span><span class="p">(</span><span class="n">max_tool_calls</span><span class="o">=</span><span class="mi">5</span><span class="p">))</span>  <span class="c1"># overrides the agent's</span>
+</code></pre></div>
+<p><strong>No tool call escapes the budget.</strong> It is claimed on the single path every
+model-requested call takes — before the tool is located or authorized — so
+unknown and policy-denied calls count too.</p>
+<h3 id="reading-what-a-run-spent">Reading what a run spent<a class="headerlink" href="#reading-what-a-run-spent" title="Permanent link">&para;</a></h3>
+<p><code>session.last_run</code> holds the accounting, and stays there afterwards —
+including when a budget stopped the run:</p>
+<div class="highlight"><pre><span></span><code><span class="n">session</span><span class="o">.</span><span class="n">last_run</span><span class="o">.</span><span class="n">snapshot</span><span class="p">()</span>
+<span class="c1"># {'run_id': '09a56d21a187', 'iterations': 3, 'tool_calls': 7,</span>
+<span class="c1">#  'tool_output_chars': 4120, 'usage': {...}, 'elapsed': 2.41,</span>
+<span class="c1">#  'estimated_cost': 0.0032, 'cost_is_complete': True, 'exceeded': None}</span>
+</code></pre></div>
+<h3 id="cost-estimates">Cost estimates<a class="headerlink" href="#cost-estimates" title="Permanent link">&para;</a></h3>
+<p>Unchained ships <strong>no price table</strong>. Published prices change, and a table
+baked into the framework would quietly go stale — a cost cap computed from stale
+numbers is worse than no cap. You supply the rates, per 1M tokens:</p>
+<div class="highlight"><pre><span></span><code><span class="n">Budget</span><span class="p">(</span><span class="n">max_cost</span><span class="o">=</span><span class="mf">0.50</span><span class="p">,</span> <span class="n">pricing</span><span class="o">=</span><span class="p">{</span><span class="s2">"gpt-4o-mini"</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.15</span><span class="p">,</span> <span class="mf">0.60</span><span class="p">)})</span>
+</code></pre></div>
+<ul>
+<li><code>Budget(max_cost=...)</code> <strong>without</strong> <code>pricing</code> raises at construction.</li>
+<li>A model missing from <code>pricing</code> while <code>max_cost</code> is set raises
+  <code>CostBudgetExceeded</code> rather than costing it as zero — a cap that cannot be
+  computed cannot be enforced.</li>
+<li>With no cap, an unpriced call just sets <code>cost_is_complete = False</code>.</li>
+<li>The figure is <code>estimated_cost</code>, derived from the provider's own token
+  counts. It is an estimate, never an invoice.</li>
+</ul>
+<p><strong>What a budget gates, and what it counts.</strong> Limits are checked at the top of
+every iteration and before every tool call. A call's cost is not known until
+it returns, so the call that crosses a limit completes, and the calls that
+close a run — the forced final answer, structured-output formatting and
+repair, the streamed reply — are not gated: a run that reaches a limit on its
+last loop call still finishes them. The next iteration or tool call raises.
+The exception is <code>max_tool_output</code>: a result's size is known only once the
+tool returns, so the call that pushes the total past the cap raises at once
+and its result never reaches memory.
+Budgets and <code>session.usage</code> count the non-streamed calls the agent loop
+makes; they do not count <code>Memory(llm=...)</code> summaries, the streamed answer of
+<code>stream()</code> / <code>events()</code>, or <code>Router.route</code>'s own routing call. This is runtime
+governance, not billing.</p>
+<h2 id="tool-authorization">Tool authorization<a class="headerlink" href="#tool-authorization" title="Permanent link">&para;</a></h2>
+<p>A model asking for a tool is a <em>request</em>, not a decision. Unchained resolves
+that request in Python, before the function runs — never by telling the model
+which tools are safe, which is advice, not a boundary.</p>
+<p>Tools carry optional metadata. It is never shown to the model:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">lookup_order</span><span class="p">(</span><span class="n">order_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Read-only: needs no permission, changes nothing."""</span>
+
+
+<span class="nd">@tool</span><span class="p">(</span><span class="n">permissions</span><span class="o">=</span><span class="p">{</span><span class="s2">"billing:write"</span><span class="p">},</span> <span class="n">side_effects</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">apply_refund</span><span class="p">(</span><span class="n">order_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Side-effecting: gated on a permission the agent must be granted."""</span>
+
+
+<span class="nd">@tool</span><span class="p">(</span><span class="n">permissions</span><span class="o">=</span><span class="p">{</span><span class="s2">"account:delete"</span><span class="p">},</span> <span class="n">requires_approval</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">side_effects</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">delete_account</span><span class="p">(</span><span class="n">customer</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Destructive: a human confirms every call."""</span>
+</code></pre></div>
+<p>A policy decides; the application, not the model, answers approval requests:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">Agent</span><span class="p">,</span> <span class="n">PermissionPolicy</span>
+
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span>
+    <span class="n">llm</span><span class="p">,</span>
+    <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="n">lookup_order</span><span class="p">,</span> <span class="n">apply_refund</span><span class="p">,</span> <span class="n">delete_account</span><span class="p">],</span>
+    <span class="n">policy</span><span class="o">=</span><span class="n">PermissionPolicy</span><span class="p">(</span><span class="n">granted</span><span class="o">=</span><span class="p">{</span><span class="s2">"billing:write"</span><span class="p">}),</span>
+    <span class="n">approve</span><span class="o">=</span><span class="k">lambda</span> <span class="n">request</span><span class="p">:</span> <span class="nb">input</span><span class="p">(</span><span class="sa">f</span><span class="s2">"run </span><span class="si">{</span><span class="n">request</span><span class="p">[</span><span class="s1">'tool'</span><span class="p">]</span><span class="si">}{</span><span class="n">request</span><span class="p">[</span><span class="s1">'arguments'</span><span class="p">]</span><span class="si">}</span><span class="s2">? "</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"y"</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+<p><code>lookup_order</code> runs. <code>apply_refund</code> runs. <code>delete_account</code> is refused — and
+would still be refused if you granted <code>account:delete</code> but wired up no
+approver, because an unanswerable question is a refusal, not a pass.</p>
+<p>Every model-requested call takes the same path, with no way around it:</p>
+<div class="highlight"><pre><span></span><code>claim budget → locate tool → validate arguments → policy.authorize() → approval → audit → execute → bound output
+</code></pre></div>
+<p>A refusal comes back to the model as an observation (a spent budget raises
+instead; see <a href="#run-budgets">Run budgets</a>), so
+it learns and can try something else rather than crashing the run. Every
+decision is auditable:</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">AuditLog</span><span class="p">(</span><span class="n">Callback</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">on_tool_audit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">):</span>  <span class="c1"># decision, tool, arguments, reason, permissions</span>
+        <span class="n">log</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"</span><span class="si">%(decision)s</span><span class="s2"> </span><span class="si">%(tool)s</span><span class="s2">"</span><span class="p">,</span> <span class="n">event</span><span class="p">)</span>
+</code></pre></div>
+<p>Write your own rules by subclassing <code>ToolPolicy</code> — raise
+<code>ToolAuthorizationError</code> to deny:</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">BusinessHoursOnly</span><span class="p">(</span><span class="n">ToolPolicy</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">authorize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tool</span><span class="p">,</span> <span class="n">arguments</span><span class="p">,</span> <span class="n">context</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">tool</span><span class="o">.</span><span class="n">side_effects</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_working_hours</span><span class="p">():</span>
+            <span class="k">raise</span> <span class="n">ToolAuthorizationError</span><span class="p">(</span><span class="s2">"no writes outside business hours"</span><span class="p">)</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">authorize</span><span class="p">(</span><span class="n">tool</span><span class="p">,</span> <span class="n">arguments</span><span class="p">,</span> <span class="n">context</span><span class="p">)</span>
+</code></pre></div>
+<p>For a rule that depends on the arguments, put it on the tool itself:</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@tool</span><span class="p">(</span><span class="n">allowed</span><span class="o">=</span><span class="k">lambda</span> <span class="n">arguments</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">arguments</span><span class="p">[</span><span class="s2">"path"</span><span class="p">]</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"/safe/"</span><span class="p">))</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_file</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span> <span class="o">...</span>
+</code></pre></div>
+<p>With no <code>policy=</code>, the default <code>ToolPolicy</code> allows every tool the agent was
+given, subject only to each tool's own <code>allowed=</code> hook and <code>requires_approval</code>
+flag. The boundary is always there; its default answer is yes. See
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/examples/policy.py"><code>examples/policy.py</code></a> for a runnable walkthrough, and
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/SECURITY.md">SECURITY.md</a> for what is and isn't enforced.</p>
+<h2 id="trust-boundaries">Trust boundaries<a class="headerlink" href="#trust-boundaries" title="Permanent link">&para;</a></h2>
+<p>A retrieved document and a tool result are <strong>not</strong> instructions. Both are
+fenced with a random per-agent marker before they reach a provider, and any
+occurrence of that marker is stripped from the text, so the content cannot
+close its own block:</p>
+<div class="highlight"><pre><span></span><code>&lt;&lt;document-9f2a1c4b7e8d0a35&gt;&gt;
+[score=0.87]
+...retrieved text...
+&lt;&lt;/document-9f2a1c4b7e8d0a35&gt;&gt;
+
+what is my balance?
+</code></pre></div>
+<p>The conversation summary is fenced too — it is written by the model from
+earlier turns and spliced into the <em>system</em> message, so unfenced it is a path
+from a tool result into your instructions.</p>
+<p>Retrieved documents are stored beside the user's turn rather than spliced
+into it, so <code>session.memory</code> records what the user actually said.</p>
+<blockquote>
+<p><strong>This does not solve prompt injection, and no system prompt does.</strong> A
+persuasive document may still talk a model into something you did not want.
+Fencing means the model is <em>told</em> where the boundary is and the data cannot
+<em>move</em> it. The boundary that holds is in Python: <code>permissions</code> are a
+frozenset fixed at decoration, <code>ToolPolicy</code> sees the tool, the arguments and
+a context built from your code — never from retrieved or returned text — and
+approval is your callback. Assume the model will eventually request the
+wrong tool, and make the policy refuse it.</p>
+<p>See <a href="https://github.com/NiravRVaghasiya/unchained/blob/main/SECURITY.md">SECURITY.md</a> for the full trust ladder and its limits.</p>
+</blockquote>
+<h2 id="sessions">Sessions<a class="headerlink" href="#sessions" title="Permanent link">&para;</a></h2>
+<p>An <code>Agent</code> is configuration and behaviour: the LLM, the tools, the prompt, the
+policy. A <strong><code>Session</code></strong> is one conversation's state: its memory, its token
+counters, its metadata. Build the agent once and give every user a session:</p>
+<div class="highlight"><pre><span></span><code><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">])</span>  <span class="c1"># build once, share freely</span>
+
+<span class="n">alice</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">session</span><span class="p">(</span><span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"user"</span><span class="p">:</span> <span class="s2">"alice"</span><span class="p">})</span>
+<span class="n">bob</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">session</span><span class="p">(</span><span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"user"</span><span class="p">:</span> <span class="s2">"bob"</span><span class="p">})</span>
+
+<span class="n">alice</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"my name is Alice"</span><span class="p">)</span>
+<span class="n">bob</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"what is my name?"</span><span class="p">)</span>  <span class="c1"># cannot see Alice's history</span>
+</code></pre></div>
+<p>That makes an agent safe to hold in a module-level variable and serve from many
+request handlers at once. The isolation is structural, not lock-based: each
+session owns its own <code>Memory</code> and usage counters, and no conversational state
+lives on the Agent, so two sessions have nothing to contend over.</p>
+<div class="highlight"><pre><span></span><code><span class="n">alice</span><span class="o">.</span><span class="n">usage</span>  <span class="c1"># {'prompt_tokens': ..., ...} for this conversation only</span>
+<span class="n">alice</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span>  <span class="c1"># start this conversation over</span>
+</code></pre></div>
+<p><strong><code>agent.run(...)</code></strong> uses one persistent default session:</p>
+<div class="highlight"><pre><span></span><code><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
+<span class="n">agent</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"hello"</span><span class="p">)</span>
+<span class="n">agent</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"what did I just say?"</span><span class="p">)</span>  <span class="c1"># remembers - one persistent conversation</span>
+</code></pre></div>
+<p>That <strong>default session</strong> is created on first use and reused for the life of
+the agent — <code>agent.memory</code> and <code>agent.usage</code> are that session's. Because it
+persists, <code>agent.run()</code> is for single-conversation scripts; serving several
+users means one session each. <code>agent.reset()</code> clears the default conversation
+and leaves other sessions alone.</p>
+<p>Sessions get their memory from <code>memory_factory</code>, so configuration carries into
+every conversation without any two sharing an instance:</p>
+<div class="highlight"><pre><span></span><code><span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">memory_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">Memory</span><span class="p">(</span><span class="n">max_messages</span><span class="o">=</span><span class="mi">50</span><span class="p">))</span>
+
+<span class="c1"># ...or hand one session a specific store, e.g. for per-user persistence:</span>
+<span class="n">session</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">session</span><span class="p">(</span><span class="n">memory</span><span class="o">=</span><span class="n">SQLiteMemory</span><span class="p">(</span><span class="n">session_id</span><span class="o">=</span><span class="n">user_id</span><span class="p">))</span>
+</code></pre></div>
+<p>Three things are deliberately shared by every session of an agent, because
+they are resources rather than conversation state: the <code>llm</code> (its connection
+pool and response cache), the <code>rag</code> knowledge base, and Agent-level
+<code>callbacks</code>. Pass <code>agent.session(callbacks=[...])</code> for a sink scoped to one
+conversation. A single <code>Session</code> is one conversation, so it is not itself
+meant to be driven by two threads at once.</p>
+<p><code>Router</code> gives every agent a fresh session per dispatch, so concurrent
+<code>run_all</code> calls never land in the same agent's history. <code>route()</code> only
+chooses; the Agent it returns runs in its default session unless you give it
+one. See <a href="https://github.com/NiravRVaghasiya/unchained/blob/main/examples/sessions.py"><code>examples/sessions.py</code></a>.</p>
+<h2 id="memory">Memory<a class="headerlink" href="#memory" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">Memory</span>
+
+<span class="n">memory</span> <span class="o">=</span> <span class="n">Memory</span><span class="p">(</span><span class="n">max_messages</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">llm</span><span class="o">=</span><span class="n">llm</span><span class="p">)</span>  <span class="c1"># overflow is summarised by the LLM</span>
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">memory</span><span class="o">=</span><span class="n">memory</span><span class="p">)</span>
+</code></pre></div>
+<p>When the window fills up, the oldest half is compressed into a running summary
+so token usage stays predictable. A message-count cap alone can't promise a
+token budget (a handful of very long messages can still overflow the context
+window), so pass <code>max_tokens</code> too to shrink the window further whenever the
+kept messages alone would exceed it (estimated at ~4 chars/token, no tokenizer
+dependency):</p>
+<div class="highlight"><pre><span></span><code><span class="n">memory</span> <span class="o">=</span> <span class="n">Memory</span><span class="p">(</span><span class="n">max_messages</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">4000</span><span class="p">,</span> <span class="n">llm</span><span class="o">=</span><span class="n">llm</span><span class="p">)</span>
+</code></pre></div>
+<h2 id="rag">RAG<a class="headerlink" href="#rag" title="Permanent link">&para;</a></h2>
+<p>TF-IDF with smoothed (sklearn-style) IDF and cosine similarity — accurate even
+on a handful of documents, and it runs entirely in memory.</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">RAG</span>
+
+<span class="n">rag</span> <span class="o">=</span> <span class="n">RAG</span><span class="p">()</span>
+<span class="n">rag</span><span class="o">.</span><span class="n">add_many</span><span class="p">(</span>
+    <span class="p">[</span>
+        <span class="s2">"Unchained is a single-file agent framework."</span><span class="p">,</span>
+        <span class="s2">"It supports OpenAI, Anthropic and Ollama."</span><span class="p">,</span>
+    <span class="p">]</span>
+<span class="p">)</span>
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">rag</span><span class="o">=</span><span class="n">rag</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">agent</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"Which providers does Unchained support?"</span><span class="p">))</span>
+</code></pre></div>
+<p>Need semantic search? Pass <code>embed_fn=...</code> (<code>list[str] -&gt; list[list[float]]</code>) to
+use dense embeddings instead — TF-IDF stays the zero-dependency default:</p>
+<div class="highlight"><pre><span></span><code><span class="n">rag</span> <span class="o">=</span> <span class="n">RAG</span><span class="p">(</span><span class="n">embed_fn</span><span class="o">=</span><span class="n">my_embedding_model</span><span class="p">)</span>  <span class="c1"># e.g. OpenAI or sentence-transformers</span>
+</code></pre></div>
+<p><strong>Inputs are validated, because the failures here are silent ones.</strong> A vector
+of the wrong width would otherwise be zipped against a longer one and score a
+perfect 1.0; a negative <code>top_k</code> would slice the ranked list from the end and
+return everything <em>except</em> the best match. So:</p>
+<ul>
+<li><code>embed_fn</code> must return exactly one vector per text, in order.</li>
+<li>The index fixes its dimension on the first vector it accepts; every later
+  vector — document or query — must match. <code>rag.dimension</code> reports it.</li>
+<li>Vectors must be non-empty and finite. A <strong>zero vector is fine</strong> — some
+  models emit one for input they can't represent — and scores 0.0.</li>
+<li>Documents must be non-empty strings; <code>top_k</code> must be an integer ≥ 1.</li>
+<li><strong>Nothing is stored until all of it validates</strong>, so a failing <code>embed_fn</code>
+  leaves the index exactly as it was rather than half-added.</li>
+</ul>
+<p>In TF-IDF mode a query with no indexable tokens (<code>""</code>, <code>"!!!"</code>) returns
+nothing. Having nothing to search <em>with</em> is different from having searched and
+found nothing similar, and returning arbitrary documents scored 0.0 only looks
+like a result.</p>
+<p>Duplicate documents are kept rather than merged — the same text can
+legitimately arrive twice from different sources — and equal scores keep
+insertion order.</p>
+<p>Each document can carry metadata, returned alongside every hit:</p>
+<div class="highlight"><pre><span></span><code><span class="n">rag</span><span class="o">.</span><span class="n">add_many</span><span class="p">([</span><span class="s2">"..."</span><span class="p">,</span> <span class="s2">"..."</span><span class="p">],</span> <span class="p">[{</span><span class="s2">"source"</span><span class="p">:</span> <span class="s2">"handbook.md"</span><span class="p">},</span> <span class="p">{</span><span class="s2">"source"</span><span class="p">:</span> <span class="s2">"faq.md"</span><span class="p">}])</span>
+<span class="n">rag</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="s2">"holiday policy"</span><span class="p">)</span>  <span class="c1"># -&gt; [{"text": ..., "score": ..., "metadata": {...}}]</span>
+</code></pre></div>
+<p><strong>What this is not.</strong> There is no automatic chunking — split long documents
+yourself before adding them (see
+<a href="https://github.com/NiravRVaghasiya/unchained/tree/main/examples/pickmystack/"><code>examples/pickmystack/</code></a> for one way). There is no
+metadata filtering: <code>search()</code> takes a query and <code>top_k</code>, and ranks the whole
+corpus. Nothing is persisted — the index lives in memory and is rebuilt on
+each start. Scoring is a linear scan over every document, which is fine for
+hundreds or a few thousand chunks and is not a vector database. If you outgrow
+it, keep the <code>Agent</code> and put a real index behind the same <code>search()</code> shape.</p>
+<h2 id="structured-output">Structured output<a class="headerlink" href="#structured-output" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Recipe</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+    <span class="n">title</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">steps</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">minutes</span><span class="p">:</span> <span class="nb">int</span>
+
+
+<span class="n">recipe</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"Give me a quick pasta recipe."</span><span class="p">,</span> <span class="n">response_format</span><span class="o">=</span><span class="n">Recipe</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">recipe</span><span class="o">.</span><span class="n">title</span><span class="p">,</span> <span class="n">recipe</span><span class="o">.</span><span class="n">minutes</span><span class="p">)</span>  <span class="c1"># a real, validated Recipe instance</span>
+</code></pre></div>
+<h3 id="self-healing-structured-output">Self-healing structured output<a class="headerlink" href="#self-healing-structured-output" title="Permanent link">&para;</a></h3>
+<p>If the model returns JSON that fails validation, the agent feeds the error and
+schema back and asks it to fix the output before giving up (<code>structured_retries</code>).</p>
+<h2 id="multi-agent-routing">Multi-agent routing<a class="headerlink" href="#multi-agent-routing" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">Router</span>
+
+<span class="n">router</span> <span class="o">=</span> <span class="n">Router</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">agents</span><span class="o">=</span><span class="p">[</span><span class="n">cost_agent</span><span class="p">,</span> <span class="n">fit_agent</span><span class="p">,</span> <span class="n">trend_agent</span><span class="p">],</span> <span class="n">synthesizer</span><span class="o">=</span><span class="n">synth</span><span class="p">)</span>
+
+<span class="n">router</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"How much will this cost?"</span><span class="p">)</span>  <span class="c1"># route to one agent, in a fresh session</span>
+<span class="n">router</span><span class="o">.</span><span class="n">run_all</span><span class="p">(</span><span class="s2">"Compare these options"</span><span class="p">)</span>  <span class="c1"># every agent, in parallel</span>
+<span class="n">router</span><span class="o">.</span><span class="n">synthesize</span><span class="p">(</span><span class="s2">"Recommend a stack for my team"</span><span class="p">)</span>  <span class="c1"># run all, then fuse</span>
+</code></pre></div>
+<p><strong>Routing fails closed.</strong> Agents differ in the tools — and so the privileges —
+they carry, so picking the wrong one is an authorization mistake, not just a
+quality one.</p>
+<p>The decision is asked for as JSON, constrained to the registered agent names,
+and then <strong>checked against the registry in Python</strong>. The prompt is where the
+model is told what is allowed; the lookup is what enforces it — nothing the
+model writes can name an agent the router does not hold.</p>
+<p>A decision is valid only if it identifies exactly one registered agent, and
+only two reply shapes can: a JSON decision, <code>{"agent": "cost"}</code>, or a bare
+agent name (case and surrounding whitespace are ignored). Everything else
+raises <code>RoutingError</code>: an empty reply, a refusal, a hallucinated name,
+malformed JSON, and prose — even prose naming exactly one agent ("The best
+agent is cost."), because matching words cannot tell "use cost" from "not
+cost". Ambiguity is a failure, not a contest — it is never broken by order or
+preference.</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">RoutingError</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="n">agent</span> <span class="o">=</span> <span class="n">router</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="n">query</span><span class="p">)</span>  <span class="c1"># the decision only; run it with agent.session().run(query)</span>
+<span class="k">except</span> <span class="n">RoutingError</span><span class="p">:</span>
+    <span class="o">...</span>  <span class="c1"># ask the user, or refuse</span>
+</code></pre></div>
+<p>Prefer a default destination? Name it, and the choice stays visible in the code:</p>
+<div class="highlight"><pre><span></span><code><span class="n">router</span> <span class="o">=</span> <span class="n">Router</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">agents</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span> <span class="n">fallback</span><span class="o">=</span><span class="n">triage_agent</span><span class="p">)</span>
+</code></pre></div>
+<p>Agent names are validated when the <code>Router</code> is built: a blank name, or two
+that collide once case and spacing are normalised, raises immediately.</p>
+<p>Models that answer in prose fail closed too. The routing call puts OpenAI
+(<code>json_object</code>) and Ollama (<code>format="json"</code>) into JSON mode; Anthropic has no
+JSON mode, so there only the prompt asks for JSON. With <code>fallback=</code> set, every
+reply that does not resolve goes to the fallback agent instead of raising.</p>
+<h2 id="streaming">Streaming<a class="headerlink" href="#streaming" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">agent</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="s2">"Write a haiku about databases."</span><span class="p">):</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">token</span><span class="p">,</span> <span class="n">end</span><span class="o">=</span><span class="s2">""</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+<p><code>LLM.stream()</code> works for all three providers. <code>Agent.stream()</code> resolves any tool
+calls first, then streams the final answer token by token. With tools, that
+costs one extra LLM call: the reply that ended the tool loop is generated again
+as a stream.</p>
+<h2 id="async">Async<a class="headerlink" href="#async" title="Permanent link">&para;</a></h2>
+<p><code>Agent.arun()</code> and <code>LLM.achat()</code> let you <code>await</code> a run from async code (FastAPI,
+aiohttp, ...) without blocking the event loop:</p>
+<div class="highlight"><pre><span></span><code><span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">arun</span><span class="p">(</span><span class="s2">"Summarise this ticket."</span><span class="p">)</span>
+</code></pre></div>
+<p>Under the hood this offloads the (still synchronous, <code>requests</code>-based) call to
+a worker thread via <code>asyncio.to_thread</code> — it keeps your event loop responsive,
+but it is not a non-blocking async HTTP client. The agent loop itself is
+synchronous; for true async sockets on direct LLM calls, override <code>achat()</code> in
+an <code>LLM</code> subclass (see <a href="../ARCHITECTURE/#extension-points">Extending</a>).</p>
+<h2 id="retries">Retries<a class="headerlink" href="#retries" title="Permanent link">&para;</a></h2>
+<p>Rate limits, <code>5xx</code>, and dropped connections are retried with exponential backoff
+and jitter, honouring <code>Retry-After</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">"openai"</span><span class="p">,</span> <span class="n">max_retries</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">backoff</span><span class="o">=</span><span class="mf">0.5</span><span class="p">)</span>
+</code></pre></div>
+<h2 id="response-caching">Response caching<a class="headerlink" href="#response-caching" title="Permanent link">&para;</a></h2>
+<p>Opt in to memoize identical requests — handy for repeated prompts, tests, and
+keeping costs down. The cache is a bounded LRU (evicts the oldest entry past
+<code>cache_size</code>) with an optional TTL, so a long-running process won't leak
+memory indefinitely:</p>
+<div class="highlight"><pre><span></span><code><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">"openai"</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">cache_size</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">cache_ttl</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>  <span class="c1"># 5-minute TTL</span>
+<span class="n">llm</span><span class="o">.</span><span class="n">clear_cache</span><span class="p">()</span>  <span class="c1"># invalidate everything</span>
+</code></pre></div>
+<p><strong>Tool-call responses are not cached.</strong> A plain answer is a fact worth
+remembering; a response asking to call <code>refund(order_id="A-1")</code> is a <em>decision
+to act</em>. Caching that would replay the decision on the next identical prompt —
+the same refund, the same email — without the model being asked again, and
+without a request going out to reveal it. The world the decision was made in
+has moved on; the cached answer has not.</p>
+<p>So <code>cache=True</code> means <code>"final_only"</code>: plain answers are stored, tool-call
+responses are returned to the caller but never kept.</p>
+<div class="highlight"><pre><span></span><code><span class="n">LLM</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">"openai"</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># "final_only" — the default</span>
+<span class="n">LLM</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">"openai"</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="s2">"none"</span><span class="p">)</span>  <span class="c1"># off</span>
+<span class="n">LLM</span><span class="p">(</span><span class="n">provider</span><span class="o">=</span><span class="s2">"openai"</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="s2">"all"</span><span class="p">)</span>  <span class="c1"># also cache tool-call decisions</span>
+</code></pre></div>
+<p>Use <code>"all"</code> only when every tool in play is read-only. Even then the cache
+only decides <em>what the model is taken to have said</em> — it never executes
+anything. Every tool call still passes the <a href="#tool-authorization">tool policy</a>
+and any approval hook before it runs, cached or fresh.</p>
+<p>The cache key covers everything that can change the answer: provider, base
+URL, model, temperature, <code>max_tokens</code>, the messages, the <strong>full tool schemas</strong>,
+and the response-format schema. Tools are keyed by schema rather than name
+because two tools can share a name and differ completely — a <code>search</code> over
+public docs and a <code>search</code> over internal records — and response formats are
+keyed by schema because unrelated models are so often both called <code>Item</code>.</p>
+<h2 id="connection-reuse">Connection reuse<a class="headerlink" href="#connection-reuse" title="Permanent link">&para;</a></h2>
+<p>Each <code>LLM</code> instance keeps a persistent <code>requests.Session</code>, so repeated calls
+reuse the underlying TCP/TLS connection instead of renegotiating one per
+request. Call <code>llm.close()</code> when you're done with an instance if you want to
+release it explicitly (otherwise it's cleaned up like any other object).</p>
+<h2 id="observability">Observability<a class="headerlink" href="#observability" title="Permanent link">&para;</a></h2>
+<h3 id="observability-and-tracing">Observability and tracing<a class="headerlink" href="#observability-and-tracing" title="Permanent link">&para;</a></h3>
+<p>Attach callbacks to trace every step, or use the built-in logger:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">unchained</span><span class="w"> </span><span class="kn">import</span> <span class="n">Agent</span><span class="p">,</span> <span class="n">LoggingCallback</span>
+
+<span class="n">logging</span><span class="o">.</span><span class="n">basicConfig</span><span class="p">(</span><span class="n">level</span><span class="o">=</span><span class="n">logging</span><span class="o">.</span><span class="n">INFO</span><span class="p">)</span>
+<span class="n">agent</span> <span class="o">=</span> <span class="n">Agent</span><span class="p">(</span><span class="n">llm</span><span class="p">,</span> <span class="n">tools</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span> <span class="n">callbacks</span><span class="o">=</span><span class="p">[</span><span class="n">LoggingCallback</span><span class="p">()])</span>
+</code></pre></div>
+<p><code>LoggingCallback</code> logs one INFO line per <a href="#structured-events">structured event</a>,
+plus one per tool call with its arguments and the first 120 characters of the
+result, <strong>verbatim</strong> — a development tracer, not a redacted production sink.
+Refusals and timeouts are also logged at WARNING by the agent itself.</p>
+<p>Write your own by subclassing <code>Callback</code> (<code>on_iteration</code>, <code>on_llm_call</code>,
+<code>on_tool_call</code>, <code>on_tool_audit</code>, <code>on_finish</code>, and <code>on_event</code> for the
+structured events below; the base <code>on_event</code> is a no-op). Callback errors are
+logged and swallowed unless <code>Agent(strict_callbacks=True)</code>.</p>
+<h3 id="structured-events">Structured events<a class="headerlink" href="#structured-events" title="Permanent link">&para;</a></h3>
+<p>For logging, metrics and debugging, subscribe to the event stream instead of
+overriding a method per hook:</p>
+<div class="highlight"><pre><span></span><code><span class="n">stop</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">subscribe</span><span class="p">(</span><span class="k">lambda</span> <span class="n">event</span><span class="p">:</span> <span class="n">log</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">event</span><span class="p">))</span>
+<span class="c1"># AgentStarted run=09a56d21a187 model=gpt-4o-mini</span>
+<span class="c1"># LLMFinished  run=09a56d21a187 model=gpt-4o-mini 412ms tokens=25</span>
+<span class="c1"># ToolStarted  run=09a56d21a187 tool=search</span>
+<span class="c1"># ToolFinished run=09a56d21a187 tool=search 88ms</span>
+<span class="c1"># AgentFinished run=09a56d21a187 1204ms tokens=63</span>
+<span class="n">stop</span><span class="p">()</span>
+</code></pre></div>
+<p>Each <code>AgentEvent</code> is a frozen record with <code>event_type</code>, <code>run_id</code>,
+<code>session_id</code>, <code>agent</code>, <code>timestamp</code>, and — where they apply — <code>duration</code>,
+<code>model</code>, <code>tool</code>, <code>tool_call_id</code>, <code>usage</code> and <code>metadata</code>. <code>as_dict()</code> gives you
+a plain dict for structured logging. It is JSON-safe with the default
+redaction; with <code>event_payloads=True</code> a payload can hold an Enum member or a
+Pydantic model, so use <code>json.dumps(event.as_dict(), default=str)</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AgentStarted</code> / <code>AgentFinished</code> / <code>AgentFailed</code></td>
+<td>a run begins, answers, or raises</td>
+</tr>
+<tr>
+<td><code>AgentIteration</code></td>
+<td>a think/act cycle begins</td>
+</tr>
+<tr>
+<td><code>LLMStarted</code> / <code>LLMFinished</code></td>
+<td>a provider request goes out and comes back</td>
+</tr>
+<tr>
+<td><code>ToolStarted</code> / <code>ToolFinished</code></td>
+<td>an authorized tool call runs</td>
+</tr>
+<tr>
+<td><code>ToolFailed</code></td>
+<td>a call produced no result</td>
+</tr>
+</tbody>
+</table>
+<p><code>ToolFailed</code> can arrive with no preceding <code>ToolStarted</code> — a call refused
+before it ran never started. <code>metadata["reason"]</code> says which stage refused it:
+<code>unknown_tool</code>, <code>invalid_arguments</code>, <code>denied</code>, <code>approval_denied</code>, <code>timeout</code> or
+<code>raised</code>. That distinction is the point: "the tool broke" and "the tool was
+not allowed to run" are different numbers on a dashboard.</p>
+<p><strong><code>run_id</code> is unique per run</strong>, so events from concurrent runs never
+interleave ambiguously; <code>session_id</code> is stable across a conversation.</p>
+<blockquote>
+<p><strong>Payloads are excluded by default.</strong> Prompts, tool arguments, tool results
+and the final answer are where personal data and credentials live, and an
+event stream usually ends up in a log aggregator. Events carry shapes and
+sizes instead — message counts, character counts. Pass
+<code>Agent(event_payloads=True)</code> to include the content itself, deliberately.</p>
+</blockquote>
+<p>Handler errors are logged and swallowed, so a broken metrics sink never costs
+you an answer the model already produced. In tests that hides bugs, so
+<code>Agent(strict_callbacks=True)</code> re-raises instead.</p>
+<h3 id="watching-a-run-as-it-happens">Watching a run as it happens<a class="headerlink" href="#watching-a-run-as-it-happens" title="Permanent link">&para;</a></h3>
+<p>Callbacks are push-based. When you'd rather iterate, <code>events()</code> yields the
+whole lifecycle — not just answer tokens:</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">event</span> <span class="ow">in</span> <span class="n">agent</span><span class="o">.</span><span class="n">events</span><span class="p">(</span><span class="s2">"research this"</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">event</span><span class="o">.</span><span class="n">event_type</span> <span class="o">==</span> <span class="s2">"LLMDelta"</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span> <span class="n">end</span><span class="o">=</span><span class="s2">""</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">event_type</span> <span class="o">==</span> <span class="s2">"ToolStarted"</span><span class="p">:</span>
+        <span class="n">spinner</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="sa">f</span><span class="s2">"calling </span><span class="si">{</span><span class="n">event</span><span class="o">.</span><span class="n">tool</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">event</span><span class="o">.</span><span class="n">event_type</span> <span class="o">==</span> <span class="s2">"FinalResponse"</span><span class="p">:</span>
+        <span class="n">save</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">"answer"</span><span class="p">])</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>AgentStarted → AgentIteration → LLMStarted → LLMFinished
+             → ToolStarted → ToolFinished
+             → AgentIteration → LLMStarted → LLMFinished
+             → LLMDelta × n → AgentFinished → FinalResponse
+</code></pre></div>
+<p>Every event carries <code>run_id</code> and <code>session_id</code>, so concurrent runs never blur
+together. <code>session.events(...)</code> is the per-conversation form.</p>
+<p><code>stream=False</code> uses the ordinary <code>run()</code> path instead: no deltas, but <strong>every
+other event still appears, including the tool ones</strong> — and <code>response_format</code>
+works, which streaming cannot support.</p>
+<p>Provider differences are already normalised: OpenAI's and Anthropic's SSE and
+Ollama's JSON lines all arrive as plain <code>LLMDelta</code> text. Streamed <em>tool calls</em>
+are not normalised — providers differ too much — so tool calls are resolved
+before the answer streams, which is why tool events arrive first either way.</p>
+<p><code>LLMDelta</code> and <code>FinalResponse</code> exist only here and are never sent to
+callbacks. They carry their content in full, which is the point of asking for
+them, and they go to one in-process consumer rather than to whatever log sink
+is attached — where a per-token flood would be unwelcome anyway. Everything
+that <em>does</em> reach callbacks still redacts payloads unless
+<code>event_payloads=True</code>.</p>
+<blockquote>
+<p>The run happens on a worker thread. Abandoning the iterator does <strong>not</strong>
+cancel it — Python cannot cancel a running thread — so the turn finishes in
+the background. An exception from the run is re-raised at the iterator, so
+failures surface the way <code>run()</code>'s would.</p>
+</blockquote>
+<h2 id="provider-responses">Provider responses<a class="headerlink" href="#provider-responses" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p><strong>Anthropic: always pass <code>model=</code>.</strong> <code>LLM(provider="anthropic")</code> without
+<code>model=</code> still defaults to <code>claude-3-5-sonnet-20241022</code>, which Anthropic
+retired on Oct 28, 2025. Unchained also always sends <code>temperature</code> (the
+<code>LLM</code> default is 0.7) with <code>anthropic-version: 2023-06-01</code>, and Claude 4.7
+and later models reject that. Claude 4.6 models accept it, so
+<code>LLM(provider="anthropic", model="claude-sonnet-4-6")</code> (or
+<code>claude-opus-4-6</code>) works as is. Claude Sonnet 5.5 and Haiku 5.5 accept only
+the default value, so pass <code>temperature=1</code> with them. Claude Opus 5.5
+rejects <code>temperature</code> entirely, so it does not work with Unchained yet.</p>
+</blockquote>
+<p>Every provider is reduced to the same <code>LLMResponse</code>, so nothing downstream
+needs to know which one replied:</p>
+<div class="highlight"><pre><span></span><code><span class="n">response</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">chat</span><span class="p">([{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"hi"</span><span class="p">}])</span>
+
+<span class="n">response</span><span class="o">.</span><span class="n">content</span>  <span class="c1"># the assistant text</span>
+<span class="n">response</span><span class="o">.</span><span class="n">tool_calls</span>  <span class="c1"># [{"name", "arguments", "id"}], arguments parsed</span>
+<span class="n">response</span><span class="o">.</span><span class="n">usage</span>  <span class="c1"># prompt_tokens / completion_tokens / total_tokens</span>
+<span class="n">response</span><span class="o">.</span><span class="n">finish_reason</span>  <span class="c1"># "stop" | "tool_calls" | "length" | "content_filter"</span>
+<span class="n">response</span><span class="o">.</span><span class="n">provider</span>  <span class="c1"># "openai" | "anthropic" | "ollama" ("mock" for MockLLM)</span>
+<span class="n">response</span><span class="o">.</span><span class="n">model</span>  <span class="c1"># what actually answered: "gpt-4o-mini-2024-07-18"</span>
+<span class="n">response</span><span class="o">.</span><span class="n">request_id</span>  <span class="c1"># for quoting to a provider's support</span>
+<span class="n">response</span><span class="o">.</span><span class="n">metadata</span>  <span class="c1"># provider-specific extras, opaque to the agent loop</span>
+</code></pre></div>
+<p><strong><code>finish_reason</code> is worth having.</strong> Anthropic's <code>max_tokens</code>, OpenAI's
+<code>length</code> and Ollama's <code>done_reason</code> all become <code>"length"</code>, and
+<code>response.truncated</code> is True — which is otherwise invisible, so an agent
+would treat a half-finished answer as a complete one. A reason we don't
+recognise is passed through unchanged rather than forced into a bucket, and
+the provider's own wording is always kept in <code>metadata["raw_finish_reason"]</code>.</p>
+<p>Provider-specific detail is preserved rather than discarded, but confined to
+<code>metadata</code> — OpenAI's <code>system_fingerprint</code>, Ollama's timings, Anthropic's
+<code>stop_sequence</code>, and the <code>endpoint</code> that answered (useful when
+<code>provider="openai"</code> is pointed at Groq or vLLM). Nothing in the agent loop
+reads it; it's there for your logs.</p>
+<p>Read access works like a dict — <code>response["content"]</code>,
+<code>response.get("usage")</code>, <code>"usage" in response</code> — and the agent loop reads
+replies that way, so an LLM stand-in returning a plain dict still works. It is
+not a <code>dict</code>: use <code>response.as_dict()</code> for <code>json.dumps</code>, <code>dict(...)</code> or
+anything that mutates it. Its fields can't be reassigned (it is a frozen
+dataclass), but the <code>tool_calls</code>, <code>usage</code> and <code>metadata</code> it holds are ordinary
+lists and dicts shared with the agent loop, so treat them as read-only in
+callbacks.</p>
+<h2 id="token-usage">Token usage<a class="headerlink" href="#token-usage" title="Permanent link">&para;</a></h2>
+<p>Usage is normalised across providers and accumulated per session; <code>agent.usage</code>
+is the default session's:</p>
+<div class="highlight"><pre><span></span><code><span class="n">agent</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="s2">"Summarise this."</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">agent</span><span class="o">.</span><span class="n">usage</span><span class="p">)</span>  <span class="c1"># {'prompt_tokens': ..., 'completion_tokens': ..., 'total_tokens': ...}</span>
+</code></pre></div>
+<h2 id="persistent-memory">Persistent memory<a class="headerlink" href="#persistent-memory" title="Permanent link">&para;</a></h2>
+<p>Swap the in-memory window for a database-backed store — see
+<a href="https://github.com/NiravRVaghasiya/unchained/blob/main/examples/sqlite_memory.py"><code>examples/sqlite_memory.py</code></a> for a <code>SQLiteMemory</code>
+that survives restarts and namespaces conversations by session.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy", "search.suggest"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>
