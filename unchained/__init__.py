@@ -3782,7 +3782,9 @@ class Router:
         """
         names = tuple(sorted(self._registry))
         try:
-            return create_model("RouterDecision", agent=(Literal[names], ...))
+            # Built at runtime from the registry, so it has no static type.
+            allowed: Any = Literal[names]
+            return create_model("RouterDecision", agent=(allowed, ...))
         except Exception:  # pragma: no cover - e.g. a lone surrogate in an agent name
             return None
 
