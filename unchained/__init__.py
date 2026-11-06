@@ -54,27 +54,7 @@ from typing import (
 )
 
 import requests
-
-try:
-    from pydantic import BaseModel, ValidationError
-
-    _HAS_PYDANTIC = True
-except ImportError:  # pragma: no cover
-    BaseModel = object  # type: ignore[assignment,misc]
-    ValidationError = Exception  # type: ignore[assignment,misc]
-    _HAS_PYDANTIC = False
-
-# Runtime argument validation needs Pydantic v2's create_model/ConfigDict.
-# v1 has create_model but no ConfigDict, so this import fails there and tools
-# fall back to structural checks - see Tool.validate_arguments.
-try:
-    from pydantic import ConfigDict, create_model
-
-    _HAS_PYDANTIC_V2 = True
-except ImportError:  # pragma: no cover
-    ConfigDict = None  # type: ignore[assignment,misc]
-    create_model = None  # type: ignore[assignment]
-    _HAS_PYDANTIC_V2 = False
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
 logger = logging.getLogger("unchained")
 logger.addHandler(logging.NullHandler())
@@ -101,7 +81,6 @@ __all__ = [
     "ToolApprovalRequired",
     "ToolArgumentValidationError",
     "ToolTimeoutError",
-    "ToolOutputTruncated",
     "Budget",
     "RunState",
     "BudgetExceededError",
@@ -198,50 +177,6 @@ class CostBudgetExceeded(BudgetExceededError):
     """
 
 
-class ToolOutputTruncated:
-    """Records that a tool result was shortened before the model saw it.
-
-    Deliberately **not** an exception: the tool succeeded, and the shortened
-    result is still useful. It carries what was cut, so an application can log
-    or alert on it, and renders as the note appended to the text the model
-    reads - which is what stops the shortening from being silent.
-    """
-
-    def __init__(self, tool: str, original_size: int, limit: int, was_json: bool = False):
-        self.tool = tool
-        self.original_size = original_size
-        self.limit = limit
-        self.was_json = was_json
-
-    @property
-    def metadata(self) -> Dict[str, Any]:
-        """A plain, JSON-serialisable record - safe for logs and memory extras."""
-        return {
-            "tool": self.tool,
-            "truncated": True,
-            "original_size": self.original_size,
-            "limit": self.limit,
-            "was_json": self.was_json,
-        }
-
-    def __str__(self) -> str:
-        note = (
-            f"\n\n[output truncated: {self.limit:,} of {self.original_size:,} characters "
-            f"shown for tool '{self.tool}']"
-        )
-        if self.was_json:
-            # Say so explicitly. A model handed a JSON fragment will otherwise
-            # try to parse it, and a cut structure is not recoverable.
-            note += (
-                " The full result was valid JSON; this fragment is cut mid-structure "
-                "and will not parse."
-            )
-        return note
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"<ToolOutputTruncated {self.tool} {self.limit}/{self.original_size}>"
-
-
 class ToolTimeoutError(RuntimeError):
     """Raised when a tool call outlives its timeout.
 
@@ -252,18 +187,9 @@ class ToolTimeoutError(RuntimeError):
     """
 
 
-class _RetryableStatus(Exception):
-    """Internal signal that the server returned a retryable HTTP status."""
-
-    def __init__(self, response: requests.Response):
-        self.response = response
-        super().__init__(f"retryable status {response.status_code}")
-
-
 # --- 1. Tool system --------------------------------------------------------
 # How a tool may be scheduled when the model asks for several at once.
-#   "parallel"  - may run alongside anything else. The default, and what
-#                 every tool did before this existed.
+#   "parallel"  - may run alongside anything else. The default.
 #   "exclusive" - runs on its own: nothing else from that turn runs while it
 #                 does. For tools whose concurrent calls would race.
 _CONCURRENCY_MODES = ("parallel", "exclusive")
@@ -303,7 +229,8 @@ def _extract_json(content: str) -> tuple:
 
 
 def _pydantic_schema(model: Type[Any]) -> Dict[str, Any]:
-    """Return a JSON schema for a Pydantic model, across v1 and v2."""
+    """A JSON schema for a Pydantic model - v2, or a ``pydantic.v1`` model,
+    which pydantic 2 still ships - or {} for anything else."""
     if hasattr(model, "model_json_schema"):
         return model.model_json_schema()  # pydantic v2
     if hasattr(model, "schema"):
@@ -393,14 +320,24 @@ class Tool:
         self.timeout = timeout
         self.max_output_size = max_output_size
         self.concurrency = concurrency
-        self.accepts_kwargs = any(
-            param.kind is inspect.Parameter.VAR_KEYWORD
-            for param in inspect.signature(func).parameters.values()
-        )
-        self.schema = self._build_schema(func)  # what the model is shown
-        self._validator = self._build_validator(func)  # what is enforced
+        parameters = list(inspect.signature(func).parameters.values())
+        self.accepts_kwargs = any(p.kind is p.VAR_KEYWORD for p in parameters)
+        # The parameters a caller can name. The schema, the validator and the
+        # structural fallback all read this one list, so they cannot disagree
+        # about which arguments exist.
+        self._params = [
+            p
+            for p in parameters
+            if p.name not in ("self", "cls") and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+        ]
+        try:
+            hints = get_type_hints(func)
+        except Exception:  # pragma: no cover - unresolvable forward refs
+            hints = {}
+        self.schema = self._build_schema(hints)  # what the model is shown
+        self._validator = self._build_validator(hints)  # what is enforced
 
-    def _build_validator(self, func: Callable[..., Any]) -> Optional[Any]:
+    def _build_validator(self, hints: Dict[str, Any]) -> Optional[Any]:
         """Build a Pydantic model from the signature, for runtime validation.
 
         Built from the *signature*, never from :attr:`schema`: the schema is
@@ -408,30 +345,18 @@ class Tool:
         same document the model is free to ignore.
 
         Returns None - leaving :meth:`validate_arguments` on its structural
-        fallback - when Pydantic v2 is absent, or when a signature carries an
-        annotation no model can be built from. Degrading is deliberate: a
-        tool that used to import must not start raising at decoration time
-        because its annotations are unusual.
+        fallback - when a signature carries an annotation no model can be
+        built from. Degrading is deliberate: a tool must not raise at
+        decoration time just because its annotations are unusual.
         """
-        if not _HAS_PYDANTIC_V2:  # pragma: no cover - v2 is the pinned floor
-            return None
-        try:
-            hints = get_type_hints(func)
-        except Exception:  # pragma: no cover - unresolvable forward refs
-            hints = {}
         fields: Dict[str, Any] = {}
-        for name, param in inspect.signature(func).parameters.items():
-            if name in ("self", "cls") or param.kind in (
-                param.VAR_POSITIONAL,
-                param.VAR_KEYWORD,
-            ):
-                continue
+        for param in self._params:
             # An unannotated parameter stays permissive (Any). The schema
             # advertises it as a string, but guessing here would reject
             # arguments that the plain Python function accepts happily.
-            annotation = hints.get(name, Any)
-            default = ... if param.default is inspect.Parameter.empty else param.default
-            fields[name] = (annotation, default)
+            annotation = hints.get(param.name, Any)
+            default = ... if param.default is param.empty else param.default
+            fields[param.name] = (annotation, default)
         config = ConfigDict(
             # A tool without **kwargs cannot receive unknown names; one with
             # **kwargs accepts them by definition.
@@ -492,7 +417,7 @@ class Tool:
             raise ToolArgumentValidationError(
                 f"tool '{self.name}' got non-string argument name(s): {', '.join(unnamed)}"
             )
-        if self._validator is None:  # pragma: no cover - no Pydantic v2
+        if self._validator is None:  # no model could be built - see _build_validator
             return self._validate_structure(arguments)
         # Pydantic's own message embeds the offending input, and this
         # exception's text is handed to the model, written to memory and
@@ -534,18 +459,12 @@ class Tool:
         return "; ".join(details) or "arguments are invalid"
 
     def _validate_structure(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Names-and-required fallback for when Pydantic v2 is unavailable.
+        """Names-and-required fallback for a signature no Pydantic model could be built from.
 
         Derived from the signature, like the real validator - not from
         :attr:`schema`. No types are checked on this path.
         """
-        parameters = inspect.signature(self.func).parameters
-        known = {
-            name
-            for name, param in parameters.items()
-            if name not in ("self", "cls")
-            and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
-        }
+        known = {p.name for p in self._params}
         if not self.accepts_kwargs:
             unknown = sorted(set(arguments) - known)
             if unknown:
@@ -553,30 +472,16 @@ class Tool:
                     f"tool '{self.name}' got unexpected argument(s): {', '.join(unknown)}. "
                     f"It accepts: {', '.join(sorted(known)) or '(none)'}"
                 )
-        missing = [
-            name
-            for name in known
-            if parameters[name].default is inspect.Parameter.empty and name not in arguments
-        ]
+        missing = [p.name for p in self._params if p.default is p.empty and p.name not in arguments]
         if missing:
             raise ToolArgumentValidationError(
                 f"tool '{self.name}' is missing required argument(s): {', '.join(sorted(missing))}"
             )
         return arguments
 
-    def _build_schema(self, func: Callable[..., Any]) -> Dict[str, Any]:
-        sig = inspect.signature(func)
-        try:
-            hints = get_type_hints(func)
-        except Exception:  # pragma: no cover
-            hints = {}
-        properties, required = {}, []
-        for name, param in sig.parameters.items():
-            if name in ("self", "cls") or param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
-                continue
-            properties[name] = self._type_to_schema(hints.get(name, str))
-            if param.default is inspect.Parameter.empty:
-                required.append(name)
+    def _build_schema(self, hints: Dict[str, Any]) -> Dict[str, Any]:
+        properties = {p.name: self._type_to_schema(hints.get(p.name, str)) for p in self._params}
+        required = [p.name for p in self._params if p.default is p.empty]
         return {
             "type": "function",
             "function": {
@@ -590,11 +495,11 @@ class Tool:
         origin = get_origin(hint)
         if origin is Literal:
             return self._enum_schema(get_args(hint))
-        if origin in (list, List):
+        if origin is list:
             args = get_args(hint)
             item = self._type_to_schema(args[0]) if args else {"type": "string"}
             return {"type": "array", "items": item}
-        if origin in (dict, Dict):
+        if origin is dict:
             return {"type": "object"}
         if origin is Union:  # Optional[X] / Union[X, None] -> first real type
             real = [a for a in get_args(hint) if a is not type(None)]
@@ -602,7 +507,7 @@ class Tool:
                 return self._type_to_schema(real[0])
         if isinstance(hint, type) and issubclass(hint, enum.Enum):
             return self._enum_schema([member.value for member in hint])
-        if _HAS_PYDANTIC and isinstance(hint, type) and issubclass(hint, BaseModel):
+        if isinstance(hint, type) and issubclass(hint, BaseModel):
             return _pydantic_schema(hint)
         return {"type": _PY_TO_JSON.get(hint, "string")}
 
@@ -764,9 +669,11 @@ class LLMResponse:
       answered. Deliberately opaque - read it in your own code, and expect
       nothing in the agent loop to interpret it.
 
-    It behaves like the plain dict this used to be (``response["content"]``,
-    ``response.get("usage")``), so existing code and test doubles that return
-    a bare dict keep working. New code can use attributes.
+    It also supports read access like a dict (``response["content"]``,
+    ``response.get("usage")``, ``"usage" in response``), and the agent loop
+    reads replies that way, so a custom LLM or test double may return a
+    plain dict instead. Its fields cannot be reassigned, but the lists and
+    dicts it holds are ordinary ones: treat them as read-only.
     """
 
     content: str = ""
@@ -787,7 +694,7 @@ class LLMResponse:
         """A plain dict, for logging or storage."""
         return asdict(self)
 
-    # -- the mapping face, so the previous dict contract still holds --
+    # -- read access like a dict, so a plain-dict reply works the same --
     def __getitem__(self, key: str) -> Any:
         try:
             return getattr(self, key)
@@ -878,7 +785,7 @@ class LLM:
         tools: Optional[List[Tool]] = None,
         response_format: Optional[Any] = None,
     ) -> LLMResponse:
-        """Send a chat request and return the normalised response dict.
+        """Send a chat request and return it as an :class:`LLMResponse`.
 
         With caching enabled, identical requests are served from an in-memory
         LRU cache (bounded by ``cache_size``, optionally expiring after
@@ -949,9 +856,9 @@ class LLM:
         """Copy a response in and out of the cache.
 
         Callers put responses into conversation memory and read them later;
-        without this, every hit would hand back the *same* dict, and one
-        caller mutating it would silently rewrite what the cache serves
-        everyone else.
+        without this, every hit would hand back the same object - whose
+        tool_calls, usage and metadata are mutable - and one caller mutating
+        it would silently rewrite what the cache serves everyone else.
         """
         # Deep, not shallow: tool-call arguments are nested dicts, and a
         # per-call shallow copy would still share them.
@@ -1102,13 +1009,19 @@ class LLM:
         )
 
     # -- Anthropic --
-    def _anthropic(self, messages, tools, response_format):
-        headers = self._anthropic_headers()
+    def _anthropic_payload(
+        self, messages: List[Dict[str, Any]], tools: Optional[List[Tool]] = None
+    ) -> Dict[str, Any]:
+        """The Messages API body, shared by chat and stream so the two cannot drift.
+
+        Anthropic takes the system prompt - agent instructions and the trust
+        note - as a top-level field rather than as a message.
+        """
         system = "\n\n".join(
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
         convo = [m for m in messages if m.get("role") != "system"]
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model,
             "messages": self._to_anthropic_messages(convo),
             "max_tokens": self.max_tokens,
@@ -1118,7 +1031,13 @@ class LLM:
             payload["system"] = system
         if tools:
             payload["tools"] = [self._anthropic_tool(t) for t in tools]
-        data, headers_out = self._post("/v1/messages", headers=headers, json=payload)
+        return payload
+
+    def _anthropic(self, messages, tools, response_format):
+        payload = self._anthropic_payload(messages, tools)
+        data, headers_out = self._post(
+            "/v1/messages", headers=self._anthropic_headers(), json=payload
+        )
         content, tool_calls = "", []
         for block in data.get("content", []):
             if block.get("type") == "text":
@@ -1321,21 +1240,10 @@ class LLM:
                 yield delta
 
     def _stream_anthropic(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        headers = self._anthropic_headers()
-        system = "\n\n".join(
-            m["content"] for m in messages if m.get("role") == "system" and m.get("content")
+        payload = {**self._anthropic_payload(messages), "stream": True}
+        resp = self._request(
+            "/v1/messages", headers=self._anthropic_headers(), json=payload, stream=True
         )
-        convo = [m for m in messages if m.get("role") != "system"]
-        payload = {
-            "model": self.model,
-            "messages": self._to_anthropic_messages(convo),
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "stream": True,
-        }
-        if system:
-            payload["system"] = system
-        resp = self._request("/v1/messages", headers=headers, json=payload, stream=True)
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data:"):
                 continue
@@ -1387,39 +1295,39 @@ class LLM:
         renegotiating one per request.
         """
         url = f"{self.base_url}{path}"
-        last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
+            final = attempt >= self.max_retries
             try:
                 resp = self.session.post(url, timeout=self.timeout, **kwargs)
-                if resp.status_code in _RETRYABLE_STATUS:
-                    raise _RetryableStatus(resp)
-                resp.raise_for_status()
-                return resp
-            except (requests.ConnectionError, requests.Timeout, _RetryableStatus) as exc:
-                last_error = exc
-                if attempt >= self.max_retries:
-                    break
-                delay = self._retry_delay(exc, attempt)
-                logger.warning(
-                    "request to %s failed (%s); retry %d/%d in %.2fs",
-                    path,
-                    exc,
-                    attempt + 1,
-                    self.max_retries,
-                    delay,
-                )
-                time.sleep(delay)
-        if isinstance(last_error, _RetryableStatus):
-            last_error.response.raise_for_status()
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("request failed without an error")  # pragma: no cover
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if final:
+                    raise
+                reason: object = exc
+                delay = self._retry_delay(None, attempt)
+            else:
+                # Anything not worth retrying - success, a 4xx, or the last
+                # attempt - is settled here: raise_for_status() passes 2xx/3xx.
+                if final or resp.status_code not in _RETRYABLE_STATUS:
+                    resp.raise_for_status()
+                    return resp
+                reason = f"HTTP {resp.status_code}"
+                delay = self._retry_delay(resp, attempt)
+            logger.warning(
+                "request to %s failed (%s); retry %d/%d in %.2fs",
+                path,
+                reason,
+                attempt + 1,
+                self.max_retries,
+                delay,
+            )
+            time.sleep(delay)
+        raise RuntimeError("request failed without an error")  # pragma: no cover - max_retries < 0
 
-    def _retry_delay(self, exc: Exception, attempt: int) -> float:
-        if isinstance(exc, _RetryableStatus):
-            retry_after = exc.response.headers.get("Retry-After")
-            if retry_after and str(retry_after).isdigit():
-                return float(retry_after)
+    def _retry_delay(self, response: Optional[requests.Response], attempt: int) -> float:
+        """Seconds before the next attempt: the server's Retry-After, else jittered backoff."""
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after and str(retry_after).isdigit():
+            return float(retry_after)
         return self.backoff * (2**attempt) + random.uniform(0, self.backoff)
 
     @staticmethod
@@ -1600,7 +1508,7 @@ class Memory:
 
     def add(self, role: str, content: Any, **extra: Any) -> None:
         self.messages.append({"role": role, "content": content, **extra})
-        if len(self.messages) > self.max_messages or self._over_token_budget():
+        if len(self.messages) > self.max_messages or self._over_token_budget(self.messages):
             self._compress()
 
     def get(self) -> List[Dict[str, Any]]:
@@ -1610,14 +1518,10 @@ class Memory:
         self.messages.clear()
         self.summary = ""
 
-    def _over_token_budget(self) -> bool:
+    def _over_token_budget(self, messages: List[Dict[str, Any]]) -> bool:
         if self.max_tokens is None:
             return False
-        return self._window_tokens(self.messages) > self.max_tokens
-
-    @staticmethod
-    def _window_tokens(messages: List[Dict[str, Any]]) -> int:
-        return sum(_estimate_tokens(m.get("content", "")) for m in messages)
+        return sum(_estimate_tokens(m.get("content", "")) for m in messages) > self.max_tokens
 
     @staticmethod
     def _tool_group_start(messages: List[Dict[str, Any]], index: int) -> int:
@@ -1646,12 +1550,8 @@ class Memory:
         # A message-count window can still bust a token budget (e.g. 20 huge
         # messages), so keep shrinking from the front until it fits - but
         # always leave at least the single most recent message.
-        if self.max_tokens is not None:
-            while (
-                split < len(self.messages) - 1
-                and self._window_tokens(self.messages[split:]) > self.max_tokens
-            ):
-                split += 1
+        while split < len(self.messages) - 1 and self._over_token_budget(self.messages[split:]):
+            split += 1
         split = self._tool_group_start(self.messages, split)
         overflow, kept = self.messages[:split], self.messages[split:]
         self.messages = kept
@@ -1673,7 +1573,7 @@ class Memory:
             try:
                 self.summary = self.llm.chat(prompt)["content"].strip()
                 return
-            except Exception:  # pragma: no cover
+            except Exception:  # a failed summary must not fail the turn
                 pass
         truncated = "\n".join(
             f"{m.get('role')}: {str(m.get('content', ''))[:100]}" for m in overflow
@@ -1693,9 +1593,9 @@ class RAG:
     embeddings instead - e.g. an OpenAI or sentence-transformers model. The
     search interface is identical either way.
 
-    Inputs are validated rather than trusted, because the failures here are
-    silent ones: a vector of the wrong length used to be zipped against a
-    longer one and scored 1.0, and a negative ``top_k`` used to slice the
+    Inputs are validated rather than trusted, because the failures here
+    would otherwise be silent ones: a vector of the wrong length zipped
+    against a longer one scores 1.0, and a negative ``top_k`` slices the
     result list from the end. Specifically:
 
     * ``embed_fn`` must return exactly one vector per text.
@@ -1744,9 +1644,8 @@ class RAG:
         index ends up with more embeddings than documents and an
         ``IndexError`` from ``search()`` much later, far from the cause.
 
-        ``metadatas``, when given, must line up one-to-one with ``texts``.
-        Zipping the two used to truncate to the shorter list, silently
-        dropping documents.
+        ``metadatas``, when given, must line up one-to-one with ``texts``;
+        zipping lists of different lengths would silently drop documents.
         """
         texts = list(texts)
         if metadatas is not None:
@@ -1783,10 +1682,12 @@ class RAG:
         else:
             self._rebuild_index()
 
-    def _embed(self, texts: List[str]) -> tuple:
+    def _embed(self, texts: List[str], query: bool = False) -> tuple:
         """Embed a batch and validate it. Returns ``(vectors, dimension)``.
 
-        Nothing here touches the index: the dimension is returned rather than
+        Documents and queries go through the same checks; ``query`` only
+        changes how a rejected vector is named in the error. Nothing here
+        touches the index: the dimension is returned rather than
         assigned, so a batch that fails half-way cannot leave the index
         claiming a width it never accepted a vector for.
         """
@@ -1800,6 +1701,11 @@ class RAG:
                 f"but returned {type(produced).__name__}."
             ) from None
         if len(vectors) != len(texts):
+            if query:
+                raise ValueError(
+                    f"embed_fn returned {len(vectors)} vectors for one query; it must "
+                    "return exactly one."
+                )
             raise ValueError(
                 f"embed_fn returned {len(vectors)} vectors for {len(texts)} texts. "
                 "It must return exactly one per text, in order, or documents and "
@@ -1807,7 +1713,8 @@ class RAG:
             )
         dimension = self._dimension
         for position, vector in enumerate(vectors):
-            dimension = self._check_vector(vector, f"document {position}", dimension)
+            label = "the query" if query else f"document {position}"
+            dimension = self._check_vector(vector, label, dimension)
         return vectors, dimension
 
     @staticmethod
@@ -1844,9 +1751,6 @@ class RAG:
 
     def _rebuild_index(self) -> None:
         n = len(self.docs)
-        if n == 0:
-            self._idf, self._vectors, self._norms = {}, [], []
-            return
         df: Counter = Counter()
         for tf in self._tf:
             df.update(tf.keys())
@@ -1904,15 +1808,7 @@ class RAG:
 
     def _embedding_scores(self, query: str) -> List[float]:
         """Score the corpus against the query vector, which must match its width."""
-        assert self.embed_fn is not None
-        produced = list(self.embed_fn([query]))
-        if len(produced) != 1:
-            raise ValueError(
-                f"embed_fn returned {len(produced)} vectors for one query; it must "
-                "return exactly one."
-            )
-        vector = list(produced[0])
-        self._check_vector(vector, "the query", self._dimension)
+        (vector,), _ = self._embed([query], query=True)
         return [self._cosine(vector, embedding) for embedding in self._embeddings]
 
     @staticmethod
@@ -2041,15 +1937,21 @@ class AgentEvent:
 class Callback:
     """Hook into the agent loop. Subclass and override the methods you need.
 
-    Every method is a no-op by default. Callbacks must not raise: the agent
-    swallows and logs any callback error so instrumentation never breaks a run.
+    Every method is a no-op by default. A callback error is logged and
+    swallowed, so instrumentation never breaks a run - unless
+    ``Agent(strict_callbacks=True)``, which re-raises it.
+
+    Hooks may run off the caller's thread: ``on_event`` and ``on_tool_audit``
+    for a turn's parallel tool calls run on tool worker threads, and the
+    whole run is on a worker thread under ``arun()`` and ``events()``.
     """
 
     def on_iteration(self, index: int) -> None:
         """Called at the start of each ReAct iteration (0-based)."""
 
-    def on_llm_call(self, messages: List[Dict[str, Any]], response: Dict[str, Any]) -> None:
-        """Called after every LLM response."""
+    def on_llm_call(self, messages: List[Dict[str, Any]], response: Any) -> None:
+        """Called after every LLM response (an :class:`LLMResponse`, or the
+        plain dict a custom backend returned)."""
 
     def on_tool_call(self, name: str, arguments: Dict[str, Any], result: str) -> None:
         """Called after each tool executes."""
@@ -2057,7 +1959,7 @@ class Callback:
     def on_tool_audit(self, event: Dict[str, Any]) -> None:
         """Called with every tool authorization decision, before execution.
 
-        ``event`` carries ``agent``, ``tool``, ``arguments``, ``decision``
+        ``event`` carries ``agent``, ``session``, ``tool``, ``arguments``, ``decision``
         (one of ``allowed``, ``approved``, ``denied``, ``approval_denied``,
         ``invalid_arguments``, ``unknown_tool``), ``reason``, ``permissions``
         and ``side_effects``.
@@ -2072,8 +1974,7 @@ class Callback:
 
         The structured stream: one handler covering starts, finishes,
         failures, timings and token usage, rather than a method per hook. The
-        older, narrower callbacks above still fire alongside it, so existing
-        subclasses keep working unchanged.
+        narrower hooks above still fire alongside it.
         """
 
     def on_finish(self, answer: Any) -> None:
@@ -2091,39 +1992,23 @@ class _EventListener(Callback):
 
 
 class LoggingCallback(Callback):
-    """A ready-made tracer that logs each step of the agent loop."""
+    """A ready-made tracer: one INFO line per :class:`AgentEvent`, plus tool I/O.
+
+    Each step of the loop is logged once, through :meth:`on_event`. Tool
+    calls additionally get a line with their arguments and the first 120
+    characters of the result, **verbatim** - the one place this tracer
+    writes payloads, so it does not follow ``event_payloads``. Refusals and
+    timeouts are already logged at WARNING by the agent itself.
+    """
 
     def __init__(self, logger_: Optional[logging.Logger] = None):
         self.log = logger_ or logger
 
-    def on_iteration(self, index: int) -> None:
-        self.log.info("iteration %d", index)
-
-    def on_llm_call(self, messages: List[Dict[str, Any]], response: Dict[str, Any]) -> None:
-        self.log.info(
-            "llm: %d msg(s) -> %d tool call(s), %d chars",
-            len(messages),
-            len(response.get("tool_calls", [])),
-            len(response.get("content", "")),
-        )
-
     def on_tool_call(self, name: str, arguments: Dict[str, Any], result: str) -> None:
         self.log.info("tool: %s(%s) -> %s", name, arguments, str(result)[:120])
 
-    def on_tool_audit(self, event: Dict[str, Any]) -> None:
-        self.log.info(
-            "audit: %s %s(%s)%s",
-            event.get("decision"),
-            event.get("tool"),
-            event.get("arguments"),
-            f" - {event['reason']}" if event.get("reason") else "",
-        )
-
     def on_event(self, event: AgentEvent) -> None:
         self.log.info("%s", event)
-
-    def on_finish(self, answer: Any) -> None:
-        self.log.info("finished (%d chars)", len(str(answer)))
 
 
 # --- 6. Tool authorization (policy layer) ----------------------------------
@@ -2137,10 +2022,10 @@ class ToolPolicy:
     can widen what it is allowed to do.
 
     This base class is also the default policy, and it is permissive: it
-    allows any tool the agent was given and asks for approval only when the
-    tool itself is marked ``requires_approval``. An agent written before this
-    layer existed therefore behaves exactly as it did - the boundary is
-    always present, its default answer is "yes".
+    allows any tool the agent was given unless that tool's ``allowed`` hook
+    refuses the call (a denial), and asks for approval only when the tool
+    itself is marked ``requires_approval``. The boundary is always present;
+    its default answer is "yes".
 
     Subclass to restrict. Deny by raising :class:`ToolAuthorizationError`;
     the agent turns that into an observation for the model rather than
@@ -2155,7 +2040,9 @@ class ToolPolicy:
 
     Both hooks receive the tool, the arguments (already through
     :meth:`Tool.validate_arguments`, so the shape is known-good), and a
-    context dict of ``agent``, ``tool`` and ``call_id``. A policy that raises
+    context dict of ``agent`` (the agent's name), ``tool``, ``call_id``,
+    ``session`` (the session id) and ``metadata`` (the session's metadata,
+    which is how a policy authorizes per user). A policy that raises
     anything else is treated as a denial - a broken policy must not fail open.
     """
 
@@ -2226,13 +2113,14 @@ class Budget:
     A budget is **per run** - one ``agent.run()`` or ``session.run()`` call -
     not per session lifetime. A ten-turn conversation gets the budget ten
     times. Lifetime token accounting is ``session.usage``, which keeps
-    accumulating regardless.
+    accumulating regardless. Both count the non-streamed calls the agent
+    loop makes; not counted are ``Memory(llm=...)`` summaries, the streamed
+    answer of ``stream()``/``events()``, and ``Router.route``'s own call.
 
     * ``max_iterations``   - think/act cycles. Defaults to the agent's own
       ``max_iterations``. **This one does not raise:** when the loop is
-      exhausted the agent makes one final call and answers, exactly as it
-      always has. Ending a turn with no answer at all is worse than one more
-      call, and that behaviour predates budgets.
+      exhausted the agent makes one final call and answers, because ending a
+      turn with no answer at all is worse than one more call.
     * ``max_tool_calls``   - tool calls in the run, counted across every
       iteration and every concurrent call in a turn.
     * ``max_total_tokens`` - prompt + completion tokens, as reported by the
@@ -2257,10 +2145,15 @@ class Budget:
     counts, never an invoice.
 
     Budgets that are reached stop the run by raising a
-    :class:`BudgetExceededError`. They are checked before spending, but a
-    single call's cost is not known until it returns, so the final call can
-    carry the total slightly past the limit; the run stops immediately
-    afterwards. This is runtime governance, not billing.
+    :class:`BudgetExceededError`. They are checked at each iteration and
+    before each tool call, but a single call's cost is not known until it
+    returns, so the call that crosses a limit completes - and the calls that
+    close a run (the forced final answer, structured-output formatting and
+    repair, the streamed reply) are not gated. A loop iteration or tool call
+    after that raises. ``max_tool_output`` is the exception: a result's size
+    is known only once the tool returns, so the call that pushes the total
+    past the cap raises at once and its result never reaches memory. This
+    is runtime governance, not billing.
     """
 
     def __init__(
@@ -2359,8 +2252,11 @@ class RunState:
     def check_before_call(self) -> None:
         """Raise if the run may not spend anything more.
 
-        Called before every LLM call and before every tool call, so nothing
-        that costs time, tokens or money starts once a budget is reached.
+        Called at the top of every loop iteration and before every tool
+        call. The calls that close a run - the forced final answer, the
+        structured-output formatting and repair passes, the streamed reply -
+        are not gated by it, so a run that reaches a limit on its last loop
+        call still finishes those.
         """
         budget = self.budget
         if budget.timeout is not None and self.elapsed >= budget.timeout:
@@ -2485,8 +2381,8 @@ class Agent:
         alice = agent.session()              # independent conversations
         bob = agent.session()
 
-    ``agent.run(...)`` still works and is unchanged for single-conversation
-    scripts: it uses one persistent default session, created on first use.
+    ``agent.run(...)`` is for single-conversation scripts: it uses one
+    persistent default session, created on first use.
     See :meth:`session` and :attr:`default_session`.
 
     Three things *are* deliberately shared by every session of an Agent,
@@ -2567,10 +2463,10 @@ class Agent:
         # set, reach or influence it.
         self.approve = approve
         # Seconds to wait for any tool that does not set its own timeout.
-        # None means wait forever, which is the old behaviour.
+        # None means wait forever.
         self.tool_timeout = tool_timeout
         # Characters of tool output to pass on, for tools that do not set
-        # their own. None means unbounded, which is the old behaviour.
+        # their own. None means unbounded.
         self.max_tool_output_size = max_tool_output_size
         # What one run may consume. An empty Budget limits nothing except the
         # iteration count, which max_iterations has always bounded.
@@ -2625,12 +2521,12 @@ class Agent:
         ``callbacks`` are additional and scoped to this session; Agent-level
         callbacks still fire. ``metadata`` is yours - it is passed to
         :class:`ToolPolicy` hooks as ``context["metadata"]`` and included in
-        audit events, which is how a policy authorizes per user rather than
-        per agent.
+        approval requests, which is how a policy authorizes per user rather
+        than per agent. Audit events carry the session id.
         """
         return Session(
             self,
-            memory=memory if memory is not None else self.memory_factory(),
+            memory=memory,
             callbacks=callbacks,
             metadata=metadata,
             session_id=session_id,
@@ -2643,8 +2539,7 @@ class Agent:
 
         Created on first use and reused for the life of the Agent, so a
         script that calls ``agent.run()`` in a loop holds a single
-        conversation - exactly as it did before sessions existed. It is
-        *not* recreated per call.
+        conversation. It is *not* recreated per call.
 
         That persistence is why ``agent.run()`` is for single-conversation
         use. Serving several users from one Agent means one session each
@@ -2655,13 +2550,7 @@ class Agent:
             with self._default_session_lock:
                 if self._default_session is None:
                     self._default_session = Session(
-                        self,
-                        memory=(
-                            self._default_memory
-                            if self._default_memory is not None
-                            else self.memory_factory()
-                        ),
-                        session_id="default",
+                        self, memory=self._default_memory, session_id="default"
                     )
         return self._default_session
 
@@ -2772,26 +2661,10 @@ class Agent:
         self._add_user_turn(session, user_input)
         tool_list = list(self.tools.values())
         answer: Optional[str] = None
-        for i in range(self._iteration_limit(state)):
-            state.iterations = i + 1
-            state.check_before_call()
-            self._emit(session, "on_iteration", i)
-            self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
-            # JSON mode is only requested when no tools are in play; combining
-            # tool-calling with JSON mode is unreliable across providers.
-            fmt = response_format if not tool_list else None
-            result = self._chat(
-                session,
-                self._build_messages(session, fmt),
-                tools=tool_list or None,
-                response_format=fmt,
-            )
-            if not result["tool_calls"]:
-                answer = result["content"]
-                session.memory.add("assistant", answer)
-                break
-            session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
-            self._execute_calls(session, result["tool_calls"], state)
+        reply = self._resolve_tools(session, state, tool_list, response_format)
+        if reply is not None:
+            answer = reply["content"]
+            session.memory.add("assistant", answer)
         if answer is None:  # exhausted iterations - force a final answer
             answer = self._chat(
                 session,
@@ -2799,13 +2672,16 @@ class Agent:
                 response_format=response_format,
             )["content"]
             session.memory.add("assistant", answer)
+        elif response_format is not None and tool_list:
+            # Dedicated formatting pass so output matches the schema: the loop
+            # ran with tools, so without JSON mode. The forced answer above
+            # already ran under the schema and needs no second pass.
+            answer = self._chat(
+                session,
+                self._build_messages(session, response_format),
+                response_format=response_format,
+            )["content"]
         if response_format is not None:
-            if tool_list:  # dedicated formatting pass so output matches the schema
-                answer = self._chat(
-                    session,
-                    self._build_messages(session, response_format),
-                    response_format=response_format,
-                )["content"]
             parsed = self._parse_structured(session, answer, response_format)
             self._emit(session, "on_finish", parsed)
             return parsed
@@ -2816,7 +2692,10 @@ class Agent:
         """Stream the final answer token by token, against one session.
 
         Any tool calls are resolved first (non-streaming); the final assistant
-        reply is then streamed. With no tools, the reply is streamed directly.
+        reply is then streamed. With tools, that costs one extra LLM call: the
+        reply that ended the tool loop is generated again as a stream, since
+        streamed tool calls are not normalised across providers. With no
+        tools, the reply is streamed directly.
         """
         state = self._begin_run(session)
         self._emit_event(
@@ -2835,24 +2714,12 @@ class Agent:
         chunks: List[str] = []
         # The whole turn is covered, not just the streaming half: a budget
         # stop or a provider error while resolving tools is just as much a
-        # failed run, and reporting only the second half meant a run could
-        # end with no AgentFinished and no AgentFailed at all.
+        # failed run, and must end in AgentFailed.
         try:
             if tool_list:
-                for i in range(self._iteration_limit(state)):
-                    state.iterations = i + 1
-                    state.check_before_call()
-                    self._emit(session, "on_iteration", i)
-                    self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
-                    result = self._chat(
-                        session, self._build_messages(session, None), tools=tool_list
-                    )
-                    if not result["tool_calls"]:
-                        break
-                    session.memory.add(
-                        "assistant", result["content"], tool_calls=result["tool_calls"]
-                    )
-                    self._execute_calls(session, result["tool_calls"], state)
+                # The reply that ends the tool loop is discarded: the answer is
+                # generated again below as a stream, which costs one more call.
+                self._resolve_tools(session, state, tool_list)
             for chunk in self.llm.stream(self._build_messages(session, None)):
                 chunks.append(chunk)
                 yield chunk
@@ -2882,6 +2749,41 @@ class Agent:
                 **self._payload(answer=answer),
             },
         )
+
+    def _resolve_tools(
+        self,
+        session: Session,
+        state: RunState,
+        tool_list: List[Tool],
+        response_format: Optional[Type[BaseModel]] = None,
+    ) -> Optional[Any]:
+        """Think and act until the model answers without asking for a tool.
+
+        The one tool-resolution loop, shared by :meth:`_run_loop` and
+        :meth:`_stream`. Each tool-call turn is written to memory before its
+        calls run. Returns the reply that ended the loop - *not* stored,
+        because the two callers use it differently - or None when the
+        iteration limit is reached first.
+        """
+        for i in range(self._iteration_limit(state)):
+            state.iterations = i + 1
+            state.check_before_call()
+            self._emit(session, "on_iteration", i)
+            self._emit_event(session, "AgentIteration", state, metadata={"iteration": i})
+            # JSON mode is only requested when no tools are in play; combining
+            # tool-calling with JSON mode is unreliable across providers.
+            fmt = response_format if not tool_list else None
+            result = self._chat(
+                session,
+                self._build_messages(session, fmt),
+                tools=tool_list or None,
+                response_format=fmt,
+            )
+            if not result["tool_calls"]:
+                return result
+            session.memory.add("assistant", result["content"], tool_calls=result["tool_calls"])
+            self._execute_calls(session, result["tool_calls"], state)
+        return None
 
     # -- observability --
     def subscribe(self, handler: Callable[[AgentEvent], None]) -> Callable[[], None]:
@@ -3094,7 +2996,9 @@ class Agent:
                 **self._payload(content=result.get("content")),
             },
         )
-        self._track_usage(session, result.get("usage"))
+        usage = result.get("usage") or {}
+        for key in session.usage:  # lifetime totals; state.usage below is per run
+            session.usage[key] += int(usage.get(key, 0) or 0)
         if state is not None:
             # getattr: the LLM interface is the chat() contract, not a class.
             # A custom backend need not carry a `model` name, and an unnamed
@@ -3103,14 +3007,6 @@ class Agent:
             state.record_llm_call(result.get("usage"), model or "")
         self._emit(session, "on_llm_call", messages, result)
         return result
-
-    @staticmethod
-    def _track_usage(session: Session, usage: Optional[Dict[str, Any]]) -> None:
-        """Accumulate token usage on the session that spent it."""
-        if not usage:
-            return
-        for key in session.usage:
-            session.usage[key] += int(usage.get(key, 0) or 0)
 
     def _emit(self, session: Session, event: str, *args: Any) -> None:
         """Notify this agent's callbacks, then the session's own.
@@ -3159,9 +3055,9 @@ class Agent:
         marker of whatever agent is doing the rendering - so a conversation
         reloaded from disk never carries stale markers from a dead agent.
 
-        The retrieval framing here is descriptive on purpose. The old wrapper
-        said "Use the following context to answer", which tells the model to
-        act on whatever the corpus contains.
+        The retrieval framing is descriptive on purpose: wording such as "use
+        the following context to answer" tells the model to act on whatever
+        the corpus contains.
         """
         hits = self.rag.search(user_input) if self.rag is not None else []
         if not hits:
@@ -3213,7 +3109,7 @@ class Agent:
         if schema is not None:
             system += (
                 "\n\nRespond with a single JSON object matching this schema "
-                f"(no prose, no code fences):\n{json.dumps(self._json_schema(schema))}"
+                f"(no prose, no code fences):\n{json.dumps(_pydantic_schema(schema))}"
             )
         return [{"role": "system", "content": system}] + [
             self._render(message) for message in session.memory.get()
@@ -3244,19 +3140,14 @@ class Agent:
         asking the model to request fewer tools. Excess calls queue and still
         run; only their concurrency is bounded, and results keep their order.
         """
-        if len(calls) == 1:
-            observations = [self._execute(session, calls[0], state)]
-        else:
-            observations = []
-            for group in self._schedule(calls):
-                if len(group) == 1:
-                    observations.append(self._execute(session, group[0], state))
-                    continue
-                workers = min(len(group), self.max_tool_workers)
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    observations.extend(
-                        pool.map(partial(self._execute, session), group, [state] * len(group))
-                    )
+        observations: List[str] = []
+        for group in self._schedule(calls):
+            if len(group) == 1:  # a lone call - or a lone turn - runs inline, no pool
+                observations.append(self._execute(session, group[0], state))
+                continue
+            workers = min(len(group), self.max_tool_workers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                observations.extend(pool.map(partial(self._execute, session, state=state), group))
         for call, observation in zip(calls, observations):
             self._emit(
                 session, "on_tool_call", call["name"], call.get("arguments", {}), observation
@@ -3274,8 +3165,7 @@ class Agent:
         Calls stay in the order the model asked for them. Consecutive
         parallel ones form a group and run concurrently; an exclusive one is
         a group of its own, so nothing else from the turn runs while it does.
-        A turn of only parallel tools is a single group - exactly the
-        behaviour every tool had before this existed.
+        A turn of only parallel tools is a single group.
 
         That order is preserved because reordering would be surprising, not
         because it means anything. **The model is not expressing a
@@ -3316,15 +3206,14 @@ class Agent:
 
         This is the only path from model output to a tool function, and it is
         a fixed sequence: locate the tool, validate the arguments, ask the
-        policy, get approval if the policy wants it, execute, and record the
-        decision. There is no branch that reaches ``tool.run`` without
+        policy, get approval if the policy wants it, record the decision,
+        then execute. There is no branch that reaches ``tool.run`` without
         passing the policy first, and the model cannot choose a different
         route through it.
 
         A refusal at any step becomes an observation string, so the model
         learns it was refused and the loop continues; a denied tool is never
         a way to crash the run. Application code calling ``tool.run(...)``
-        Application code calling ``tool.run(...)``
         directly is trusted and deliberately not policed - this boundary is
         for model intent.
 
@@ -3443,8 +3332,7 @@ class Agent:
         which estimates tokens the same way.
 
         Nothing is shortened silently. An oversized result keeps its first
-        ``limit`` characters and gains a :class:`ToolOutputTruncated` note
-        saying how much was dropped - and, when the full result was valid
+        ``limit`` characters and gains a note saying how much was dropped - and, when the full result was valid
         JSON, saying that the fragment is cut mid-structure and will not
         parse, since a model handed a JSON fragment will otherwise try. The
         note is appended on top of the budget rather than counted inside it,
@@ -3458,19 +3346,21 @@ class Agent:
         limit = self._output_limit_for(tool_obj)
         if limit is None or len(text) <= limit:
             return text
-        indicator = ToolOutputTruncated(
-            tool=tool_obj.name,
-            original_size=len(text),
-            limit=limit,
-            was_json=self._looks_like_json(text),
+        note = (
+            f"\n\n[output truncated: {limit:,} of {len(text):,} characters "
+            f"shown for tool '{tool_obj.name}']"
         )
+        if self._looks_like_json(text):
+            # Say so explicitly. A model handed a JSON fragment will otherwise
+            # try to parse it, and a cut structure is not recoverable.
+            note += (
+                " The full result was valid JSON; this fragment is cut mid-structure "
+                "and will not parse."
+            )
         logger.warning(
-            "tool %s: output truncated to %d of %d characters",
-            tool_obj.name,
-            limit,
-            indicator.original_size,
+            "tool %s: output truncated to %d of %d characters", tool_obj.name, limit, len(text)
         )
-        return text[:limit] + str(indicator)
+        return text[:limit] + note
 
     @staticmethod
     def _looks_like_json(text: str) -> bool:
@@ -3542,8 +3432,8 @@ class Agent:
           ``timeout=`` can block for a very long time; the tool timeout will
           free the agent but leave the request running.
 
-        Without a timeout the call runs inline, exactly as before - no thread,
-        no executor, and an unbounded tool blocks the agent.
+        Without a timeout the call runs inline - no thread, no executor, and
+        an unbounded tool blocks the agent.
         """
         timeout = self._timeout_for(tool_obj)
         if timeout is None:
@@ -3578,8 +3468,8 @@ class Agent:
 
         With no ``approve`` callback configured the call is refused: a tool
         marked ``requires_approval`` must not run merely because nobody wired
-        up an approver. An approver that raises is likewise a refusal (it is
-        caught upstream in _execute), never a pass.
+        up an approver. An approver that raises is likewise a refusal, never
+        a pass.
         """
         if self.approve is None:
             raise ToolApprovalRequired(
@@ -3640,19 +3530,13 @@ class Agent:
             logger.warning("tool %s: %s (%s)", name, decision, reason)
         self._emit(session, "on_tool_audit", event)
 
-    @staticmethod
-    def _json_schema(schema: Type[BaseModel]) -> Dict[str, Any]:
-        return _pydantic_schema(schema)
-
     def _parse_structured(self, session: Session, content: str, schema: Type[BaseModel]):
         """Validate content against the schema, repairing via the LLM on failure."""
         data = self._loads_object(content)
-        for attempt in range(self.structured_retries + 1):
+        for attempt in range(self.structured_retries):
             try:
                 return schema(**data)
             except ValidationError as exc:
-                if attempt >= self.structured_retries:
-                    raise
                 logger.warning(
                     "structured output failed validation; repair attempt %d", attempt + 1
                 )
@@ -3666,14 +3550,14 @@ class Agent:
                         },
                         {
                             "role": "user",
-                            "content": f"Schema:\n{json.dumps(self._json_schema(schema))}\n\n"
+                            "content": f"Schema:\n{json.dumps(_pydantic_schema(schema))}\n\n"
                             f"Invalid JSON:\n{content}\n\nValidation error:\n{exc}",
                         },
                     ],
                     response_format=schema,
                 )["content"]
                 data = self._loads_object(content)
-        raise RuntimeError("unreachable")  # pragma: no cover
+        return schema(**data)  # the last attempt: a ValidationError now propagates
 
     @staticmethod
     def _loads_object(content: str) -> Dict[str, Any]:
@@ -3714,8 +3598,9 @@ class Session:
     conversation, and two threads adding to the same history interleave. One
     session per conversation, not per request to the same conversation.
 
-    Create these with :meth:`Agent.session`; constructing one directly is
-    fine but you must supply the memory yourself.
+    Create these with :meth:`Agent.session`. Constructing one directly is
+    equivalent: without ``memory=`` it gets a fresh one from the agent's
+    ``memory_factory``.
     """
 
     def __init__(
@@ -3728,7 +3613,7 @@ class Session:
         budget: Optional[Budget] = None,
     ):
         self.agent = agent
-        self.memory = memory if memory is not None else Memory()
+        self.memory = memory if memory is not None else agent.memory_factory()
         # Copied, not aliased: a caller's dict must not become shared state.
         self.callbacks = list(callbacks or [])
         self.metadata: Dict[str, Any] = dict(metadata or {})
@@ -3787,8 +3672,9 @@ class Session:
         calls are resolved before the answer streams, which is why tool events
         arrive first either way.
 
-        The run happens on a worker thread; see :meth:`Agent._events` for what
-        that means if you abandon the iterator.
+        The run happens on a worker thread. Abandoning the iterator does not
+        cancel it: the turn completes in the background. An exception from
+        the run is re-raised here, with a traceback from the worker thread.
         """
         return self.agent._events(self, user_input, response_format, stream)
 
@@ -3825,13 +3711,9 @@ class Router:
     The decision is asked for as JSON and then **checked against the agent
     registry in Python**. The prompt is where the model is told what is
     allowed; the registry lookup is what enforces it. Nothing the model
-    writes can name an agent this Router does not hold.
-
-    ``strict=True`` accepts only a structured reply or a bare exact name,
-    refusing prose entirely. The default also accepts a name appearing as a
-    contiguous run of words in a longer reply ("the best agent is cost"),
-    which small local models often produce - see :meth:`_resolve` for what
-    that does and does not catch.
+    writes can name an agent this Router does not hold. Only two reply
+    shapes are accepted - a JSON decision, or a bare agent name - and prose
+    is refused, because text matching cannot tell "use cost" from "not cost".
 
     Every dispatch runs in a **fresh** :class:`Session` per agent, so a
     router can serve concurrent queries without two of them landing in the
@@ -3840,10 +3722,10 @@ class Router:
     :class:`ToolPolicy`.
 
     :meth:`run_all` and :meth:`synthesize` do not route - they run every
-    agent - so none of this applies to them.
+    agent - so the fail-closed rules above do not apply to them; they still
+    use fresh sessions and accept ``metadata=``.
     """
 
-    _TOKEN_RE = re.compile(r"[a-z0-9_]+")
     # An agent description is developer-supplied, but it is often built from
     # data that is not. Cap it so a long one cannot crowd out the
     # instruction, and see _descriptions for why newlines are collapsed.
@@ -3855,18 +3737,10 @@ class Router:
         agents: List[Agent],
         synthesizer: Optional[Agent] = None,
         fallback: Optional[Agent] = None,
-        strict: bool = False,
     ):
-        """``fallback`` receives queries that :meth:`route` cannot resolve.
-
-        Leave it ``None`` (the default) to fail closed with
-        :class:`RoutingError` instead of dispatching to an unchosen agent.
-
-        Agent names are validated here rather than at routing time: a name
-        that is blank, or that collides with another once case and spacing
-        are normalised, makes "resolve to exactly one agent" impossible. Both
-        used to be silent - a blank-named agent was simply unreachable
-        forever, and one of two identically-named agents always won.
+        """Agent names are validated here: a blank name, or one that collides
+        with another after normalisation, raises ValueError, since either
+        makes resolving to exactly one agent impossible.
         """
         if not agents:
             raise ValueError("Router needs at least one agent.")
@@ -3887,7 +3761,6 @@ class Router:
             registry[key] = agent
         self.llm, self.agents, self.synthesizer = llm, agents, synthesizer
         self.fallback = fallback
-        self.strict = strict
         self._registry = registry
         self._decision_model = self._build_decision_model()
 
@@ -3897,23 +3770,20 @@ class Router:
         """Casefold, strip, and collapse internal whitespace to one space."""
         return " ".join(str(text or "").casefold().split())
 
-    def _tokens(self, text: Any) -> List[str]:
-        return self._TOKEN_RE.findall(self._normalise(text))
-
     def _build_decision_model(self) -> Optional[Any]:
         """A Pydantic model whose ``agent`` field is one of the known names.
 
         This is what makes the *request* structured: the allowed values come
         from the registry, so the model is shown a closed set rather than
-        asked to invent a name. It is not the enforcement - :meth:`_resolve`
-        looks the answer up in the registry regardless.
+        asked to invent a name. Passed as ``response_format``, it also puts
+        the built-in providers into JSON mode (OpenAI ``json_object``, Ollama
+        ``format="json"``; Anthropic has none). It is not the enforcement -
+        :meth:`_resolve` looks the answer up in the registry regardless.
         """
-        if not _HAS_PYDANTIC_V2:  # pragma: no cover - v2 is the pinned floor
-            return None
         names = tuple(sorted(self._registry))
         try:
             return create_model("RouterDecision", agent=(Literal[names], ...))
-        except Exception:  # pragma: no cover - exotic agent names only
+        except Exception:  # pragma: no cover - e.g. a lone surrogate in an agent name
             return None
 
     def _descriptions(self) -> str:
@@ -3984,50 +3854,18 @@ class Router:
         scanning it for names would route to the agent the model just ruled
         out.
 
-        A reply carrying no JSON is matched as text, exactly:
-
-        1. **Bare name** - the whole reply, normalised, *is* a known name.
-        2. **Embedded name** - the name appears as a contiguous run of words
-           inside a longer reply, and exactly one agent's does. Skipped under
-           ``strict=True``.
-
-        Anything else returns None: an empty or whitespace reply, a refusal,
-        an unregistered name, unparseable JSON, or a reply naming two agents.
-        Ambiguity is not broken by preference or order - two matches is a
-        failure, not a contest.
-
-        Rule 2 is exact containment, not fuzzy matching: ``fit`` does not
-        match "profit", and a two-word name does not match a reply using both
-        words apart ("admin ... delete"). What it cannot see is *sense*: prose
-        mentioning one agent in order to reject it ("not cost") reads as
-        choosing it. The structured path has no such gap, so set
-        ``strict=True`` where that matters.
+        A reply carrying no JSON must *be* a known name, once case and
+        whitespace are normalised. Anything else returns None: an empty or
+        whitespace reply, prose (even prose naming one agent), a refusal, an
+        unregistered name, or malformed JSON. Prose is refused rather than
+        scanned because matching words cannot see sense - "not cost" names
+        exactly one agent in order to reject it.
         """
         value, found = _extract_json(choice)
-        if found:
+        name: Any = choice
+        if found:  # a JSON reply is only ever a decision, never read as a name
             name = value.get("agent") if isinstance(value, dict) else None
-            return self._registry.get(self._normalise(name)) if isinstance(name, str) else None
-        agent = self._registry.get(self._normalise(choice))
-        if agent is not None:
-            return agent
-        if self.strict:
-            return None
-        words = self._tokens(choice)
-        if not words:
-            return None
-        matches = [
-            candidate
-            for key, candidate in self._registry.items()
-            if self._contains_run(words, self._TOKEN_RE.findall(key))
-        ]
-        return matches[0] if len(matches) == 1 else None
-
-    @staticmethod
-    def _contains_run(words: List[str], name: List[str]) -> bool:
-        """True if ``name`` appears in ``words`` as consecutive whole words."""
-        if not name or len(name) > len(words):
-            return False
-        return any(words[i : i + len(name)] == name for i in range(len(words) - len(name) + 1))
+        return self._registry.get(self._normalise(name)) if isinstance(name, str) else None
 
     def run(self, query: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         """Route the query to one agent and run it in a fresh session."""
@@ -4073,6 +3911,9 @@ class Router:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Run all agents, then fuse their findings with the synthesizer.
+
+        Without a synthesizer, returns the per-agent results joined as
+        ``### name`` sections.
 
         The synthesizer also gets a fresh session, for the same reason.
         """
